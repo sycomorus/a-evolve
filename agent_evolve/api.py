@@ -49,6 +49,9 @@ _BENCHMARK_REGISTRY: dict[str, str] = {
     "arc-agi-3": "agent_evolve.benchmarks.arc_agi3.ArcAgi3Benchmark",
     "arc-agi3": "agent_evolve.benchmarks.arc_agi3.ArcAgi3Benchmark",
     "arc": "agent_evolve.benchmarks.arc_agi3.ArcAgi3Benchmark",
+    "or-interact": "agent_evolve.benchmarks.or_interact.ORInteractBenchmark",
+    "or-interact-bench": "agent_evolve.benchmarks.or_interact.ORInteractBenchmark",
+    "industry-or": "agent_evolve.benchmarks.or_interact.ORInteractBenchmark",
 }
 
 # Registry of seed workspace names -> paths (relative to package root)
@@ -70,6 +73,9 @@ _SEED_REGISTRY: dict[str, str] = {
     "arc-agi-3-mas": "arc-mas",
     "arc-agi3": "arc",
     "mcp-mh": "mcp_mh",
+    "or-interact-react": "or_interact_react",
+    "or-interact": "or_interact_react",
+    "industry-or": "or_interact_react",
 }
 
 

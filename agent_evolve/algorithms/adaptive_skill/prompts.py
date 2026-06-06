@@ -55,22 +55,33 @@ def _extract_trajectory_signals(conversation: list[dict[str, Any]]) -> dict[str,
 
     for msg in conversation:
         role = msg.get("role", "")
-        if role == "assistant":
+        event_type = msg.get("type", "")
+        if role == "assistant" or event_type == "assistant_message":
             n_turns += 1
             for tc in msg.get("tool_calls", []):
                 n_tool_calls += 1
-                fn = tc.get("function", "")
+                fn, args = _tool_call_name_args(tc)
                 tools_used[fn] = tools_used.get(fn, 0) + 1
-                args = tc.get("arguments", {})
                 cmd = args.get("cmd", "") or args.get("command", "")
                 if cmd:
                     cmd_short = cmd[:80]
                     commands_run.append(cmd_short)
-                if fn == "submit" or fn == "task_submit":
+                if fn in {"submit", "task_submit", "finalize"}:
                     submitted = True
-                    submit_value = args.get("answer", "")
-        elif role == "tool":
-            content = msg.get("content") or ""
+                    submit_value = str(args.get("answer", args.get("objective_value", "")))
+        elif event_type == "tool_call":
+            n_tool_calls += 1
+            fn = str(msg.get("name", ""))
+            tools_used[fn] = tools_used.get(fn, 0) + 1
+            args = msg.get("arguments", {}) if isinstance(msg.get("arguments", {}), dict) else {}
+            cmd = args.get("cmd", "") or args.get("command", "") or args.get("code", "")
+            if cmd:
+                commands_run.append(str(cmd)[:80])
+            if fn in {"submit", "task_submit", "finalize"}:
+                submitted = True
+                submit_value = str(args.get("answer", args.get("objective_value", "")))
+        elif role == "tool" or event_type == "tool_output":
+            content = msg.get("content") or _jsonish(msg.get("output", ""))
             if "ERROR:" in content or "error:" in content.lower()[:50]:
                 n_errors += 1
                 error_messages.append(content[:100])
@@ -126,6 +137,51 @@ def _summarize_conversation(conversation: list[dict[str, Any]]) -> str:
     return "\n".join(parts)
 
 
+def _jsonish(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    try:
+        return json.dumps(value, ensure_ascii=False, default=str)
+    except Exception:
+        return str(value)
+
+
+def _parse_arguments(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _tool_call_name_args(tool_call: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    function = tool_call.get("function", {})
+    if isinstance(function, dict):
+        name = str(function.get("name", ""))
+        args = _parse_arguments(function.get("arguments", {}))
+        return name, args
+    return (
+        str(tool_call.get("name", function or "")),
+        _parse_arguments(tool_call.get("arguments", {})),
+    )
+
+
+def _event_command(name: str, args: dict[str, Any]) -> str:
+    command = args.get("cmd", "") or args.get("command", "") or args.get("code", "")
+    if command:
+        return str(command)
+    if name:
+        compact_args = _jsonish(args)
+        return f"{name}({compact_args[:180]})"
+    return ""
+
+
 def _compress_trajectory(conversation: list[dict[str, Any]]) -> str:
     """Compress a trajectory into a failure-focused summary.
 
@@ -144,19 +200,31 @@ def _compress_trajectory(conversation: list[dict[str, Any]]) -> str:
 
     for msg in conversation:
         role = msg.get("role", "")
-        if role == "assistant":
+        event_type = msg.get("type", "")
+        if role == "assistant" or event_type == "assistant_message":
             for tc in msg.get("tool_calls", []):
-                fn = tc.get("function", "")
-                args = tc.get("arguments", {})
-                cmd = args.get("cmd", "") or args.get("command", "") or args.get("code", "")
-                answer = args.get("answer", "")
-                if fn in ("submit", "task_submit"):
+                fn, args = _tool_call_name_args(tc)
+                cmd = _event_command(fn, args)
+                answer = args.get("answer", args.get("objective_value", ""))
+                if fn in ("submit", "task_submit", "finalize"):
                     events.append({"type": "submit", "value": answer})
                 elif cmd:
                     prev_cmd = cmd[:200]
                     events.append({"type": "cmd", "fn": fn, "cmd": prev_cmd})
-        elif role == "tool":
-            content = (msg.get("content") or "").strip()
+        elif event_type == "tool_call":
+            fn = str(msg.get("name", ""))
+            args = msg.get("arguments", {}) if isinstance(msg.get("arguments", {}), dict) else {}
+            cmd = _event_command(fn, args)
+            if fn in ("submit", "task_submit", "finalize"):
+                events.append({
+                    "type": "submit",
+                    "value": str(args.get("answer", args.get("objective_value", ""))),
+                })
+            elif cmd:
+                prev_cmd = cmd[:200]
+                events.append({"type": "cmd", "fn": fn, "cmd": prev_cmd})
+        elif role == "tool" or event_type == "tool_output":
+            content = (msg.get("content") or _jsonish(msg.get("output", ""))).strip()
             is_error = (
                 "ERROR:" in content
                 or "error:" in content[:80].lower()
@@ -348,11 +416,14 @@ def build_evolution_prompt(
                 entry["judge_verdict"] = verdicts[i]
             summaries.append(entry)
         else:
+            conversation = log.get("conversation", [])
             summaries.append({
                 "task_id": log.get("task_id", ""),
                 "success": log.get("success", False),
                 "score": log.get("score", 0.0),
-                "feedback": log.get("feedback_detail", "")[:300],
+                "feedback": log.get("feedback_detail", "")[:1200],
+                "signals": _extract_trajectory_signals(conversation),
+                "compressed_trajectory": _compress_trajectory(conversation)[:2500],
             })
 
     skills = workspace.list_skills()
@@ -390,7 +461,7 @@ def build_evolution_prompt(
         else:
             instruction_lines = _build_trajectory_only_instructions(len(skill_names), max_skills=max_skills, protect_skills=protect_skills)
     else:
-        summary_heading = "### Task Summaries (this batch)"
+        summary_heading = _build_standard_heading()
         instruction_lines = _build_standard_instructions()
 
     return f"""\
@@ -438,6 +509,18 @@ Each task includes:
 - **Score 7-10 (LIKELY SOLVED)**: Agent probably succeeded. Skip these — do not create skills from them.
 
 **Group failures by category.** If multiple tasks in the same category failed for similar reasons, that's a pattern worth addressing with a category-specific skill."""
+
+
+def _build_standard_heading() -> str:
+    return """\
+### Task Summaries (this batch)
+
+Each task includes:
+- `success`, `score`, and `feedback`: real benchmark feedback from evaluation.
+- `signals`: automated behavior metrics extracted from the trajectory.
+- `compressed_trajectory`: failure-focused summary of approach, tool calls, errors, repeated actions, and final submission.
+
+Use the real feedback to identify which tasks failed, then use the trajectory fields to diagnose why they failed before changing prompts, skills, memory, or tools."""
 
 
 def _build_trajectory_only_instructions(current_skill_count: int, max_skills: int = 5, protect_skills: bool = False) -> str:

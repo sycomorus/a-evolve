@@ -1,0 +1,31 @@
+tools:
+  - name: list_context
+    kind: seed
+    module: tools.seed_tools.list_context
+    function: list_context
+    description: List visible files under docs/ and data/.
+  - name: read_md
+    kind: seed
+    module: tools.seed_tools.read_md
+    function: read_md
+    description: Read visible Markdown files.
+  - name: read_csv
+    kind: seed
+    module: tools.seed_tools.read_csv
+    function: read_csv
+    description: Read visible CSV files.
+  - name: run_solver
+    kind: seed
+    module: tools.seed_tools.run_solver
+    function: run_solver
+    description: Run optimization solver code in the guarded runtime.
+  - name: execute_python
+    kind: seed
+    module: tools.seed_tools.execute_python
+    function: execute_python
+    description: Execute Python code in the guarded runtime.
+  - name: finalize
+    kind: seed
+    module: tools.seed_tools.finalize
+    function: finalize
+    description: Submit final code and objective value.
