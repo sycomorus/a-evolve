@@ -66,6 +66,7 @@ inspect_evals/
 uv.lock
 
 evolution_workdir
+evolution_workdir_or_interact/
 logs/
 swe_results*/
 .crowdresearch/

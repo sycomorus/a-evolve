@@ -5,8 +5,11 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import sys
 from pathlib import Path
+
+import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 REPO_ROOT = ROOT.parent
@@ -23,6 +26,7 @@ from agent_evolve.config import EvolveConfig
 
 def main() -> int:
     args = parse_args()
+    evolver_model, evolver_base_url, evolver_api_key = resolve_evolver_llm(args)
     benchmark = ORInteractBenchmark(
         benchmark_dir=args.benchmark_dir,
         dataset="IndustryOR",
@@ -33,12 +37,18 @@ def main() -> int:
     config = EvolveConfig(
         batch_size=train_batch,
         max_cycles=args.max_cycles,
+        evolver_model=evolver_model,
+        evolver_max_tokens=args.evolver_max_tokens,
         evolve_prompts=True,
         evolve_skills=True,
         evolve_memory=True,
         evolve_tools=True,
         trajectory_only=False,
-        extra={"max_skills": args.max_skills},
+        extra={
+            "max_skills": args.max_skills,
+            "evolver_base_url": evolver_base_url,
+            "evolver_api_key": evolver_api_key,
+        },
     )
     engine = AdaptiveSkillEngine(config)
     seed_workspace = ROOT / "seed_workspaces" / "or_interact_react"
@@ -99,7 +109,45 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-skills", type=int, default=8)
     parser.add_argument("--limit-train", type=int)
     parser.add_argument("--limit-test", type=int)
+    parser.add_argument("--evolver-model")
+    parser.add_argument("--evolver-base-url")
+    parser.add_argument("--evolver-api-key")
+    parser.add_argument("--evolver-config", default=str(REPO_ROOT / "config" / "react.yaml"))
+    parser.add_argument("--evolver-max-tokens", type=int, default=16384)
     return parser.parse_args()
+
+
+def resolve_evolver_llm(args: argparse.Namespace) -> tuple[str, str | None, str | None]:
+    config = load_yaml(args.evolver_config)
+    model = (
+        args.evolver_model
+        or os.environ.get("EVOLVER_MODEL")
+        or config.get("model")
+        or EvolveConfig.evolver_model
+    )
+    base_url = (
+        args.evolver_base_url
+        or os.environ.get("EVOLVER_OPENAI_BASE_URL")
+        or os.environ.get("OPENAI_BASE_URL")
+        or config.get("base_url")
+    )
+    api_key = (
+        args.evolver_api_key
+        or os.environ.get("EVOLVER_OPENAI_API_KEY")
+        or os.environ.get("OPENAI_API_KEY")
+        or config.get("api_key")
+    )
+    if base_url and not model.startswith("openai:"):
+        model = f"openai:{model}"
+    return model, base_url, api_key
+
+
+def load_yaml(path: str) -> dict[str, str]:
+    file_path = Path(path)
+    if not file_path.exists():
+        return {}
+    data = yaml.safe_load(file_path.read_text(encoding="utf-8")) or {}
+    return data if isinstance(data, dict) else {}
 
 
 if __name__ == "__main__":

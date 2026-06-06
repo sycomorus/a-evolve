@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -52,6 +53,20 @@ def make_workspace_bash(workspace_root: str | Path):
 def create_default_llm(config: EvolveConfig) -> LLMProvider:
     """Create the default LLM provider based on the evolver_model config string."""
     model = config.evolver_model
+
+    if (
+        model.startswith("openai:")
+        or config.extra.get("evolver_base_url")
+        or os.environ.get("EVOLVER_OPENAI_BASE_URL")
+        or os.environ.get("OPENAI_BASE_URL")
+    ):
+        from ..unified.openai_compat import OpenAICompatProvider
+
+        return OpenAICompatProvider(
+            model=model.removeprefix("openai:"),
+            api_key=config.extra.get("evolver_api_key"),
+            base_url=config.extra.get("evolver_base_url"),
+        )
 
     if "." in model and ("anthropic" in model or "amazon" in model or "meta" in model):
         from ...llm.bedrock import BedrockProvider
