@@ -3,8 +3,18 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from agent_evolve.algorithms.adaptive_skill.engine import AdaptiveSkillEngine
 from agent_evolve.algorithms.adaptive_skill.prompts import build_evolution_prompt
+from agent_evolve.config import EvolveConfig
 from agent_evolve.contract.workspace import AgentWorkspace
+from agent_evolve.engine.versioning import VersionControl
+
+
+class _EmptyHistory:
+    latest_cycle = 0
+
+    def get_observations(self, last_n_cycles: int = 2) -> list[dict]:
+        return []
 
 
 def test_standard_prompt_includes_real_feedback_and_compressed_trajectory(tmp_path: Path) -> None:
@@ -63,3 +73,30 @@ def test_standard_prompt_includes_real_feedback_and_compressed_trajectory(tmp_pa
     assert "Traceback: bad model" in prompt
     assert '"submitted": true' in prompt
     assert "[submitted] 123" in prompt
+
+
+def test_adaptive_skill_step_marks_prompt_diff_as_mutation(tmp_path: Path) -> None:
+    workspace = AgentWorkspace(tmp_path)
+    workspace.write_prompt("initial prompt")
+    (tmp_path / "skills").mkdir()
+    (tmp_path / "memory").mkdir()
+    (tmp_path / "tools").mkdir()
+    (tmp_path / "manifest.yaml").write_text("name: test\n", encoding="utf-8")
+    VersionControl(workspace.root).init()
+
+    engine = AdaptiveSkillEngine(EvolveConfig())
+
+    def mutate_prompt(_prompt: str, root: Path) -> dict:
+        (root / "prompts" / "system.md").write_text("changed prompt", encoding="utf-8")
+        return {"usage": {}}
+
+    engine._run_llm = mutate_prompt  # type: ignore[method-assign]
+
+    result = engine.step(
+        workspace=workspace,
+        observations=[],
+        history=_EmptyHistory(),
+        trial=None,
+    )
+
+    assert result.mutated is True

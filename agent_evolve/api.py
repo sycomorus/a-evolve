@@ -26,6 +26,7 @@ import importlib
 import logging
 import shutil
 from pathlib import Path
+from typing import Any, Callable
 
 from .benchmarks.base import BenchmarkAdapter
 from .config import EvolveConfig
@@ -116,9 +117,13 @@ class Evolver:
 
         return AEvolveEngine(self.config)
 
-    def run(self, cycles: int | None = None) -> EvolutionResult:
+    def run(
+        self,
+        cycles: int | None = None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> EvolutionResult:
         """Run the evolution loop."""
-        return self._loop.run(cycles=cycles)
+        return self._loop.run(cycles=cycles, progress_callback=progress_callback)
 
     # ── Resolution helpers ───────────────────────────────────────────
 

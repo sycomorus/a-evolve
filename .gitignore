@@ -56,6 +56,8 @@ inspect_evals/
 !/tests/test_skillbench_setup.py
 !/tests/test_or_interact_adapter.py
 !/tests/test_adaptive_skill_prompt.py
+!/tests/test_runs.py
+!/tests/test_evaluation.py
 !/tests/gepa/
 
 # Root-level artifacts

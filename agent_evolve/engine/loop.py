@@ -13,7 +13,7 @@ import json
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Callable
 
 from ..config import EvolveConfig
 from ..types import CycleRecord, EvolutionResult, Observation
@@ -65,7 +65,11 @@ class EvolutionLoop:
         self.history = EvolutionHistory(self.observer, self.versioning)
         self.trial = TrialRunner(self.agent, self.benchmark)
 
-    def run(self, cycles: int | None = None) -> EvolutionResult:
+    def run(
+        self,
+        cycles: int | None = None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> EvolutionResult:
         """Run the evolution loop for the specified number of cycles."""
         max_cycles = cycles or self.config.max_cycles
         evolution_dir = self.agent.workspace.root / "evolution"
@@ -92,7 +96,9 @@ class EvolutionLoop:
                     try:
                         trajectory = self.agent.solve(task)
                         feedback = self.benchmark.evaluate(task, trajectory)
-                        observations.append(Observation(task=task, trajectory=trajectory, feedback=feedback))
+                        observations.append(
+                            Observation(task=task, trajectory=trajectory, feedback=feedback)
+                        )
                     except Exception as e:
                         logger.error("Error solving task %s: %s", task.id, e)
 
@@ -154,6 +160,16 @@ class EvolutionLoop:
                 logger.info("Engine requested early stop after cycle %d.", cycle_num)
                 self._append_history(evolution_dir, cycle_num, cycle_score, step_result.mutated)
                 self._write_metrics(evolution_dir, score_history)
+                self._notify_progress(
+                    progress_callback,
+                    cycle_num,
+                    max_cycles,
+                    cycle_score,
+                    step_result.mutated,
+                    step_result.summary,
+                    stopped=True,
+                    converged=True,
+                )
                 return EvolutionResult(
                     cycles_completed=cycle_num,
                     final_score=cycle_score,
@@ -164,6 +180,14 @@ class EvolutionLoop:
             # 8. LOGGING
             self._append_history(evolution_dir, cycle_num, cycle_score, step_result.mutated)
             self._write_metrics(evolution_dir, score_history)
+            self._notify_progress(
+                progress_callback,
+                cycle_num,
+                max_cycles,
+                cycle_score,
+                step_result.mutated,
+                step_result.summary,
+            )
 
             # 9. CONVERGENCE CHECK
             if _is_score_converged(score_history, window=self.config.egl_window):
@@ -183,6 +207,32 @@ class EvolutionLoop:
         )
 
     # ── Internal helpers ──────────────────────────────────────
+
+    def _notify_progress(
+        self,
+        progress_callback: Callable[[dict[str, Any]], None] | None,
+        cycle: int,
+        total_cycles: int,
+        score: float,
+        mutated: bool,
+        summary: str,
+        *,
+        stopped: bool = False,
+        converged: bool = False,
+    ) -> None:
+        if progress_callback is None:
+            return
+        progress_callback(
+            {
+                "cycle": cycle,
+                "total_cycles": total_cycles,
+                "score": score,
+                "mutated": mutated,
+                "summary": summary,
+                "stopped": stopped,
+                "converged": converged,
+            }
+        )
 
     def _append_history(
         self, evolution_dir: Path, cycle: int, score: float, mutated: bool

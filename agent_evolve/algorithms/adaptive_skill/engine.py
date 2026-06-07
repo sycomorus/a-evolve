@@ -8,6 +8,7 @@ default EvolutionEngine implementation.
 from __future__ import annotations
 
 import logging
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,8 @@ from .prompts import DEFAULT_EVOLVER_SYSTEM_PROMPT, build_evolution_prompt
 from .tools import BASH_TOOL_SPEC, create_default_llm, make_workspace_bash
 
 logger = logging.getLogger(__name__)
+
+MUTATION_PATHS = ("prompts", "skills", "memory", "tools", "manifest.yaml")
 
 
 class AdaptiveSkillEngine(EvolutionEngine):
@@ -67,12 +70,11 @@ class AdaptiveSkillEngine(EvolutionEngine):
         )
         response = self._run_llm(prompt, workspace.root)
 
-        skills_after = [s.name for s in workspace.list_skills()]
-        new_skills = len(set(skills_after) - set(skills_before))
-
         workspace.clear_drafts()
 
-        mutated = set(skills_after) != set(skills_before) or new_skills > 0
+        skills_after = [s.name for s in workspace.list_skills()]
+        new_skills = len(set(skills_after) - set(skills_before))
+        mutated = _workspace_has_mutation(workspace.root)
 
         return StepResult(
             mutated=mutated,
@@ -123,12 +125,11 @@ class AdaptiveSkillEngine(EvolutionEngine):
         )
         response = self._run_llm(prompt, workspace.root)
 
-        skills_after = [s.name for s in workspace.list_skills()]
-        new_skills = len(set(skills_after) - set(skills_before))
-
         workspace.clear_drafts()
 
-        mutated = set(skills_after) != set(skills_before) or new_skills > 0
+        skills_after = [s.name for s in workspace.list_skills()]
+        new_skills = len(set(skills_after) - set(skills_before))
+        mutated = _workspace_has_mutation(workspace.root)
         if mutated:
             vc.commit(
                 message=f"evo-{evo_number}: {new_skills} new skills",
@@ -178,3 +179,17 @@ class AdaptiveSkillEngine(EvolutionEngine):
             "content": response.content,
             "usage": response.usage,
         }
+
+
+def _workspace_has_mutation(workspace_root: Path) -> bool:
+    """Return whether evolvable workspace files changed since the last commit."""
+    result = subprocess.run(
+        ["git", "status", "--porcelain", "--", *MUTATION_PATHS],
+        capture_output=True,
+        text=True,
+        cwd=str(workspace_root),
+    )
+    if result.returncode != 0:
+        logger.warning("Could not inspect workspace mutation status: %s", result.stderr.strip())
+        return False
+    return bool(result.stdout.strip())
