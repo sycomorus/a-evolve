@@ -6,8 +6,10 @@ import importlib.util
 import inspect
 import json
 import os
+import signal
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, get_args, get_origin, get_type_hints
 
@@ -61,12 +63,17 @@ class ORReactAgent(BaseAgent):
         error: str | None = None
 
         try:
-            result = ReActAgent(
-                config=self.config,
-                trace=trace,
-                registry=registry,
-                system_prompt=system_prompt,
-            ).run()
+            with _task_timeout(self.config.task_timeout_seconds):
+                result = ReActAgent(
+                    config=self.config,
+                    trace=trace,
+                    registry=registry,
+                    system_prompt=system_prompt,
+                ).run()
+        except TimeoutError as exc:
+            error = str(exc)
+            trace.event("error", {"message": error})
+            result = AgentResult(status="task_timeout", turns=0, error=error)
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
             trace.event("error", {"message": error})
@@ -121,6 +128,7 @@ class ORReactAgent(BaseAgent):
                 model=os.environ.get("OR_REACT_MODEL") or os.environ.get("OPENAI_MODEL") or "gpt-4o-mini",
                 temperature=0.0,
                 max_turns=int(os.environ.get("OR_REACT_MAX_TURNS", "16")),
+                task_timeout_seconds=int(os.environ.get("OR_REACT_TASK_TIMEOUT_SECONDS", "600")),
                 parallelism=int(os.environ.get("OR_REACT_PARALLELISM", "1")),
                 benchmark_dir=(Path.cwd() / "OR-Interact-Bench").resolve(),
                 results_dir=self.workspace.root / "evolution" / "runs",
@@ -133,6 +141,9 @@ class ORReactAgent(BaseAgent):
             model=os.environ.get("OR_REACT_MODEL", base.model),
             temperature=float(os.environ.get("OR_REACT_TEMPERATURE", str(base.temperature))),
             max_turns=int(os.environ.get("OR_REACT_MAX_TURNS", str(base.max_turns))),
+            task_timeout_seconds=int(
+                os.environ.get("OR_REACT_TASK_TIMEOUT_SECONDS", str(base.task_timeout_seconds))
+            ),
             parallelism=int(os.environ.get("OR_REACT_PARALLELISM", str(base.parallelism))),
             benchmark_dir=base.benchmark_dir,
             results_dir=Path(results_dir).expanduser().resolve()
@@ -286,3 +297,25 @@ def _validate_tool_function(name: str, function: Any) -> None:
         args = get_args(return_annotation)
         if args and args[0] is not str:
             raise ValueError(f"evolved tool {name!r} must use string keys")
+
+
+@contextmanager
+def _task_timeout(seconds: int):
+    if seconds <= 0:
+        yield
+        return
+
+    def _handle_timeout(signum, frame):
+        raise TimeoutError(f"task exceeded timeout of {seconds} seconds")
+
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_alarm = signal.alarm(0)
+    signal.signal(signal.SIGALRM, _handle_timeout)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        if previous_alarm > 0:
+            signal.alarm(previous_alarm)
