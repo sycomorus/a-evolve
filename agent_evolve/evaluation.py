@@ -19,6 +19,7 @@ from rich.progress import (
 
 from .benchmarks.base import BenchmarkAdapter
 from .protocol.base_agent import BaseAgent
+from .task_runner import TaskEvaluation, resolve_agent_parallelism, run_task_evaluations
 
 
 def run_evaluation(
@@ -39,9 +40,8 @@ def run_evaluation(
     destination = Path(output_dir)
     destination.mkdir(parents=True, exist_ok=True)
 
-    rows: list[dict[str, Any]] = []
     tasks = benchmark.get_tasks(split=split, limit=limit)
-    task_iterable = tasks
+    workers = min(resolve_agent_parallelism(agent), len(tasks)) if tasks else 0
 
     if show_progress:
         active_console = console or Console()
@@ -50,6 +50,7 @@ def run_evaluation(
             TextColumn("[bold cyan]Evaluating"),
             BarColumn(),
             MofNCompleteColumn(),
+            TextColumn("[dim]workers={task.fields[workers]}"),
             TextColumn("[dim]{task.fields[current_task]}"),
             TimeElapsedColumn(),
             console=active_console,
@@ -58,17 +59,26 @@ def run_evaluation(
                 "evaluate",
                 total=len(tasks),
                 current_task="starting",
+                workers=workers,
             )
-            for task in tasks:
-                rows.append(_evaluate_one(agent, benchmark, task))
+
+            def update_progress(result: TaskEvaluation) -> None:
                 progress.update(
                     task_id,
                     advance=1,
-                    current_task=task.id,
+                    current_task=result.task.id,
                 )
+
+            evaluations = run_task_evaluations(
+                agent,
+                benchmark,
+                tasks,
+                on_complete=update_progress,
+            )
     else:
-        for task in task_iterable:
-            rows.append(_evaluate_one(agent, benchmark, task))
+        evaluations = run_task_evaluations(agent, benchmark, tasks)
+
+    rows = [_row_from_evaluation(result) for result in evaluations]
 
     total = len(rows)
     success = sum(1 for row in rows if _as_bool(row.get("success")))
@@ -92,31 +102,25 @@ def run_evaluation(
     return summary
 
 
-def _evaluate_one(
-    agent: BaseAgent,
-    benchmark: BenchmarkAdapter,
-    task: Any,
-) -> dict[str, Any]:
-    try:
-        trajectory = agent.solve(task)
-        feedback = benchmark.evaluate(task, trajectory)
-        row = {
-            "task_id": task.id,
-            "success": feedback.success,
-            "score": feedback.score,
-            "detail": feedback.detail,
-        }
-        evaluation = feedback.raw.get("evaluation") if isinstance(feedback.raw, dict) else None
-        if isinstance(evaluation, dict):
-            row.update(evaluation)
-        return row
-    except Exception as exc:
+def _row_from_evaluation(result: TaskEvaluation) -> dict[str, Any]:
+    if result.feedback is None:
         return {
-            "task_id": task.id,
+            "task_id": result.task.id,
             "success": False,
             "score": 0.0,
-            "detail": f"{type(exc).__name__}: {exc}",
+            "detail": result.error or "missing feedback",
         }
+    feedback = result.feedback
+    row = {
+        "task_id": result.task.id,
+        "success": feedback.success,
+        "score": feedback.score,
+        "detail": feedback.detail,
+    }
+    evaluation = feedback.raw.get("evaluation") if isinstance(feedback.raw, dict) else None
+    if isinstance(evaluation, dict):
+        row.update(evaluation)
+    return row
 
 
 def _write_results_csv(path: Path, rows: list[dict[str, Any]]) -> None:

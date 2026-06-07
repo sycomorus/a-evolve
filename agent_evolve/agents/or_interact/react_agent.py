@@ -121,20 +121,23 @@ class ORReactAgent(BaseAgent):
                 model=os.environ.get("OR_REACT_MODEL") or os.environ.get("OPENAI_MODEL") or "gpt-4o-mini",
                 temperature=0.0,
                 max_turns=int(os.environ.get("OR_REACT_MAX_TURNS", "16")),
-                parallelism=1,
+                parallelism=int(os.environ.get("OR_REACT_PARALLELISM", "1")),
                 benchmark_dir=(Path.cwd() / "OR-Interact-Bench").resolve(),
                 results_dir=self.workspace.root / "evolution" / "runs",
             )
 
+        results_dir = os.environ.get("OR_REACT_RESULTS_DIR")
         return ReactConfig(
             api_key=os.environ.get("OR_REACT_API_KEY", base.api_key),
             base_url=os.environ.get("OR_REACT_BASE_URL", base.base_url),
             model=os.environ.get("OR_REACT_MODEL", base.model),
             temperature=float(os.environ.get("OR_REACT_TEMPERATURE", str(base.temperature))),
             max_turns=int(os.environ.get("OR_REACT_MAX_TURNS", str(base.max_turns))),
-            parallelism=1,
+            parallelism=int(os.environ.get("OR_REACT_PARALLELISM", str(base.parallelism))),
             benchmark_dir=base.benchmark_dir,
-            results_dir=self.workspace.root / "evolution" / "runs",
+            results_dir=Path(results_dir).expanduser().resolve()
+            if results_dir
+            else self.workspace.root / "evolution" / "runs",
         )
 
     def _build_system_prompt(self) -> str:

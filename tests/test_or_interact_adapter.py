@@ -142,6 +142,76 @@ def test_workspace_tool_overrides_seed_tool(tmp_path: Path) -> None:
     assert agent.registry.get("list_context").kind == "evolved"
 
 
+def test_agent_parallelism_comes_from_react_yaml(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = _workspace(tmp_path / "workspace")
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "react.yaml").write_text(
+        "\n".join(
+            [
+                "api_key: test-key",
+                "base_url: http://localhost/v1",
+                "model: fake-model",
+                "temperature: 0.0",
+                "max_turns: 3",
+                "parallelism: 4",
+                f"benchmark_dir: {BENCHMARK_DIR}",
+                "results_dir: results/react",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    agent = ORReactAgent(workspace)
+
+    assert agent.config.parallelism == 4
+
+
+def test_agent_parallelism_env_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = _workspace(tmp_path / "workspace")
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "react.yaml").write_text(
+        "\n".join(
+            [
+                "api_key: test-key",
+                "base_url: http://localhost/v1",
+                "model: fake-model",
+                "parallelism: 4",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OR_REACT_PARALLELISM", "2")
+
+    agent = ORReactAgent(workspace)
+
+    assert agent.config.parallelism == 2
+
+
+def test_agent_results_dir_env_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = _workspace(tmp_path / "workspace")
+    results_dir = tmp_path / "evaluation" / "runs"
+    monkeypatch.setenv("OR_REACT_RESULTS_DIR", str(results_dir))
+
+    agent = ORReactAgent(workspace)
+
+    assert agent.config.results_dir == results_dir.resolve()
+
+
 def test_forbidden_evolved_tool_is_rejected(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path / "workspace")
     _write_tool(

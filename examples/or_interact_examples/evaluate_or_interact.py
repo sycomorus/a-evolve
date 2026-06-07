@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -51,16 +52,24 @@ def main() -> int:
         seed=42,
         train_size=50,
     )
-    agent = ORReactAgent(workspace)
-    summary = run_evaluation(
-        agent,
-        benchmark,
-        split=args.split,
-        limit=args.limit,
-        output_dir=output_dir,
-        show_progress=True,
-        console=console,
-    )
+    previous_results_dir = os.environ.get("OR_REACT_RESULTS_DIR")
+    os.environ["OR_REACT_RESULTS_DIR"] = str((output_dir / "runs").resolve())
+    try:
+        agent = ORReactAgent(workspace)
+        summary = run_evaluation(
+            agent,
+            benchmark,
+            split=args.split,
+            limit=args.limit,
+            output_dir=output_dir,
+            show_progress=True,
+            console=console,
+        )
+    finally:
+        if previous_results_dir is None:
+            os.environ.pop("OR_REACT_RESULTS_DIR", None)
+        else:
+            os.environ["OR_REACT_RESULTS_DIR"] = previous_results_dir
     summary["source_type"] = source_type
     (output_dir / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2),
@@ -80,7 +89,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--from",
         dest="from_source",
-        default="latest",
+        default="empty",
         help=(
             "Evaluation source: empty, latest, a run id under work-dir/runs, "
             "a run path, or a workspace path."

@@ -19,6 +19,7 @@ from ..config import EvolveConfig
 from ..types import CycleRecord, EvolutionResult, Observation
 from .history import EvolutionHistory
 from .observer import Observer
+from ..task_runner import run_task_evaluations
 from .trial import TrialRunner
 from .versioning import VersionControl
 
@@ -90,17 +91,19 @@ class EvolutionLoop:
                 cycle_score = 0.0
             else:
                 tasks = self.benchmark.get_tasks(split="train", limit=self.config.batch_size)
-                observations: list[Observation] = []
-
-                for task in tasks:
-                    try:
-                        trajectory = self.agent.solve(task)
-                        feedback = self.benchmark.evaluate(task, trajectory)
-                        observations.append(
-                            Observation(task=task, trajectory=trajectory, feedback=feedback)
+                task_results = run_task_evaluations(self.agent, self.benchmark, tasks)
+                observations = []
+                for result in task_results:
+                    if result.trajectory is None or result.feedback is None:
+                        logger.error("Error solving task %s: %s", result.task.id, result.error)
+                        continue
+                    observations.append(
+                        Observation(
+                            task=result.task,
+                            trajectory=result.trajectory,
+                            feedback=result.feedback,
                         )
-                    except Exception as e:
-                        logger.error("Error solving task %s: %s", task.id, e)
+                    )
 
                 self.agent.export_to_fs()
                 batch_path = self.observer.collect(observations)
