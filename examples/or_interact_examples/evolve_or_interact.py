@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
+from typing import Any
 
 import yaml
 from rich.console import Console
@@ -13,7 +15,7 @@ from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, T
 
 ROOT = Path(__file__).resolve().parents[2]
 REPO_ROOT = ROOT.parent
-REACT_CONFIG = REPO_ROOT / "config" / "react.yaml"
+EVOLVER_CONFIG = REPO_ROOT / "config" / "evolver.yaml"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 if str(REPO_ROOT) not in sys.path:
@@ -31,7 +33,7 @@ from agent_evolve.runs import create_run_workspace, update_run_metadata
 def main() -> int:
     args = parse_args()
     console = Console()
-    evolver_model, evolver_base_url, evolver_api_key = resolve_evolver_llm()
+    evolver_model, evolver_base_url, evolver_api_key, evolver_temperature = resolve_evolver_llm()
     benchmark = ORInteractBenchmark(
         benchmark_dir=args.benchmark_dir,
         dataset="IndustryOR",
@@ -52,6 +54,7 @@ def main() -> int:
             "max_skills": args.max_skills,
             "evolver_base_url": evolver_base_url,
             "evolver_api_key": evolver_api_key,
+            "evolver_temperature": evolver_temperature,
         },
     )
     engine = AdaptiveSkillEngine(config)
@@ -166,21 +169,23 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def resolve_evolver_llm() -> tuple[str, str, str | None]:
-    config = load_yaml(REACT_CONFIG)
+def resolve_evolver_llm() -> tuple[str, str, str | None, float | None]:
+    config_path = Path(os.environ.get("OR_EVOLVER_CONFIG", EVOLVER_CONFIG))
+    config = load_yaml(config_path)
     model = config.get("model")
     base_url = config.get("base_url")
     api_key = config.get("api_key")
+    temperature = config.get("temperature")
     if not model or not base_url:
         raise ValueError(
-            f"{REACT_CONFIG} must define model and base_url for the OpenAI-compatible evolver."
+            f"{config_path} must define model and base_url for the OpenAI-compatible evolver."
         )
     if base_url and not model.startswith("openai:"):
         model = f"openai:{model}"
-    return model, base_url, api_key
+    return model, base_url, api_key, float(temperature) if temperature is not None else None
 
 
-def load_yaml(path: str | Path) -> dict[str, str]:
+def load_yaml(path: str | Path) -> dict[str, Any]:
     file_path = Path(path)
     if not file_path.exists():
         return {}

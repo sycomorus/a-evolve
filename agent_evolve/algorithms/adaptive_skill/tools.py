@@ -66,6 +66,11 @@ def create_default_llm(config: EvolveConfig) -> LLMProvider:
             model=model.removeprefix("openai:"),
             api_key=config.extra.get("evolver_api_key"),
             base_url=config.extra.get("evolver_base_url"),
+            temperature=config.extra.get("evolver_temperature"),
+            omit_temperature=(
+                "evolver_temperature" in config.extra
+                and config.extra.get("evolver_temperature") is None
+            ),
         )
 
     if "." in model and ("anthropic" in model or "amazon" in model or "meta" in model):

@@ -318,6 +318,7 @@ Respond in JSON format:
 
 def judge_trajectories(
     logs: list[dict[str, Any]],
+    llm: Any | None = None,
     model_id: str = "us.anthropic.claude-opus-4-6-v1",
     region: str = "us-west-2",
 ) -> list[dict[str, Any]]:
@@ -327,13 +328,14 @@ def judge_trajectories(
     Each verdict has: score (0-10), category, outcome, failure_reason.
     """
     try:
-        from ...llm.bedrock import BedrockProvider
         from ...llm.base import LLMMessage
+        if llm is None:
+            from ...llm.bedrock import BedrockProvider
+            llm = BedrockProvider(model_id=model_id, region=region)
     except ImportError:
-        logger.warning("BedrockProvider not available, skipping judge")
+        logger.warning("LLM judge provider not available, skipping judge")
         return [{"score": -1, "category": "unknown", "outcome": "judge unavailable", "failure_reason": ""} for _ in logs]
 
-    llm = BedrockProvider(model_id=model_id, region=region)
     verdicts = []
 
     for log in logs:
@@ -385,6 +387,7 @@ def build_evolution_prompt(
     solver_proposed: bool = False,
     prompt_only: bool = False,
     protect_skills: bool = False,
+    judge_llm: Any | None = None,
 ) -> str:
     """Build the user-message prompt for one evolution cycle.
 
@@ -400,9 +403,7 @@ def build_evolution_prompt(
     verdicts = []
     if trajectory_only and recent_logs:
         try:
-            from ..adaptive_skill.tools import create_default_llm
-            config_module = __import__("agent_evolve.config", fromlist=["EvolveConfig"])
-            verdicts = judge_trajectories(recent_logs)
+            verdicts = judge_trajectories(recent_logs, llm=judge_llm)
         except Exception as e:
             logger.warning("Judge step failed, proceeding without verdicts: %s", str(e)[:100])
             verdicts = []

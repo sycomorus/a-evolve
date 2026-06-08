@@ -98,6 +98,26 @@ def test_latest_run_id_and_path_sources_resolve_workspace(tmp_path: Path) -> Non
     )
 
 
+def test_simple_run_id_preferred_over_cwd_relative_path(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    seed = _workspace(tmp_path / "seed")
+    cwd_workspace = _workspace(tmp_path / "manual")
+    run_workspace = _workspace(tmp_path / "work" / "runs" / "manual" / "workspace")
+
+    monkeypatch.chdir(tmp_path)
+
+    assert resolve_workspace_source(tmp_path / "work", "manual", seed) == (
+        "run",
+        run_workspace,
+    )
+    assert resolve_workspace_source(tmp_path / "work", cwd_workspace, seed) == (
+        "workspace",
+        cwd_workspace,
+    )
+
+
 def _workspace(path: Path) -> Path:
     path.mkdir(parents=True)
     (path / "manifest.yaml").write_text("name: fake\n", encoding="utf-8")

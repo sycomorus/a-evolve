@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from pathlib import Path
 
 from agent_evolve.algorithms.adaptive_skill.engine import AdaptiveSkillEngine
 from agent_evolve.algorithms.adaptive_skill.prompts import build_evolution_prompt
+from agent_evolve.algorithms.adaptive_skill.tools import create_default_llm
+from agent_evolve.algorithms.unified.openai_compat import OpenAICompatProvider
 from agent_evolve.config import EvolveConfig
 from agent_evolve.contract.workspace import AgentWorkspace
 from agent_evolve.engine.versioning import VersionControl
+from agent_evolve.llm.base import LLMResponse
 
 
 class _EmptyHistory:
@@ -15,6 +19,31 @@ class _EmptyHistory:
 
     def get_observations(self, last_n_cycles: int = 2) -> list[dict]:
         return []
+
+
+class _FakeCompletions:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.requests = []
+
+    def create(self, **kwargs):
+        self.requests.append(deepcopy(kwargs))
+        return self.responses.pop(0)
+
+
+class _FakeClient:
+    def __init__(self, responses):
+        self.chat = type("Chat", (), {})()
+        self.chat.completions = _FakeCompletions(responses)
+
+
+def _openai_compat_provider(responses) -> OpenAICompatProvider:
+    provider = object.__new__(OpenAICompatProvider)
+    provider.model = "fake-model"
+    provider.client = _FakeClient(responses)
+    provider.temperature = None
+    provider.omit_temperature = True
+    return provider
 
 
 def test_standard_prompt_includes_real_feedback_and_compressed_trajectory(tmp_path: Path) -> None:
@@ -106,6 +135,107 @@ def test_standard_prompt_keeps_reference_solution_feedback(tmp_path: Path) -> No
     )
 
     assert reference_tail in prompt
+
+
+def test_trajectory_only_judge_uses_injected_evolver_llm(tmp_path: Path) -> None:
+    workspace = AgentWorkspace(tmp_path)
+
+    class FakeJudge:
+        calls = 0
+
+        def complete(self, **_kwargs):
+            self.calls += 1
+            return LLMResponse(
+                content=json.dumps({
+                    "score": 2,
+                    "category": "optimization",
+                    "outcome": "failed before finalization",
+                    "failure_reason": "no submitted answer",
+                }),
+                usage={},
+            )
+
+    judge = FakeJudge()
+    prompt = build_evolution_prompt(
+        workspace=workspace,
+        logs=[{"task_id": "task_x", "conversation": []}],
+        drafts=[],
+        evo_number=1,
+        trajectory_only=True,
+        judge_llm=judge,
+    )
+
+    assert judge.calls == 1
+    assert "judge_verdict" in prompt
+    assert "no submitted answer" in prompt
+
+
+def test_openai_compatible_evolver_can_omit_temperature() -> None:
+    llm = create_default_llm(
+        EvolveConfig(
+            evolver_model="openai:gpt-5.5",
+            extra={
+                "evolver_base_url": "http://localhost/v1",
+                "evolver_api_key": "test-key",
+                "evolver_temperature": None,
+            },
+        )
+    )
+
+    assert getattr(llm, "omit_temperature") is True
+
+
+def test_openai_compatible_evolver_accepts_string_responses() -> None:
+    llm = _openai_compat_provider(["plain final response"])
+
+    response = llm.converse_loop(
+        system_prompt="system",
+        user_message="user",
+        tools=[],
+        tool_executor={},
+    )
+
+    assert response.content == "plain final response"
+
+
+def test_openai_compatible_evolver_accepts_json_string_tool_calls() -> None:
+    first_response = json.dumps({
+        "choices": [
+            {
+                "message": {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "workspace_bash",
+                                "arguments": json.dumps({"command": "pwd"}),
+                            },
+                        }
+                    ],
+                }
+            }
+        ],
+        "usage": {"prompt_tokens": 3, "completion_tokens": 4},
+    })
+    llm = _openai_compat_provider([first_response, "done"])
+
+    response = llm.converse_loop(
+        system_prompt="system",
+        user_message="user",
+        tools=[{"name": "workspace_bash", "input_schema": {"type": "object"}}],
+        tool_executor={"workspace_bash": lambda command: f"ran {command}"},
+    )
+
+    requests = llm.client.chat.completions.requests
+    assert response.content == "done"
+    assert response.usage == {"input_tokens": 3, "output_tokens": 4}
+    assert requests[1]["messages"][-1] == {
+        "role": "tool",
+        "tool_call_id": "call_1",
+        "content": "ran pwd",
+    }
 
 
 def test_adaptive_skill_step_marks_prompt_diff_as_mutation(tmp_path: Path) -> None:

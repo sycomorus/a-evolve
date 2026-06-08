@@ -88,10 +88,12 @@ def resolve_workspace_source(
         return "latest", _workspace_from_run(run_dir)
 
     candidate = Path(source)
-    if not candidate.exists():
-        run_id_path = Path(work_dir) / RUNS_DIRNAME / source_text
-        if run_id_path.exists():
-            candidate = run_id_path
+    run_id_path = Path(work_dir) / RUNS_DIRNAME / source_text
+    is_simple_run_id = not candidate.is_absolute() and len(candidate.parts) == 1
+    if is_simple_run_id and run_id_path.exists():
+        candidate = run_id_path
+    elif not candidate.exists() and run_id_path.exists():
+        candidate = run_id_path
 
     if candidate.exists():
         if (candidate / WORKSPACE_DIRNAME).is_dir():

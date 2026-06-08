@@ -17,6 +17,8 @@ class OpenAICompatProvider:
         model: str,
         api_key: str | None = None,
         base_url: str | None = None,
+        temperature: float | None = None,
+        omit_temperature: bool = False,
     ) -> None:
         try:
             import openai
@@ -41,6 +43,8 @@ class OpenAICompatProvider:
         elif resolved_api_key:
             kwargs["api_key"] = resolved_api_key
         self.client = openai.OpenAI(**kwargs)
+        self.temperature = temperature
+        self.omit_temperature = omit_temperature
 
     def complete(
         self,
@@ -49,16 +53,20 @@ class OpenAICompatProvider:
         temperature: float = 0.0,
         **_: Any,
     ) -> LLMResponse:
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": m.role, "content": m.content} for m in messages],
-            max_tokens=max_tokens,
-            temperature=temperature,
-        )
-        choice = response.choices[0]
-        usage = getattr(response, "usage", None)
+        params: dict[str, Any] = {
+            "model": self.model,
+            "messages": [{"role": m.role, "content": m.content} for m in messages],
+            "max_tokens": max_tokens,
+        }
+        if not self.omit_temperature:
+            resolved_temperature = self.temperature if self.temperature is not None else temperature
+            if resolved_temperature is not None:
+                params["temperature"] = resolved_temperature
+        response = self.client.chat.completions.create(**params)
+        content, _tool_calls = self._message_parts(response)
+        usage = self._response_usage(response)
         return LLMResponse(
-            content=choice.message.content or "",
+            content=content,
             usage={
                 "input_tokens": self._usage_value(usage, "prompt_tokens"),
                 "output_tokens": self._usage_value(usage, "completion_tokens"),
@@ -79,10 +87,10 @@ class OpenAICompatProvider:
             max_tokens=max_tokens,
             tools=self._to_openai_tools(tools),
         )
-        choice = response.choices[0]
-        usage = getattr(response, "usage", None)
+        content, _tool_calls = self._message_parts(response)
+        usage = self._response_usage(response)
         return LLMResponse(
-            content=choice.message.content or "",
+            content=content,
             usage={
                 "input_tokens": self._usage_value(usage, "prompt_tokens"),
                 "output_tokens": self._usage_value(usage, "completion_tokens"),
@@ -121,29 +129,26 @@ class OpenAICompatProvider:
                 params["tool_choice"] = "auto"
             response = self.client.chat.completions.create(**params)
             last_response = response
-            usage = getattr(response, "usage", None)
+            usage = self._response_usage(response)
             input_tokens += self._usage_value(usage, "prompt_tokens")
             output_tokens += self._usage_value(usage, "completion_tokens")
 
-            message = response.choices[0].message
-            content = getattr(message, "content", None) or ""
-            tool_calls = list(getattr(message, "tool_calls", None) or [])
+            content, tool_calls = self._message_parts(response)
             if content:
                 text_parts.append(content)
 
             assistant_message: dict[str, Any] = {"role": "assistant", "content": content}
             if tool_calls:
-                assistant_message["tool_calls"] = [
-                    self._tool_call_to_dict(call) for call in tool_calls
-                ]
+                assistant_message["tool_calls"] = tool_calls
             messages.append(assistant_message)
 
             if not tool_calls:
                 break
 
             for tool_call in tool_calls:
-                name = tool_call.function.name
-                raw_args = tool_call.function.arguments or "{}"
+                function = tool_call.get("function") or {}
+                name = function.get("name") or ""
+                raw_args = function.get("arguments") or "{}"
                 try:
                     parsed_args = json.loads(raw_args)
                     executor = tool_executor.get(name)
@@ -157,7 +162,7 @@ class OpenAICompatProvider:
                     result_text = f"ERROR: {exc}"
                 messages.append({
                     "role": "tool",
-                    "tool_call_id": tool_call.id,
+                    "tool_call_id": tool_call.get("id"),
                     "content": result_text,
                 })
 
@@ -186,6 +191,8 @@ class OpenAICompatProvider:
 
     @staticmethod
     def _tool_call_to_dict(tool_call: Any) -> dict[str, Any]:
+        if isinstance(tool_call, dict):
+            return tool_call
         return {
             "id": tool_call.id,
             "type": "function",
@@ -194,6 +201,56 @@ class OpenAICompatProvider:
                 "arguments": tool_call.function.arguments or "{}",
             },
         }
+
+    @classmethod
+    def _message_parts(cls, response: Any) -> tuple[str, list[dict[str, Any]]]:
+        raw = cls._response_payload(response)
+        if isinstance(raw, str):
+            return raw, []
+
+        choices = raw.get("choices") or []
+        if not choices:
+            return str(raw), []
+
+        choice = choices[0]
+        if not isinstance(choice, dict):
+            choice = cls._response_payload(choice)
+        if not isinstance(choice, dict):
+            return str(choice), []
+
+        message = choice.get("message") or choice.get("delta") or {}
+        if not isinstance(message, dict):
+            message = cls._response_payload(message)
+        if not isinstance(message, dict):
+            return str(message), []
+
+        content = message.get("content")
+        if content is None:
+            content = choice.get("text") or ""
+        tool_calls = [
+            cls._tool_call_to_dict(tool_call)
+            for tool_call in (message.get("tool_calls") or [])
+        ]
+        return str(content or ""), tool_calls
+
+    @classmethod
+    def _response_usage(cls, response: Any) -> Any:
+        raw = cls._response_payload(response)
+        return raw.get("usage") if isinstance(raw, dict) else None
+
+    @staticmethod
+    def _response_payload(response: Any) -> Any:
+        if isinstance(response, str):
+            text = response.strip()
+            if not text:
+                return ""
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                return response
+        if hasattr(response, "model_dump"):
+            return response.model_dump(exclude_none=True)
+        return response
 
     @staticmethod
     def _usage_value(usage: Any, key: str) -> int:
