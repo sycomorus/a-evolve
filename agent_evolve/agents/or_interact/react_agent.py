@@ -139,7 +139,7 @@ class ORReactAgent(BaseAgent):
             api_key=os.environ.get("OR_REACT_API_KEY", base.api_key),
             base_url=os.environ.get("OR_REACT_BASE_URL", base.base_url),
             model=os.environ.get("OR_REACT_MODEL", base.model),
-            temperature=float(os.environ.get("OR_REACT_TEMPERATURE", str(base.temperature))),
+            temperature=_resolve_temperature(base.temperature),
             max_turns=int(os.environ.get("OR_REACT_MAX_TURNS", str(base.max_turns))),
             task_timeout_seconds=int(
                 os.environ.get("OR_REACT_TASK_TIMEOUT_SECONDS", str(base.task_timeout_seconds))
@@ -256,6 +256,16 @@ class ORReactAgent(BaseAgent):
 
 def _is_evolved_tool_entry(entry: dict[str, Any]) -> bool:
     return bool(entry.get("name")) and (bool(entry.get("file")) or bool(entry.get("module")))
+
+
+def _resolve_temperature(base_temperature: float | None) -> float | None:
+    raw = os.environ.get("OR_REACT_TEMPERATURE")
+    if raw is None:
+        return base_temperature
+    text = raw.strip().lower()
+    if text in {"", "none", "null"}:
+        return None
+    return float(raw)
 
 
 def _resolve_workspace_tool_path(tools_dir: Path, file_name: str) -> Path:

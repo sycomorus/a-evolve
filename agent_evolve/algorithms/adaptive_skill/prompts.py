@@ -10,6 +10,8 @@ from ...contract.workspace import AgentWorkspace
 
 logger = logging.getLogger(__name__)
 
+STANDARD_FEEDBACK_CHAR_LIMIT = 9000
+
 DEFAULT_EVOLVER_SYSTEM_PROMPT = """\
 You are a meta-learning agent that improves another agent by modifying its workspace files.
 
@@ -423,7 +425,7 @@ def build_evolution_prompt(
                 "task_id": log.get("task_id", ""),
                 "success": log.get("success", False),
                 "score": log.get("score", 0.0),
-                "feedback": log.get("feedback_detail", "")[:1200],
+                "feedback": log.get("feedback_detail", "")[:STANDARD_FEEDBACK_CHAR_LIMIT],
                 "signals": _extract_trajectory_signals(conversation),
                 "compressed_trajectory": _compress_trajectory(conversation)[:2500],
             })
@@ -524,7 +526,9 @@ Each task includes:
 - `signals`: automated behavior metrics extracted from the trajectory.
 - `compressed_trajectory`: failure-focused summary of approach, tool calls, errors, repeated actions, and final submission.
 
-Use the real feedback to identify which tasks failed, then use the trajectory fields to diagnose why they failed before changing prompts, skills, memory, or tools."""
+If `feedback` includes `Reference solution code`, it is private oracle information shown only to you, the evolver, to diagnose the correct modeling approach. The execution agent cannot see oracle files or reference_solution.py. Do NOT write evolved prompts, skills, memory, tools, or summaries that tell the agent to consult oracle/reference_solution.py or otherwise rely on hidden oracle files.
+
+Use the real feedback to identify which tasks failed, then use the trajectory fields and any private reference solution to diagnose why they failed before changing prompts, skills, memory, or tools."""
 
 
 def _build_trajectory_only_instructions(current_skill_count: int, max_skills: int = 5, protect_skills: bool = False) -> str:

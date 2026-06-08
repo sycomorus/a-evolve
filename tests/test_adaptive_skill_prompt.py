@@ -66,6 +66,8 @@ def test_standard_prompt_includes_real_feedback_and_compressed_trajectory(tmp_pa
 
     assert "real benchmark feedback" in prompt
     assert "Failure reason: outside relative tolerance" in prompt
+    assert "private oracle information shown only to you" in prompt
+    assert "Do NOT write evolved prompts, skills, memory, tools, or summaries" in prompt
     assert "compressed_trajectory" in prompt
     assert "signals" in prompt
     assert "read_csv" in prompt
@@ -73,6 +75,37 @@ def test_standard_prompt_includes_real_feedback_and_compressed_trajectory(tmp_pa
     assert "Traceback: bad model" in prompt
     assert '"submitted": true' in prompt
     assert "[submitted] 123" in prompt
+
+
+def test_standard_prompt_keeps_reference_solution_feedback(tmp_path: Path) -> None:
+    workspace = AgentWorkspace(tmp_path)
+    reference_tail = "REFERENCE_SOLVER_MODEL_FORMULATION"
+    logs = [
+        {
+            "task_id": "task_001",
+            "success": False,
+            "score": 0.0,
+            "feedback_detail": (
+                "Failure reason: outside relative tolerance\n"
+                "Reference solution code:\n"
+                "```python\n"
+                + ("x = 1\n" * 300)
+                + reference_tail
+                + "\n```"
+            ),
+            "conversation": [],
+        }
+    ]
+
+    prompt = build_evolution_prompt(
+        workspace=workspace,
+        logs=logs,
+        drafts=[],
+        evo_number=1,
+        trajectory_only=False,
+    )
+
+    assert reference_tail in prompt
 
 
 def test_adaptive_skill_step_marks_prompt_diff_as_mutation(tmp_path: Path) -> None:

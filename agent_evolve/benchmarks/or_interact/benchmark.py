@@ -15,6 +15,7 @@ from ...types import Feedback, Task, Trajectory
 
 
 ANSWER_FILENAME = "submitted_answer.csv"
+REFERENCE_SOLUTION_FILENAME = "reference_solution.py"
 
 
 @dataclass(frozen=True)
@@ -65,7 +66,7 @@ class ORInteractBenchmark(BenchmarkAdapter):
         else:
             evaluation = evaluate_task_objective(task.id, task_dir, runtime_dir)
 
-        detail = _feedback_detail(evaluation, trajectory)
+        detail = _feedback_detail(evaluation, trajectory, task_dir)
         return Feedback(
             success=evaluation.correct,
             score=1.0 if evaluation.correct else 0.0,
@@ -179,7 +180,7 @@ def _runtime_dir_from_trajectory(trajectory: Trajectory) -> Path | None:
     return None
 
 
-def _feedback_detail(evaluation: ObjectiveEvaluation, trajectory: Trajectory) -> str:
+def _feedback_detail(evaluation: ObjectiveEvaluation, trajectory: Trajectory, task_dir: Path) -> str:
     status = "PASS" if evaluation.correct else "FAIL"
     parts = [
         f"Status: {status}",
@@ -195,7 +196,27 @@ def _feedback_detail(evaluation: ObjectiveEvaluation, trajectory: Trajectory) ->
     diagnostics = _trajectory_diagnostics(trajectory)
     if diagnostics:
         parts.append(f"Trajectory diagnosis: {diagnostics}")
+    reference_solution = _read_reference_solution(task_dir)
+    if reference_solution:
+        parts.append(reference_solution)
     return "\n".join(parts)
+
+
+def _read_reference_solution(task_dir: Path) -> str:
+    path = task_dir / "oracle" / REFERENCE_SOLUTION_FILENAME
+    if not path.is_file():
+        return ""
+    try:
+        source = path.read_text(encoding="utf-8")
+    except Exception as exc:
+        return f"Reference solution unavailable: {type(exc).__name__}: {exc}"
+    return (
+        f"Reference solution path: {path}\n"
+        "Reference solution code:\n"
+        "```python\n"
+        f"{source.rstrip()}\n"
+        "```"
+    )
 
 
 def _trajectory_diagnostics(trajectory: Trajectory) -> str:

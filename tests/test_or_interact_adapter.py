@@ -64,6 +64,9 @@ def test_evaluate_wrong_objective(tmp_path: Path) -> None:
     assert feedback.success is False
     assert feedback.score == 0.0
     assert "outside relative tolerance" in feedback.detail
+    assert "Reference solution path:" in feedback.detail
+    assert "oracle/reference_solution.py" in feedback.detail
+    assert "factory_planning" in feedback.detail
 
 
 @pytest.mark.parametrize(
@@ -170,6 +173,34 @@ def test_agent_parallelism_comes_from_react_yaml(
     agent = ORReactAgent(workspace)
 
     assert agent.config.parallelism == 4
+
+
+def test_agent_temperature_can_be_omitted_for_compatible_apis(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = _workspace(tmp_path / "workspace")
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "react.yaml").write_text(
+        "\n".join(
+            [
+                "api_key: test-key",
+                "base_url: http://localhost/v1",
+                "model: fake-model",
+                "temperature: null",
+                f"benchmark_dir: {BENCHMARK_DIR}",
+                "results_dir: results/react",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    agent = ORReactAgent(workspace)
+
+    assert agent.config.temperature is None
 
 
 def test_agent_parallelism_env_override(
