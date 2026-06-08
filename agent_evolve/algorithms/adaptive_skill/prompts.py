@@ -30,6 +30,8 @@ Your job each cycle:
 
 Guidelines:
 - Quality over quantity. Only create skills that genuinely help future tasks.
+- Skills live at `skills/<name>/SKILL.md`, where `<name>` exactly matches the YAML `name`.
+- Skill names must match `^[a-z0-9]+(-[a-z0-9]+)*$`: lowercase kebab-case only; no spaces, underscores, or uppercase.
 - Skills use SKILL.md format with YAML frontmatter (name, description).
 - Keep memory concise and actionable.
 - When modifying files, use precise edits.
@@ -444,9 +446,11 @@ def build_evolution_prompt(
         permission_lines.append("- You CAN modify prompts/system.md")
     if evolve_skills:
         if protect_skills:
-            permission_lines.append("- You CAN create NEW skills in skills/ but MUST NOT modify or delete existing skills")
+            permission_lines.append(
+                "- You CAN create NEW skills in skills/<kebab-name>/SKILL.md but MUST NOT modify or delete existing skills"
+            )
         else:
-            permission_lines.append("- You CAN create/modify/delete skills in skills/")
+            permission_lines.append("- You CAN create/modify/delete skills in skills/<kebab-name>/SKILL.md")
     if evolve_memory:
         permission_lines.append("- You CAN add/prune entries in memory/*.jsonl")
     if evolve_tools:
@@ -563,7 +567,9 @@ ones the agent will actually choose to read and benefit from.
 {skill_budget_note}
 
 **Skill quality checklist:**
-- `name` in YAML frontmatter must be short, descriptive kebab-case (the agent matches by name)
+- Store each skill at `skills/<name>/SKILL.md`; the directory `<name>` and YAML frontmatter `name` MUST be identical
+- `name` must be short, descriptive lowercase kebab-case matching `^[a-z0-9]+(-[a-z0-9]+)*$`
+- Never use spaces, underscores, uppercase letters, slashes, or display-title names in `name`
 - `description` must clearly say WHEN this skill applies (the agent decides to read based on this)
 - Body must contain domain-specific knowledge the agent couldn't infer on its own
 - Max 2000 chars per skill — concise and actionable

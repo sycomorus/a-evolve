@@ -67,6 +67,8 @@ Your job each cycle:
 ### Skill Rules:
 - Each skill under {cfg.skill_max_chars} characters.
 - Use YAML frontmatter (name, description, optionally: triggers).
+- Store each skill at `skills/<name>/SKILL.md`; the directory `<name>` and YAML frontmatter `name` MUST be identical.
+- Skill names must match `^[a-z0-9]+(-[a-z0-9]+)*$`: lowercase kebab-case only; no spaces, underscores, uppercase letters, slashes, or display-title names.
 - One skill per concept — avoid overlap.
 - Maximum {cfg.max_skills} skills total.
 - Name skills by their PURPOSE, not by batch number.

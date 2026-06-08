@@ -93,7 +93,9 @@ ones the agent will actually choose to read and benefit from.
 {skill_budget_note}
 
 **Skill quality checklist:**
-- `name` in YAML frontmatter must be short, descriptive kebab-case (the agent matches by name)
+- Store each skill at `skills/<name>/SKILL.md`; the directory `<name>` and YAML frontmatter `name` MUST be identical
+- `name` must be short, descriptive lowercase kebab-case matching `^[a-z0-9]+(-[a-z0-9]+)*$`
+- Never use spaces, underscores, uppercase letters, slashes, or display-title names in `name`
 - `description` must clearly say WHEN this skill applies (the agent decides to read based on this)
 - Body must contain domain-specific knowledge the agent couldn't infer on its own
 - Max 2000 chars per skill -- concise and actionable
@@ -174,10 +176,10 @@ def _build_prompt(
     if bool(state.get("evolve_skills", True)):
         if protect_skills:
             permission_lines.append(
-                "- You CAN create NEW skills in skills/ but MUST NOT modify or delete existing skills"
+                "- You CAN create NEW skills in skills/<kebab-name>/SKILL.md but MUST NOT modify or delete existing skills"
             )
         else:
-            permission_lines.append("- You CAN create/modify/delete skills in skills/")
+            permission_lines.append("- You CAN create/modify/delete skills in skills/<kebab-name>/SKILL.md")
     if bool(state.get("evolve_memory", False)):
         permission_lines.append("- You CAN add/prune entries in memory/*.jsonl")
     if bool(state.get("evolve_tools", False)):

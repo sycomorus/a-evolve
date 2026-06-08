@@ -63,6 +63,8 @@ Your job each cycle:
 
 Guidelines:
 - Quality over quantity. Only create skills that genuinely help future tasks.
+- Skills live at `skills/<name>/SKILL.md`, where `<name>` exactly matches the YAML `name`.
+- Skill names must match `^[a-z0-9]+(-[a-z0-9]+)*$`: lowercase kebab-case only; no spaces, underscores, or uppercase.
 - Skills use SKILL.md format with YAML frontmatter (name, description).
 - Keep memory concise and actionable.
 - When modifying files, use precise edits.
@@ -160,7 +162,7 @@ def _build_permission_block(
         protect_skills = bool(state.get("protect_skills", False))
         if protect_skills:
             lines.append(
-                "- You MAY create NEW skills under skills/, but MUST NOT modify "
+                "- You MAY create NEW skills under skills/<kebab-name>/SKILL.md, but MUST NOT modify "
                 "or delete existing skills."
             )
             if protected_skills:
@@ -169,7 +171,12 @@ def _build_permission_block(
                     + ", ".join(sorted(protected_skills))
                 )
         else:
-            lines.append("- You MAY create/modify/delete skills under skills/.")
+            lines.append("- You MAY create/modify/delete skills under skills/<kebab-name>/SKILL.md.")
+        lines.append(
+            "- For every skill, the directory `<name>` and YAML frontmatter `name` MUST be identical "
+            "and match `^[a-z0-9]+(-[a-z0-9]+)*$`."
+        )
+        lines.append("- Do not use spaces, underscores, uppercase letters, slashes, or display-title names for skills.")
         if max_skills is not None:
             lines.append(f"- Maximum total non-draft skills: {max_skills}.")
     else:
