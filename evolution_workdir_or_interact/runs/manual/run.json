@@ -1,0 +1,13 @@
+{
+  "run_id": "manual",
+  "created_at": "2026-06-08T00:00:00",
+  "agent": "or-interact",
+  "benchmark": "industry-or",
+  "workspace": "/home/zzt/OR-Claw/a-evolve/evolution_workdir_or_interact/runs/manual/workspace",
+  "source": {
+    "spec": "manual",
+    "type": "manual",
+    "path": "/home/zzt/OR-Claw/a-evolve/seed_workspaces/or_interact_react"
+  },
+  "description": "Hand-constructed OR-Interact ReAct workspace initialized from the seed workspace and manually evolved from train error analysis."
+}

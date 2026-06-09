@@ -29,6 +29,11 @@ tools:
     module: tools.seed_tools.finalize
     function: finalize
     description: Submit final code and objective value.
+  - name: audit_model_text
+    kind: evolved
+    file: audit_model_text.py
+    function: audit_model_text
+    description: Inspect draft model notes or code for common formulation risks before finalizing.
   - name: type_router
     kind: evolved
     file: type_router.py

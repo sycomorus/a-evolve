@@ -157,20 +157,15 @@ class ORReactAgent(BaseAgent):
             return hook(self.system_prompt, self.skills, self.memories, self.registry)
 
         sections = [self.system_prompt.strip()]
-        memory_summary = self._memory_summary()
-        if memory_summary:
-            sections.append("## Evolved Memory\n" + memory_summary)
+        sections.append(_harness_protocol())
 
-        if self.skills:
-            skills = "\n".join(f"- {skill.name}: {skill.description}" for skill in self.skills)
-            sections.append("## Available Evolved Skills\n" + skills)
-            skill_bodies = []
-            for skill in self.skills:
-                content = self.get_skill_content(skill.name).strip()
-                if content:
-                    skill_bodies.append(f"### {skill.name}\n{content}")
-            if skill_bodies:
-                sections.append("## Evolved Skill Instructions\n" + "\n\n".join(skill_bodies))
+        skill_catalog = self._skill_catalog()
+        if skill_catalog:
+            sections.append("## Evolved Skill Catalog\n" + skill_catalog)
+
+        memory_catalog = self._memory_catalog()
+        if memory_catalog:
+            sections.append("## Evolved Memory Catalog\n" + memory_catalog)
 
         tool_lines = []
         for spec in self.registry.as_dict().values():
@@ -179,13 +174,29 @@ class ORReactAgent(BaseAgent):
         sections.append("## Available Tools\n" + "\n".join(tool_lines))
         return "\n\n".join(section for section in sections if section)
 
-    def _memory_summary(self) -> str:
+    def _memory_catalog(self) -> str:
         lines = []
-        for memory in self.memories[-20:]:
-            content = str(memory.get("content", "")).strip()
-            if content:
-                category = memory.get("_category", "memory")
-                lines.append(f"- [{category}] {content}")
+        for index, memory in enumerate(self.memories[-20:], start=1):
+            category = memory.get("_category", "memory")
+            types = _normalize_types(memory.get("types"))
+            checklist = _normalize_checklist(memory.get("checklist"))
+            checklist_ids = ", ".join(item["id"] for item in checklist) or "none"
+            lines.append(
+                f"- memory:{index} category={category} types={', '.join(types)} "
+                f"checklist={checklist_ids}"
+            )
+        return "\n".join(lines)
+
+    def _skill_catalog(self) -> str:
+        lines = []
+        for skill in self.skills:
+            types = skill.types or ["general"]
+            checklist_ids = ", ".join(item["id"] for item in skill.checklist) or "none"
+            description = " ".join(skill.description.split())
+            lines.append(
+                f"- {skill.path or skill.name}: {skill.name}; types={', '.join(types)}; "
+                f"checklist={checklist_ids}; description={description}"
+            )
         return "\n".join(lines)
 
     def _build_registry(self) -> ToolRegistry:
@@ -256,6 +267,48 @@ class ORReactAgent(BaseAgent):
 
 def _is_evolved_tool_entry(entry: dict[str, Any]) -> bool:
     return bool(entry.get("name")) and (bool(entry.get("file")) or bool(entry.get("module")))
+
+
+def _harness_protocol() -> str:
+    return """## Harness Interaction Protocol
+You must use the evolved workspace harness tools instead of relying on hidden prompt-injected skill bodies.
+
+Required workflow:
+1. Call list_context, then read_md/read_csv to collect visible evidence from docs/ and data/.
+2. Call type_router(evidence_text) after summarizing that visible evidence yourself.
+3. Use the returned task_types, selected skills, selected memories, and required_checklist while building the model.
+4. Call answer_checker(compressed_trace, final_code, objective_value, task_types, harness_notes) before finalize.
+5. If answer_checker returns passed=false, revise the model or submitted value and call answer_checker again.
+6. Call finalize only after answer_checker returns passed=true.
+
+The router/checker tools may read the workspace harness library, but they only receive evidence, trace notes, code, and values that you provide. Do not treat the catalog below as full guidance; use type_router to load relevant harness content."""
+
+
+def _normalize_types(value: Any) -> list[str]:
+    if isinstance(value, str):
+        items = [value]
+    elif isinstance(value, list):
+        items = value
+    else:
+        items = ["general"]
+    normalized = [str(item).strip() for item in items if str(item).strip()]
+    return normalized or ["general"]
+
+
+def _normalize_checklist(value: Any) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    items: list[dict[str, str]] = []
+    for index, item in enumerate(value, start=1):
+        if isinstance(item, dict):
+            prompt = str(item.get("prompt", "")).strip()
+            check_id = str(item.get("id", f"check_{index}")).strip()
+        else:
+            prompt = str(item).strip()
+            check_id = f"check_{index}"
+        if prompt:
+            items.append({"id": check_id or f"check_{index}", "prompt": prompt})
+    return items
 
 
 def _resolve_temperature(base_temperature: float | None) -> float | None:

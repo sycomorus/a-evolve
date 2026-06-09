@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import csv
 import json
+import shutil
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -92,7 +95,7 @@ def test_evaluate_bad_answer_csv(tmp_path: Path, rows: list[dict[str, str]] | No
     assert message in feedback.detail
 
 
-def test_agent_prompt_includes_skill_memory_and_evolved_tool(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_agent_prompt_uses_harness_catalog_and_protocol(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     workspace = _workspace(tmp_path / "workspace")
     _write_skill(workspace, "modeling", "Prefer explicit variable bounds.")
     (workspace / "memory" / "memories.jsonl").write_text(
@@ -104,7 +107,24 @@ def test_agent_prompt_includes_skill_memory_and_evolved_tool(tmp_path: Path, mon
         "diagnose",
         "from typing import Any\n\ndef diagnose() -> dict[str, Any]:\n    return {'ok': True}\n",
     )
-    _write_registry(workspace, [{"name": "diagnose", "file": "diagnose.py", "function": "diagnose", "description": "diagnostic helper"}])
+    _write_tool(
+        workspace,
+        "type_router",
+        "from typing import Any\n\ndef type_router(evidence_text: str) -> dict[str, Any]:\n    return {'task_types': ['general']}\n",
+    )
+    _write_tool(
+        workspace,
+        "answer_checker",
+        "from typing import Any\n\ndef answer_checker(compressed_trace: str, final_code: str, objective_value: str, task_types: str, harness_notes: str) -> dict[str, Any]:\n    return {'passed': True}\n",
+    )
+    _write_registry(
+        workspace,
+        [
+            {"name": "diagnose", "file": "diagnose.py", "function": "diagnose", "description": "diagnostic helper"},
+            {"name": "type_router", "file": "type_router.py", "function": "type_router"},
+            {"name": "answer_checker", "file": "answer_checker.py", "function": "answer_checker"},
+        ],
+    )
 
     captured: dict[str, object] = {}
 
@@ -125,9 +145,135 @@ def test_agent_prompt_includes_skill_memory_and_evolved_tool(tmp_path: Path, mon
     agent.solve(task)
 
     prompt = str(captured["system_prompt"])
-    assert "Prefer explicit variable bounds." in prompt
-    assert "Check objective direction before finalizing." in prompt
+    assert "Call type_router" in prompt
+    assert "Call answer_checker" in prompt
+    assert "Prefer explicit variable bounds." not in prompt
+    assert "Check objective direction before finalizing." not in prompt
+    assert "modeling; types=general" in prompt
+    assert "memory:1 category=memories types=general" in prompt
     assert "diagnose" in captured["tools"]
+    assert "type_router" in captured["tools"]
+    assert "answer_checker" in captured["tools"]
+
+
+def test_seed_workspace_loads_router_and_checker_tools() -> None:
+    workspace = REPO_ROOT / "a-evolve" / "seed_workspaces" / "or_interact_react"
+    agent = ORReactAgent(workspace)
+
+    assert agent.registry.get("type_router").kind == "evolved"
+    assert agent.registry.get("answer_checker").kind == "evolved"
+
+
+def test_type_router_returns_selected_harness_content_and_old_skill_defaults(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = _workspace(tmp_path / "workspace")
+    _write_skill(workspace, "legacy-skill", "Legacy skill body.")
+    (workspace / "memory" / "memories.jsonl").write_text(
+        json.dumps({"content": "Legacy memory."}) + "\n",
+        encoding="utf-8",
+    )
+    _copy_harness_tool(workspace, "type_router")
+    _write_registry(workspace, [{"name": "type_router", "file": "type_router.py", "function": "type_router"}])
+    _install_fake_openai(
+        monkeypatch,
+        [
+            {
+                "task_types": ["general"],
+                "selected_skill_paths": ["skills/legacy-skill/SKILL.md"],
+                "selected_memory_paths": ["memory/memories.jsonl:1"],
+                "rationale": "legacy general route",
+            }
+        ],
+    )
+
+    agent = ORReactAgent(workspace)
+    result = agent.registry.call("type_router", evidence_text="Visible production planning evidence.")
+
+    assert result["task_types"] == ["general"]
+    assert result["selected_skills"][0]["path"] == "skills/legacy-skill/SKILL.md"
+    assert "Legacy skill body." in result["selected_skills"][0]["content"]
+    assert result["selected_memories"][0]["content"] == "Legacy memory."
+
+
+def test_answer_checker_returns_failed_checklist_from_mocked_llm(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = _workspace(tmp_path / "workspace")
+    _write_skill(
+        workspace,
+        "objective-check",
+        "Check objective unit.",
+        frontmatter="\ntypes: [general]\nchecklist:\n  - id: objective_unit\n    prompt: Verify unit.\n",
+    )
+    _copy_harness_tool(workspace, "answer_checker")
+    _write_registry(workspace, [{"name": "answer_checker", "file": "answer_checker.py", "function": "answer_checker"}])
+    _install_fake_openai(
+        monkeypatch,
+        [
+            {
+                "passed": False,
+                "failed_items": ["objective_unit"],
+                "check_results": [{"id": "objective_unit", "passed": False, "reason": "Unit mismatch."}],
+                "required_fix": "Submit profit, not quantity.",
+            }
+        ],
+    )
+
+    agent = ORReactAgent(workspace)
+    result = agent.registry.call(
+        "answer_checker",
+        compressed_trace="trace",
+        final_code="print('model')",
+        objective_value="10",
+        task_types='["general"]',
+        harness_notes="notes",
+    )
+
+    assert result["passed"] is False
+    assert result["failed_items"] == ["objective_unit"]
+    assert result["required_fix"] == "Submit profit, not quantity."
+
+
+def test_answer_checker_returns_pass_from_mocked_llm(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = _workspace(tmp_path / "workspace")
+    _write_skill(
+        workspace,
+        "objective-check",
+        "Check objective unit.",
+        frontmatter="\ntypes: [general]\nchecklist:\n  - id: objective_unit\n    prompt: Verify unit.\n",
+    )
+    _copy_harness_tool(workspace, "answer_checker")
+    _write_registry(workspace, [{"name": "answer_checker", "file": "answer_checker.py", "function": "answer_checker"}])
+    _install_fake_openai(
+        monkeypatch,
+        [
+            {
+                "passed": True,
+                "failed_items": [],
+                "check_results": [{"id": "objective_unit", "passed": True, "reason": "Matches."}],
+                "required_fix": "",
+            }
+        ],
+    )
+
+    agent = ORReactAgent(workspace)
+    result = agent.registry.call(
+        "answer_checker",
+        compressed_trace="trace",
+        final_code="print('model')",
+        objective_value="10",
+        task_types="general",
+        harness_notes="notes",
+    )
+
+    assert result["passed"] is True
+    assert result["failed_items"] == []
 
 
 def test_workspace_tool_overrides_seed_tool(tmp_path: Path) -> None:
@@ -294,11 +440,11 @@ def _workspace(path: Path) -> Path:
     return path
 
 
-def _write_skill(workspace: Path, name: str, body: str) -> None:
+def _write_skill(workspace: Path, name: str, body: str, frontmatter: str = "") -> None:
     skill_dir = workspace / "skills" / name
     skill_dir.mkdir()
     skill_dir.joinpath("SKILL.md").write_text(
-        f"---\nname: {name}\ndescription: Test skill\n---\n\n{body}\n",
+        f"---\nname: {name}\ndescription: Test skill{frontmatter}\n---\n\n{body}\n",
         encoding="utf-8",
     )
 
@@ -315,6 +461,34 @@ def _write_registry(workspace: Path, tools: list[dict[str, str]]) -> None:
 
 def _write_tool(workspace: Path, name: str, source: str) -> None:
     (workspace / "tools" / f"{name}.py").write_text(source, encoding="utf-8")
+
+
+def _copy_harness_tool(workspace: Path, name: str) -> None:
+    source = REPO_ROOT / "a-evolve" / "seed_workspaces" / "or_interact_react" / "tools" / f"{name}.py"
+    shutil.copyfile(source, workspace / "tools" / f"{name}.py")
+
+
+def _install_fake_openai(monkeypatch: pytest.MonkeyPatch, payloads: list[dict[str, object]]) -> None:
+    remaining = list(payloads)
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            if not remaining:
+                raise AssertionError("unexpected OpenAI call")
+            content = json.dumps(remaining.pop(0))
+            message = types.SimpleNamespace(content=content)
+            choice = types.SimpleNamespace(message=message)
+            return types.SimpleNamespace(choices=[choice])
+
+    class FakeChat:
+        def __init__(self) -> None:
+            self.completions = FakeCompletions()
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs) -> None:
+            self.chat = FakeChat()
+
+    monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(OpenAI=FakeOpenAI))
 
 
 def _visible_task(tmp_path: Path) -> Path:

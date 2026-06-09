@@ -67,8 +67,12 @@ inspect_evals/
 *.pyc
 uv.lock
 
-evolution_workdir
-evolution_workdir_or_interact/
+evolution_workdir_or_interact/*
+!evolution_workdir_or_interact/runs/
+evolution_workdir_or_interact/runs/*
+!evolution_workdir_or_interact/runs/manual/
+!evolution_workdir_or_interact/runs/manual/**
+
 logs/
 swe_results*/
 .crowdresearch/
@@ -149,3 +153,4 @@ examples/tb_examples/skipped/
 agent_evolve/benchmarks/tb2/challenges/
 examples/run_skillbench_solve_all_ablate.sh
 examples/skillbench_evolve_one.py
+

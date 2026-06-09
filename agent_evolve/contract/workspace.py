@@ -196,7 +196,7 @@ _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---", re.DOTALL)
 
 
 def _parse_skill_frontmatter(path: Path) -> SkillMeta:
-    """Extract name + description from SKILL.md YAML frontmatter."""
+    """Extract lightweight catalog metadata from SKILL.md YAML frontmatter."""
     text = path.read_text()
     m = _FRONTMATTER_RE.match(text)
     if m:
@@ -206,7 +206,36 @@ def _parse_skill_frontmatter(path: Path) -> SkillMeta:
                 name=meta.get("name", path.parent.name),
                 description=meta.get("description", ""),
                 path="",
+                types=_normalize_types(meta.get("types")),
+                checklist=_normalize_checklist(meta.get("checklist")),
             )
         except yaml.YAMLError:
             pass
     return SkillMeta(name=path.parent.name, description="", path="")
+
+
+def _normalize_types(value: Any) -> list[str]:
+    if isinstance(value, str):
+        items = [value]
+    elif isinstance(value, list):
+        items = value
+    else:
+        items = ["general"]
+    normalized = [str(item).strip() for item in items if str(item).strip()]
+    return normalized or ["general"]
+
+
+def _normalize_checklist(value: Any) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    items: list[dict[str, str]] = []
+    for index, item in enumerate(value, start=1):
+        if isinstance(item, dict):
+            prompt = str(item.get("prompt", "")).strip()
+            check_id = str(item.get("id", f"check_{index}")).strip()
+        else:
+            prompt = str(item).strip()
+            check_id = f"check_{index}"
+        if prompt:
+            items.append({"id": check_id or f"check_{index}", "prompt": prompt})
+    return items
