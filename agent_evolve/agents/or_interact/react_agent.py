@@ -208,6 +208,7 @@ class ORReactAgent(BaseAgent):
                 continue
             spec = self._load_evolved_tool(entry)
             registry.register(spec, overwrite=True)
+        _install_answer_checker_budget(registry)
         return registry
 
     def _load_evolved_tool(self, entry: dict[str, Any]) -> ToolSpec:
@@ -269,6 +270,90 @@ def _is_evolved_tool_entry(entry: dict[str, Any]) -> bool:
     return bool(entry.get("name")) and (bool(entry.get("file")) or bool(entry.get("module")))
 
 
+def _install_answer_checker_budget(registry: ToolRegistry) -> None:
+    try:
+        spec = registry.get("answer_checker")
+    except KeyError:
+        return
+
+    failure_count = 0
+    blocked = False
+
+    def answer_checker(
+        compressed_trace: str,
+        final_code: str,
+        objective_value: str,
+        task_types: str,
+        harness_notes: str,
+    ) -> dict[str, Any]:
+        nonlocal blocked, failure_count
+        if blocked:
+            return _answer_checker_budget_exhausted()
+
+        result = spec.function(
+            compressed_trace=compressed_trace,
+            final_code=final_code,
+            objective_value=objective_value,
+            task_types=task_types,
+            harness_notes=harness_notes,
+        )
+        if result.get("passed") is False:
+            failure_count += 1
+            if failure_count >= 3:
+                blocked = True
+                return _with_answer_checker_budget_warning(result)
+        return result
+
+    registry.register(
+        ToolSpec(
+            name=spec.name,
+            function=answer_checker,
+            description=spec.description,
+            kind=spec.kind,
+            metadata={**spec.metadata, "answer_checker_failure_budget": 3},
+        ),
+        overwrite=True,
+    )
+
+
+def _with_answer_checker_budget_warning(result: dict[str, Any]) -> dict[str, Any]:
+    warning = (
+        "WARNING: answer_checker has returned failed three times. The answer_checker "
+        "revision budget is exhausted. Do not call answer_checker again; call finalize "
+        "now with the best available objective value."
+    )
+    updated = dict(result)
+    updated["warning"] = warning
+    updated["answer_checker_budget_exhausted"] = True
+    updated["answer_checker_call_allowed"] = False
+    updated["required_fix"] = warning
+    return updated
+
+
+def _answer_checker_budget_exhausted() -> dict[str, Any]:
+    warning = (
+        "WARNING: answer_checker calls are disabled because it already returned failed "
+        "three times. The revision budget is exhausted. Call finalize now with the best "
+        "available objective value."
+    )
+    return {
+        "passed": False,
+        "failed_items": ["answer_checker_budget_exhausted"],
+        "check_results": [
+            {
+                "id": "answer_checker_budget_exhausted",
+                "passed": False,
+                "reason": warning,
+                "evidence": ["answer_checker failed three times earlier in this task."],
+            }
+        ],
+        "required_fix": warning,
+        "warning": warning,
+        "answer_checker_budget_exhausted": True,
+        "answer_checker_call_allowed": False,
+    }
+
+
 def _harness_protocol() -> str:
     return """## Harness Interaction Protocol
 You must use the evolved workspace harness tools instead of relying on hidden prompt-injected skill bodies.
@@ -279,7 +364,8 @@ Required workflow:
 3. Use the returned task_types, selected skills, selected memories, and required_checklist while building the model.
 4. Call answer_checker(compressed_trace, final_code, objective_value, task_types, harness_notes) before finalize.
 5. If answer_checker returns passed=false, revise the model or submitted value and call answer_checker again.
-6. Call finalize only after answer_checker returns passed=true.
+6. If answer_checker returns an answer_checker_budget_exhausted warning, stop calling answer_checker and call finalize with the best available objective value.
+7. Call finalize after answer_checker returns passed=true, or after answer_checker reports that its revision budget is exhausted.
 
 The router/checker tools may read the workspace harness library, but they only receive evidence, trace notes, code, and values that you provide. Do not treat the catalog below as full guidance; use type_router to load relevant harness content."""
 

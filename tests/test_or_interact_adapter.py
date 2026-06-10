@@ -375,6 +375,65 @@ def test_answer_checker_requires_per_item_explanation_and_evidence(
     assert visible_check["reason"] == "Missing per-item explanation."
 
 
+def test_answer_checker_warns_and_blocks_after_three_failures(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path / "workspace")
+    _write_tool(
+        workspace,
+        "answer_checker",
+        "\n".join(
+            [
+                "from typing import Any",
+                "",
+                "CALLS = 0",
+                "",
+                "def answer_checker(",
+                "    compressed_trace: str,",
+                "    final_code: str,",
+                "    objective_value: str,",
+                "    task_types: str,",
+                "    harness_notes: str,",
+                ") -> dict[str, Any]:",
+                "    global CALLS",
+                "    CALLS += 1",
+                "    return {",
+                "        'passed': False,",
+                "        'failed_items': ['objective_unit'],",
+                "        'check_results': [],",
+                "        'required_fix': f'revise attempt {CALLS}',",
+                "        'calls': CALLS,",
+                "    }",
+            ]
+        )
+        + "\n",
+    )
+    _write_registry(workspace, [{"name": "answer_checker", "file": "answer_checker.py", "function": "answer_checker"}])
+
+    agent = ORReactAgent(workspace)
+    calls = [
+        agent.registry.call(
+            "answer_checker",
+            compressed_trace="trace",
+            final_code="print('model')",
+            objective_value="10",
+            task_types="general",
+            harness_notes="notes",
+        )
+        for _ in range(4)
+    ]
+
+    assert calls[0]["calls"] == 1
+    assert calls[1]["calls"] == 2
+    assert calls[2]["calls"] == 3
+    assert calls[2]["answer_checker_budget_exhausted"] is True
+    assert calls[2]["answer_checker_call_allowed"] is False
+    assert "call finalize" in calls[2]["warning"]
+    assert "calls" not in calls[3]
+    assert calls[3]["failed_items"] == ["answer_checker_budget_exhausted"]
+    assert calls[3]["answer_checker_budget_exhausted"] is True
+    assert calls[3]["answer_checker_call_allowed"] is False
+    assert "Call finalize now" in calls[3]["warning"]
+
+
 def test_workspace_tool_overrides_seed_tool(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path / "workspace")
     _write_tool(

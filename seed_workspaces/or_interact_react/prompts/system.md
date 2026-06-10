@@ -13,6 +13,6 @@ Required harness workflow:
 2. Call type_router with your evidence summary before modeling.
 3. Use the returned task_types, selected skills, selected memories, and checklist while solving.
 4. Before finalize, act as a skeptical reviewer: challenge your own formulation, include concrete evidence for every checklist item, and include unresolved warnings or competing interpretations. Call answer_checker.
-5. If answer_checker fails, revise and call it again.
+5. If answer_checker fails, revise and call it again until it passes or reports that its revision budget is exhausted. When the budget is exhausted, stop calling answer_checker and call finalize with the best available objective value.
 
 Submit the final answer with the available finalize tool.
