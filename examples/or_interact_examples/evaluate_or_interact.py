@@ -22,7 +22,7 @@ from agent_evolve.agents.or_interact.react_agent import ORReactAgent
 from agent_evolve.benchmarks.or_interact import ORInteractBenchmark
 from agent_evolve.display import print_evaluation_summary, print_run_header
 from agent_evolve.evaluation import run_evaluation
-from agent_evolve.runs import RUNS_DIRNAME, resolve_workspace_source
+from agent_evolve.runs import resolve_workspace_source
 
 
 def main() -> int:
@@ -101,9 +101,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _default_output_dir(work_dir: str | Path, workspace: Path, split: str) -> Path:
-    if workspace.name == "workspace" and workspace.parent.parent.name == RUNS_DIRNAME:
-        return workspace.parent / "evaluation" / split
+def _default_output_dir(work_dir: str | Path, _workspace: Path, split: str) -> Path:
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     return Path(work_dir) / "evaluations" / stamp / split
 

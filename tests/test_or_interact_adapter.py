@@ -216,7 +216,26 @@ def test_answer_checker_returns_failed_checklist_from_mocked_llm(
             {
                 "passed": False,
                 "failed_items": ["objective_unit"],
-                "check_results": [{"id": "objective_unit", "passed": False, "reason": "Unit mismatch."}],
+                "check_results": [
+                    {
+                        "id": "objective_unit",
+                        "passed": False,
+                        "reason": "Unit mismatch.",
+                        "evidence": ["objective_value=10; trace says quantity"],
+                    },
+                    {
+                        "id": "visible_constraints",
+                        "passed": True,
+                        "reason": "Constraints are supported.",
+                        "evidence": ["final_code contains stated model constraints"],
+                    },
+                    {
+                        "id": "warning_resolution",
+                        "passed": True,
+                        "reason": "No warnings remain.",
+                        "evidence": ["harness_notes=notes"],
+                    },
+                ],
                 "required_fix": "Submit profit, not quantity.",
             }
         ],
@@ -234,6 +253,7 @@ def test_answer_checker_returns_failed_checklist_from_mocked_llm(
 
     assert result["passed"] is False
     assert result["failed_items"] == ["objective_unit"]
+    assert result["check_results"][0]["evidence"] == ["objective_value=10; trace says quantity"]
     assert result["required_fix"] == "Submit profit, not quantity."
 
 
@@ -256,7 +276,26 @@ def test_answer_checker_returns_pass_from_mocked_llm(
             {
                 "passed": True,
                 "failed_items": [],
-                "check_results": [{"id": "objective_unit", "passed": True, "reason": "Matches."}],
+                "check_results": [
+                    {
+                        "id": "objective_unit",
+                        "passed": True,
+                        "reason": "Matches.",
+                        "evidence": ["objective_value=10; trace says submitted profit"],
+                    },
+                    {
+                        "id": "visible_constraints",
+                        "passed": True,
+                        "reason": "Constraints are supported.",
+                        "evidence": ["final_code contains stated model constraints"],
+                    },
+                    {
+                        "id": "warning_resolution",
+                        "passed": True,
+                        "reason": "Warnings resolved.",
+                        "evidence": ["compressed_trace states no warnings"],
+                    },
+                ],
                 "required_fix": "",
             }
         ],
@@ -274,6 +313,66 @@ def test_answer_checker_returns_pass_from_mocked_llm(
 
     assert result["passed"] is True
     assert result["failed_items"] == []
+    assert result["check_results"][0]["evidence"] == ["objective_value=10; trace says submitted profit"]
+
+
+def test_answer_checker_requires_per_item_explanation_and_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = _workspace(tmp_path / "workspace")
+    _write_skill(
+        workspace,
+        "objective-check",
+        "Check objective unit.",
+        frontmatter="\ntypes: [general]\nchecklist:\n  - id: objective_unit\n    prompt: Verify unit.\n",
+    )
+    _copy_harness_tool(workspace, "answer_checker")
+    _write_registry(workspace, [{"name": "answer_checker", "file": "answer_checker.py", "function": "answer_checker"}])
+    _install_fake_openai(
+        monkeypatch,
+        [
+            {
+                "passed": True,
+                "failed_items": [],
+                "check_results": [
+                    {"id": "objective_unit", "passed": True, "reason": "Matches."},
+                    {
+                        "id": "visible_constraints",
+                        "passed": True,
+                        "evidence": ["final_code contains stated model constraints"],
+                    },
+                    {
+                        "id": "warning_resolution",
+                        "passed": True,
+                        "reason": "Warnings resolved.",
+                        "evidence": ["compressed_trace states no warnings"],
+                    },
+                ],
+                "required_fix": "",
+            }
+        ],
+    )
+
+    agent = ORReactAgent(workspace)
+    result = agent.registry.call(
+        "answer_checker",
+        compressed_trace="trace",
+        final_code="print('model')",
+        objective_value="10",
+        task_types="general",
+        harness_notes="notes",
+    )
+
+    assert result["passed"] is False
+    assert "objective_unit" in result["failed_items"]
+    assert "visible_constraints" in result["failed_items"]
+    objective_check = result["check_results"][0]
+    assert objective_check["passed"] is False
+    assert objective_check["reason"].endswith("Missing explicit evidence.")
+    visible_check = result["check_results"][1]
+    assert visible_check["passed"] is False
+    assert visible_check["reason"] == "Missing per-item explanation."
 
 
 def test_workspace_tool_overrides_seed_tool(tmp_path: Path) -> None:

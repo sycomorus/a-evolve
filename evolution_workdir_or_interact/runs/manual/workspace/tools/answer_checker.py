@@ -47,9 +47,16 @@ def _judge_answer(
     checklist: list[dict[str, str]],
 ) -> dict[str, Any]:
     system = (
-        "You are a strict pre-submit checker for optimization-modeling work. "
+        "You are a skeptical, adversarial pre-submit reviewer for optimization-modeling work. "
         "Use only the supplied trace, code, submitted value, task types, harness notes, "
-        "and checklist. Return JSON with passed, failed_items, check_results, and required_fix."
+        "and checklist. Check every checklist item independently. A checklist item passes "
+        "only when the supplied materials contain explicit supporting evidence; the agent's "
+        "unsupported assertion is not enough. If evidence is missing, ambiguous, or a warning "
+        "was not resolved with concrete support, mark that item failed. Return JSON with "
+        "passed, failed_items, check_results, and required_fix. Each check_results item must "
+        "include id, passed, reason, and a non-empty evidence list of short snippets or "
+        "locations from compressed_trace, final_code, objective_value, task_types, or "
+        "harness_notes."
     )
     user = json.dumps(
         {
@@ -88,6 +95,7 @@ def _judge_answer(
                     "id": check["id"],
                     "passed": False,
                     "reason": f"LLM answer check unavailable: {type(exc).__name__}.",
+                    "evidence": [f"answer_checker exception: {type(exc).__name__}"],
                 }
                 for check in checklist
             ],
@@ -96,6 +104,15 @@ def _judge_answer(
     return {
         "passed": False,
         "failed_items": [check["id"] for check in checklist],
+        "check_results": [
+            {
+                "id": check["id"],
+                "passed": False,
+                "reason": "answer_checker returned invalid JSON.",
+                "evidence": ["No valid JSON check_results were returned."],
+            }
+            for check in checklist
+        ],
         "required_fix": "answer_checker returned invalid JSON; rerun with clearer trace and harness notes.",
     }
 
@@ -205,27 +222,52 @@ def _dedupe_checks(checks: list[dict[str, str]]) -> list[dict[str, str]]:
 def _normalize_result(judge: dict[str, Any], checklist: list[dict[str, str]]) -> dict[str, Any]:
     check_results = judge.get("check_results")
     if not isinstance(check_results, list):
-        failed = {str(item) for item in judge.get("failed_items", []) if item is not None}
         check_results = [
             {
                 "id": check["id"],
-                "passed": check["id"] not in failed and bool(judge.get("passed", False)),
-                "reason": "",
+                "passed": False,
+                "reason": "Missing per-item check_result from reviewer.",
+                "evidence": ["No per-item evidence was returned for this checklist item."],
             }
             for check in checklist
         ]
+    results_by_id: dict[str, dict[str, Any]] = {}
+    for result in check_results:
+        if isinstance(result, dict):
+            check_id = str(result.get("id") or "").strip()
+            if check_id:
+                results_by_id[check_id] = result
+
     normalized_results: list[dict[str, Any]] = []
     failed_items: list[str] = []
-    for index, result in enumerate(check_results, start=1):
-        if not isinstance(result, dict):
+    for check in checklist:
+        check_id = check["id"]
+        result = results_by_id.get(check_id)
+        if result is None:
+            normalized_results.append(
+                {
+                    "id": check_id,
+                    "passed": False,
+                    "reason": "Reviewer omitted this checklist item.",
+                    "evidence": ["No evidence was returned for this checklist item."],
+                }
+            )
+            failed_items.append(check_id)
             continue
-        check_id = str(result.get("id") or f"check_{index}")
-        passed = bool(result.get("passed"))
+
+        reason = str(result.get("reason") or "").strip()
+        evidence = _normalize_evidence(result.get("evidence"))
+        passed = bool(result.get("passed")) and bool(reason) and bool(evidence)
+        if not reason:
+            reason = "Missing per-item explanation."
+        if not evidence:
+            reason = (reason + " " if reason else "") + "Missing explicit evidence."
         normalized_results.append(
             {
                 "id": check_id,
                 "passed": passed,
-                "reason": str(result.get("reason") or ""),
+                "reason": reason,
+                "evidence": evidence,
             }
         )
         if not passed:
@@ -237,6 +279,16 @@ def _normalize_result(judge: dict[str, Any], checklist: list[dict[str, str]]) ->
         "check_results": normalized_results,
         "required_fix": "" if passed else str(judge.get("required_fix") or "Fix failed checklist items."),
     }
+
+
+def _normalize_evidence(value: Any) -> list[str]:
+    if isinstance(value, str):
+        items = [value]
+    elif isinstance(value, list):
+        items = value
+    else:
+        items = []
+    return [str(item).strip() for item in items if str(item).strip()]
 
 
 def _parse_json_object(text: str) -> Any:

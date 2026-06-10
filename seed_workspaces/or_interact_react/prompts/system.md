@@ -12,7 +12,7 @@ Required harness workflow:
 1. Use list_context/read_md/read_csv to collect visible evidence.
 2. Call type_router with your evidence summary before modeling.
 3. Use the returned task_types, selected skills, selected memories, and checklist while solving.
-4. Call answer_checker before finalize.
+4. Before finalize, act as a skeptical reviewer: challenge your own formulation, include concrete evidence for every checklist item, and include unresolved warnings or competing interpretations. Call answer_checker.
 5. If answer_checker fails, revise and call it again.
 
 Submit the final answer with the available finalize tool.

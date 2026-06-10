@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 from datetime import datetime
 from pathlib import Path
@@ -118,7 +119,34 @@ def test_simple_run_id_preferred_over_cwd_relative_path(
     )
 
 
+def test_evaluate_run_workspace_default_output_dir_uses_evaluations_root() -> None:
+    module = _load_evaluate_module()
+    work_dir = Path("/tmp/work")
+    workspace = work_dir / "runs" / "manual" / "workspace"
+
+    output_dir = module._default_output_dir(work_dir, workspace, "train")
+
+    assert output_dir.name == "train"
+    assert output_dir.parent.parent == work_dir / "evaluations"
+    assert output_dir != work_dir / "runs" / "manual" / "evaluation" / "train"
+
+
 def _workspace(path: Path) -> Path:
     path.mkdir(parents=True)
     (path / "manifest.yaml").write_text("name: fake\n", encoding="utf-8")
     return path
+
+
+def _load_evaluate_module():
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "examples"
+        / "or_interact_examples"
+        / "evaluate_or_interact.py"
+    )
+    spec = importlib.util.spec_from_file_location("evaluate_or_interact_script", path)
+    if spec is None or spec.loader is None:
+        raise AssertionError(f"failed to load module from {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
