@@ -38,16 +38,19 @@ FORBIDDEN_TOOL_STRINGS = (
     "os.system",
     "popen",
 )
+ANSWER_CHECKER_ENV = "OR_REACT_ENABLE_ANSWER_CHECKER"
 
 
 class ORReactAgent(BaseAgent):
     """Reloadable a-evolve agent that runs the OR-Claw ReAct baseline."""
 
     def __init__(self, workspace_dir: str | Path):
+        self.enable_answer_checker = _resolve_answer_checker_enabled()
         super().__init__(workspace_dir)
         self.config = self._load_config()
 
     def reload_from_fs(self) -> None:
+        self.enable_answer_checker = _resolve_answer_checker_enabled()
         super().reload_from_fs()
         self.registry = self._build_registry()
 
@@ -57,8 +60,9 @@ class ORReactAgent(BaseAgent):
         configure_environment(context_dir=task_dir, runtime_dir=runtime_dir)
 
         trace = TraceWriter(runtime_dir)
-        system_prompt = self._build_system_prompt()
         registry = self._build_registry()
+        self.registry = registry
+        system_prompt = self._build_system_prompt()
         start = time.monotonic()
         error: str | None = None
 
@@ -157,7 +161,7 @@ class ORReactAgent(BaseAgent):
             return hook(self.system_prompt, self.skills, self.memories, self.registry)
 
         sections = [self.system_prompt.strip()]
-        sections.append(_harness_protocol())
+        sections.append(_harness_protocol(self.enable_answer_checker))
 
         skill_catalog = self._skill_catalog()
         if skill_catalog:
@@ -204,11 +208,14 @@ class ORReactAgent(BaseAgent):
         for entry in self.workspace.read_tool_registry():
             if entry.get("kind") == "seed":
                 continue
+            if entry.get("name") == "answer_checker" and not self.enable_answer_checker:
+                continue
             if not _is_evolved_tool_entry(entry):
                 continue
             spec = self._load_evolved_tool(entry)
             registry.register(spec, overwrite=True)
-        _install_answer_checker_budget(registry)
+        if self.enable_answer_checker:
+            _install_answer_checker_budget(registry)
         return registry
 
     def _load_evolved_tool(self, entry: dict[str, Any]) -> ToolSpec:
@@ -354,12 +361,13 @@ def _answer_checker_budget_exhausted() -> dict[str, Any]:
     }
 
 
-def _harness_protocol() -> str:
-    return """## Harness Interaction Protocol
+def _harness_protocol(enable_answer_checker: bool) -> str:
+    if enable_answer_checker:
+        return """## Harness Interaction Protocol
 You must use the evolved workspace harness tools instead of relying on hidden prompt-injected skill bodies.
 
 Required workflow:
-1. Call list_context, then read_md/read_csv to collect visible evidence from docs/ and data/.
+1. Call list_context, then read_md/read_csv/read_json to collect visible evidence from docs/ and data/.
 2. Call type_router(evidence_text) after summarizing that visible evidence yourself.
 3. Use the returned task_types, selected skills, selected memories, and required_checklist while building the model.
 4. Call answer_checker(compressed_trace, final_code, objective_value, task_types, harness_notes) before finalize.
@@ -368,6 +376,18 @@ Required workflow:
 7. Call finalize after answer_checker returns passed=true, or after answer_checker reports that its revision budget is exhausted.
 
 The router/checker tools may read the workspace harness library, but they only receive evidence, trace notes, code, and values that you provide. Do not treat the catalog below as full guidance; use type_router to load relevant harness content."""
+
+    return """## Harness Interaction Protocol
+You must use the evolved workspace harness tools instead of relying on hidden prompt-injected skill bodies.
+
+Required workflow:
+1. Call list_context, then read_md/read_csv/read_json to collect visible evidence from docs/ and data/.
+2. Call type_router(evidence_text) after summarizing that visible evidence yourself.
+3. Use the returned task_types, selected skills, selected memories, and required_checklist while building the model.
+4. Before finalize, act as a skeptical reviewer: challenge your own formulation, include concrete evidence for every checklist item, and include unresolved warnings or competing interpretations.
+5. Call finalize with the best available objective value.
+
+The router tool may read the workspace harness library, but it only receives evidence that you provide. Do not treat the catalog below as full guidance; use type_router to load relevant harness content."""
 
 
 def _normalize_types(value: Any) -> list[str]:
@@ -405,6 +425,11 @@ def _resolve_temperature(base_temperature: float | None) -> float | None:
     if text in {"", "none", "null"}:
         return None
     return float(raw)
+
+
+def _resolve_answer_checker_enabled() -> bool:
+    raw = os.environ.get(ANSWER_CHECKER_ENV, "")
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _resolve_workspace_tool_path(tools_dir: Path, file_name: str) -> Path:

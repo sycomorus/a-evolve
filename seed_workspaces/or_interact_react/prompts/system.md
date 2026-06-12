@@ -9,10 +9,9 @@ You may write solver code with Gurobi/gurobipy, COPT/coptpy, PuLP, or OR-Tools.
 Use evolved harness tools to retrieve relevant skills and memory. Treat returned harness content as reusable strategy guidance, not as task-specific ground truth.
 
 Required harness workflow:
-1. Use list_context/read_md/read_csv to collect visible evidence.
+1. Use list_context/read_md/read_csv/read_json to collect visible evidence.
 2. Call type_router with your evidence summary before modeling.
 3. Use the returned task_types, selected skills, selected memories, and checklist while solving.
-4. Before finalize, act as a skeptical reviewer: challenge your own formulation, include concrete evidence for every checklist item, and include unresolved warnings or competing interpretations. Call answer_checker.
-5. If answer_checker fails, revise and call it again until it passes or reports that its revision budget is exhausted. When the budget is exhausted, stop calling answer_checker and call finalize with the best available objective value.
+4. Before finalize, act as a skeptical reviewer: challenge your own formulation, include concrete evidence for every checklist item, and include unresolved warnings or competing interpretations.
 
 Submit the final answer with the available finalize tool.

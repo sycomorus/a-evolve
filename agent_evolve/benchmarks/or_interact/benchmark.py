@@ -1,4 +1,4 @@
-"""OR-Interact-Bench adapter for IndustryOR tasks."""
+"""OR-Interact-Bench adapter."""
 
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ class ObjectiveEvaluation:
 
 
 class ORInteractBenchmark(BenchmarkAdapter):
-    """Adapter for the 100-task IndustryOR subset of OR-Interact-Bench."""
+    """Adapter for a dataset directory under OR-Interact-Bench."""
 
     def __init__(
         self,
@@ -79,11 +79,7 @@ class ORInteractBenchmark(BenchmarkAdapter):
         )
 
     def _load_tasks(self) -> list[Task]:
-        index_path = self.benchmark_dir / "index.json"
-        if not index_path.is_file():
-            raise FileNotFoundError(f"missing OR-Interact-Bench index: {index_path}")
-
-        index = json.loads(index_path.read_text(encoding="utf-8"))
+        index = self._read_index()
         tasks: list[Task] = []
         for item in index.get("tasks", []):
             relative_path = Path(item["path"])
@@ -95,7 +91,33 @@ class ORInteractBenchmark(BenchmarkAdapter):
             tasks.append(self._task_from_index_item(item, task_dir))
 
         if not tasks:
+            tasks = self._load_tasks_from_dataset_dir()
+
+        if not tasks:
             raise ValueError(f"no tasks found for dataset {self.dataset!r} under {self.benchmark_dir}")
+        return tasks
+
+    def _read_index(self) -> dict[str, Any]:
+        index_path = self.benchmark_dir / "index.json"
+        if not index_path.is_file():
+            return {"tasks": []}
+        return json.loads(index_path.read_text(encoding="utf-8"))
+
+    def _load_tasks_from_dataset_dir(self) -> list[Task]:
+        dataset_dir = self.benchmark_dir / self.dataset
+        if not dataset_dir.is_dir():
+            return []
+
+        tasks = []
+        for task_dir in sorted(dataset_dir.glob("task_*")):
+            if not task_dir.is_dir():
+                continue
+            item = {
+                "task_id": task_dir.name,
+                "path": f"{self.dataset}/{task_dir.name}",
+                "source_instance_dir": None,
+            }
+            tasks.append(self._task_from_index_item(item, task_dir.resolve()))
         return tasks
 
     def _split_tasks(self) -> tuple[list[Task], list[Task]]:

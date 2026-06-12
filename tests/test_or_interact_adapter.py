@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_evolve.agents.or_interact.react_agent import ORReactAgent
+from agent_evolve.agents.or_interact.react_agent import ANSWER_CHECKER_ENV, ORReactAgent
 from agent_evolve.benchmarks.or_interact import ORInteractBenchmark
 from agent_evolve.types import Task, Trajectory
 
@@ -32,6 +32,38 @@ def test_split_is_reproducible_and_disjoint() -> None:
     assert set(first_train).isdisjoint(first_test)
     assert first_train == second_train
     assert first_test == second_test
+
+
+def test_loads_dataset_directory_when_index_lacks_dataset(tmp_path: Path) -> None:
+    benchmark_dir = tmp_path / "OR-Interact-Bench"
+    benchmark_dir.mkdir()
+    (benchmark_dir / "index.json").write_text(
+        json.dumps(
+            {
+                "tasks": [
+                    {
+                        "task_id": "task_001",
+                        "source_instance_dir": "instance_1",
+                        "path": "IndustryOR/task_001",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    _minimal_visible_task(benchmark_dir / "LargeScaleOR" / "task_001")
+    _minimal_visible_task(benchmark_dir / "LargeScaleOR" / "task_002")
+
+    benchmark = ORInteractBenchmark(
+        benchmark_dir=benchmark_dir,
+        dataset="LargeScaleOR",
+        train_size=50,
+    )
+    tasks = benchmark.get_tasks("train", limit=10)
+
+    assert sorted(task.id for task in tasks) == ["task_001", "task_002"]
+    assert tasks[0].metadata["dataset"] == "LargeScaleOR"
+    assert tasks[0].metadata["visible_roots"] == ["docs", "data"]
 
 
 def test_task_metadata_does_not_expose_oracle_names() -> None:
@@ -96,6 +128,7 @@ def test_evaluate_bad_answer_csv(tmp_path: Path, rows: list[dict[str, str]] | No
 
 
 def test_agent_prompt_uses_harness_catalog_and_protocol(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(ANSWER_CHECKER_ENV, "0")
     workspace = _workspace(tmp_path / "workspace")
     _write_skill(workspace, "modeling", "Prefer explicit variable bounds.")
     (workspace / "memory" / "memories.jsonl").write_text(
@@ -146,22 +179,133 @@ def test_agent_prompt_uses_harness_catalog_and_protocol(tmp_path: Path, monkeypa
 
     prompt = str(captured["system_prompt"])
     assert "Call type_router" in prompt
-    assert "Call answer_checker" in prompt
+    assert "answer_checker" not in prompt
     assert "Prefer explicit variable bounds." not in prompt
     assert "Check objective direction before finalizing." not in prompt
     assert "modeling; types=general" in prompt
     assert "memory:1 category=memories types=general" in prompt
     assert "diagnose" in captured["tools"]
     assert "type_router" in captured["tools"]
-    assert "answer_checker" in captured["tools"]
+    assert "answer_checker" not in captured["tools"]
 
 
-def test_seed_workspace_loads_router_and_checker_tools() -> None:
+def test_seed_workspace_skips_checker_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(ANSWER_CHECKER_ENV, "0")
+    workspace = REPO_ROOT / "a-evolve" / "seed_workspaces" / "or_interact_react"
+    agent = ORReactAgent(workspace)
+
+    assert agent.registry.get("type_router").kind == "evolved"
+    assert "answer_checker" not in agent.registry.list_tools()
+
+
+def test_seed_workspace_loads_checker_when_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(ANSWER_CHECKER_ENV, "1")
     workspace = REPO_ROOT / "a-evolve" / "seed_workspaces" / "or_interact_react"
     agent = ORReactAgent(workspace)
 
     assert agent.registry.get("type_router").kind == "evolved"
     assert agent.registry.get("answer_checker").kind == "evolved"
+
+
+def test_retailopt_task_can_index_and_call_read_json(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from baseline.react.agent import AgentResult, tool_schemas
+
+    import agent_evolve.agents.or_interact.react_agent as react_module
+
+    workspace = tmp_path / "workspace"
+    shutil.copytree(REPO_ROOT / "a-evolve" / "seed_workspaces" / "or_interact_react", workspace)
+    benchmark = ORInteractBenchmark(
+        benchmark_dir=BENCHMARK_DIR,
+        dataset="RetailOpt",
+        train_size=999,
+    )
+    task = _task_by_id(benchmark, "task_001")
+    captured: dict[str, object] = {}
+
+    class FakeReActAgent:
+        def __init__(self, *, config, trace, registry, system_prompt):
+            captured["registry_tools"] = registry.list_tools()
+            captured["schema_names"] = [tool["function"]["name"] for tool in tool_schemas(registry)]
+            captured["system_prompt"] = system_prompt
+            output = registry.call("read_json", file="data/instance.json")
+            captured["read_json_file"] = output["json"]["file"]
+            captured["read_json_content"] = output["json"]["content"]
+
+        def run(self):
+            return AgentResult(status="success", turns=1, objective_value="smoke")
+
+    monkeypatch.setattr(react_module, "ReActAgent", FakeReActAgent)
+    monkeypatch.setenv(ANSWER_CHECKER_ENV, "0")
+    monkeypatch.setenv("OR_REACT_RESULTS_DIR", str(tmp_path / "runs"))
+
+    trajectory = ORReactAgent(workspace).solve(task)
+
+    assert "read_json" in captured["registry_tools"]
+    assert "read_json" in captured["schema_names"]
+    assert "read_json" in str(captured["system_prompt"])
+    assert "answer_checker" not in captured["registry_tools"]
+    assert "answer_checker" not in captured["schema_names"]
+    assert "answer_checker" not in str(captured["system_prompt"])
+    assert trajectory.steps[-1]["tools"] == captured["registry_tools"]
+    assert captured["read_json_file"] == "data/instance.json"
+    assert isinstance(captured["read_json_content"], dict)
+    assert "products" in captured["read_json_content"]
+
+
+def test_check_flag_enables_checker_in_solve_prompt_and_schema(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from baseline.react.agent import AgentResult, tool_schemas
+
+    import agent_evolve.agents.or_interact.react_agent as react_module
+
+    workspace = tmp_path / "workspace"
+    shutil.copytree(REPO_ROOT / "a-evolve" / "seed_workspaces" / "or_interact_react", workspace)
+    benchmark = ORInteractBenchmark(
+        benchmark_dir=BENCHMARK_DIR,
+        dataset="RetailOpt",
+        train_size=999,
+    )
+    task = _task_by_id(benchmark, "task_001")
+    captured: dict[str, object] = {}
+
+    class FakeReActAgent:
+        def __init__(self, *, config, trace, registry, system_prompt):
+            captured["registry_tools"] = registry.list_tools()
+            captured["schema_names"] = [tool["function"]["name"] for tool in tool_schemas(registry)]
+            captured["system_prompt"] = system_prompt
+
+        def run(self):
+            return AgentResult(status="success", turns=1, objective_value="smoke")
+
+    monkeypatch.setattr(react_module, "ReActAgent", FakeReActAgent)
+    monkeypatch.setenv(ANSWER_CHECKER_ENV, "1")
+    monkeypatch.setenv("OR_REACT_RESULTS_DIR", str(tmp_path / "runs"))
+
+    trajectory = ORReactAgent(workspace).solve(task)
+
+    assert "answer_checker" in captured["registry_tools"]
+    assert "answer_checker" in captured["schema_names"]
+    assert "Call answer_checker" in str(captured["system_prompt"])
+    assert trajectory.steps[-1]["tools"] == captured["registry_tools"]
+
+
+def test_or_interact_cli_check_flags(monkeypatch: pytest.MonkeyPatch) -> None:
+    from examples.or_interact_examples import evaluate_or_interact, evolve_or_interact
+
+    monkeypatch.setattr(sys, "argv", ["evaluate_or_interact.py"])
+    assert evaluate_or_interact.parse_args().check is False
+    monkeypatch.setattr(sys, "argv", ["evaluate_or_interact.py", "--check"])
+    assert evaluate_or_interact.parse_args().check is True
+
+    monkeypatch.setattr(sys, "argv", ["evolve_or_interact.py"])
+    assert evolve_or_interact.parse_args().check is False
+    monkeypatch.setattr(sys, "argv", ["evolve_or_interact.py", "--check"])
+    assert evolve_or_interact.parse_args().check is True
 
 
 def test_type_router_returns_selected_harness_content_and_old_skill_defaults(
@@ -201,6 +345,7 @@ def test_answer_checker_returns_failed_checklist_from_mocked_llm(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv(ANSWER_CHECKER_ENV, "1")
     workspace = _workspace(tmp_path / "workspace")
     _write_skill(
         workspace,
@@ -261,6 +406,7 @@ def test_answer_checker_returns_pass_from_mocked_llm(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv(ANSWER_CHECKER_ENV, "1")
     workspace = _workspace(tmp_path / "workspace")
     _write_skill(
         workspace,
@@ -320,6 +466,7 @@ def test_answer_checker_requires_per_item_explanation_and_evidence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv(ANSWER_CHECKER_ENV, "1")
     workspace = _workspace(tmp_path / "workspace")
     _write_skill(
         workspace,
@@ -375,7 +522,11 @@ def test_answer_checker_requires_per_item_explanation_and_evidence(
     assert visible_check["reason"] == "Missing per-item explanation."
 
 
-def test_answer_checker_warns_and_blocks_after_three_failures(tmp_path: Path) -> None:
+def test_answer_checker_warns_and_blocks_after_three_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(ANSWER_CHECKER_ENV, "1")
     workspace = _workspace(tmp_path / "workspace")
     _write_tool(
         workspace,
@@ -655,3 +806,12 @@ def _visible_task(tmp_path: Path) -> Path:
     (task_dir / "data").mkdir()
     (task_dir / "docs" / "business_requirement.md").write_text("Task", encoding="utf-8")
     return task_dir
+
+
+def _minimal_visible_task(task_dir: Path) -> None:
+    (task_dir / "docs").mkdir(parents=True)
+    (task_dir / "data").mkdir()
+    (task_dir / "docs" / "business_requirement.md").write_text(
+        "Task",
+        encoding="utf-8",
+    )

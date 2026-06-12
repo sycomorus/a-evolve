@@ -1,4 +1,4 @@
-"""Run a-evolve on OR-Interact-Bench IndustryOR."""
+"""Run a-evolve on an OR-Interact-Bench dataset."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -21,13 +22,15 @@ if str(ROOT) not in sys.path:
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from agent_evolve.api import Evolver
-from agent_evolve.algorithms.adaptive_skill import AdaptiveSkillEngine
-from agent_evolve.benchmarks.or_interact import ORInteractBenchmark
-from agent_evolve.config import EvolveConfig
-from agent_evolve.display import print_evolve_summary, print_run_header
-from agent_evolve.evaluation import run_evaluation
-from agent_evolve.runs import create_run_workspace, update_run_metadata
+from agent_evolve.api import Evolver  # noqa: E402
+from agent_evolve.algorithms.adaptive_skill import AdaptiveSkillEngine  # noqa: E402
+from agent_evolve.benchmarks.or_interact import ORInteractBenchmark  # noqa: E402
+from agent_evolve.config import EvolveConfig  # noqa: E402
+from agent_evolve.display import print_evolve_summary, print_run_header  # noqa: E402
+from agent_evolve.evaluation import run_evaluation  # noqa: E402
+from agent_evolve.runs import create_run_workspace, update_run_metadata  # noqa: E402
+
+ANSWER_CHECKER_ENV = "OR_REACT_ENABLE_ANSWER_CHECKER"
 
 
 def main() -> int:
@@ -36,7 +39,7 @@ def main() -> int:
     evolver_model, evolver_base_url, evolver_api_key, evolver_temperature = resolve_evolver_llm()
     benchmark = ORInteractBenchmark(
         benchmark_dir=args.benchmark_dir,
-        dataset="IndustryOR",
+        dataset=args.dataset,
         seed=42,
         train_size=50,
     )
@@ -64,7 +67,7 @@ def main() -> int:
         args.from_source,
         seed_workspace,
         agent="or-interact",
-        benchmark="industry-or",
+        benchmark=f"or-interact:{args.dataset}",
     )
     print_run_header(
         title="OR-Interact Evolution",
@@ -73,56 +76,59 @@ def main() -> int:
         source=args.from_source,
         console=console,
     )
-    evolver = Evolver(
-        agent=run.workspace_dir,
-        benchmark=benchmark,
-        config=config,
-        engine=engine,
-        work_dir=run.run_dir,
-    )
-
-    with Progress(
-        TextColumn("[bold magenta]Evolving"),
-        BarColumn(),
-        MofNCompleteColumn(),
-        TextColumn("[dim]score={task.fields[score]} mutated={task.fields[mutated]}"),
-        TimeElapsedColumn(),
-        console=console,
-    ) as progress:
-        progress_task = progress.add_task(
-            "evolve",
-            total=args.max_cycles,
-            score="n/a",
-            mutated="n/a",
+    with _answer_checker_setting(args.check):
+        evolver = Evolver(
+            agent=run.workspace_dir,
+            benchmark=benchmark,
+            config=config,
+            engine=engine,
+            work_dir=run.run_dir,
         )
 
-        def update_progress(event: dict[str, object]) -> None:
-            progress.update(
-                progress_task,
-                completed=int(event["cycle"]),
-                score=f"{float(event['score']):.3f}",
-                mutated="yes" if event["mutated"] else "no",
+        with Progress(
+            TextColumn("[bold magenta]Evolving"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TextColumn("[dim]score={task.fields[score]} mutated={task.fields[mutated]}"),
+            TimeElapsedColumn(),
+            console=console,
+        ) as progress:
+            progress_task = progress.add_task(
+                "evolve",
+                total=args.max_cycles,
+                score="n/a",
+                mutated="n/a",
             )
 
-        result = evolver.run(cycles=args.max_cycles, progress_callback=update_progress)
+            def update_progress(event: dict[str, object]) -> None:
+                progress.update(
+                    progress_task,
+                    completed=int(event["cycle"]),
+                    score=f"{float(event['score']):.3f}",
+                    mutated="yes" if event["mutated"] else "no",
+                )
 
-    workspace = evolver.agent.workspace.root
-    final_dir = workspace / "evolution" / "final_test"
-    test_limit = args.limit_test if args.limit_test is not None else 50
-    console.rule("[bold cyan]Final test evaluation")
-    eval_summary = run_evaluation(
-        evolver.agent,
-        benchmark,
-        split="test",
-        limit=test_limit,
-        output_dir=final_dir,
-        show_progress=True,
-        console=console,
-    )
+            result = evolver.run(cycles=args.max_cycles, progress_callback=update_progress)
+
+        workspace = evolver.agent.workspace.root
+        final_dir = workspace / "evolution" / "final_test"
+        test_limit = args.limit_test if args.limit_test is not None else 50
+        console.rule("[bold cyan]Final test evaluation")
+        eval_summary = run_evaluation(
+            evolver.agent,
+            benchmark,
+            split="test",
+            limit=test_limit,
+            output_dir=final_dir,
+            show_progress=True,
+            console=console,
+        )
     summary = {
         "run_id": run.run_id,
         "run_dir": str(run.run_dir),
         "workspace": str(workspace),
+        "dataset": args.dataset,
+        "check": args.check,
         "cycles_completed": result.cycles_completed,
         "score_history": result.score_history,
         "test_total": eval_summary["total"],
@@ -135,6 +141,7 @@ def main() -> int:
     )
     update_run_metadata(
         run.run_dir,
+        check=args.check,
         cycles_completed=result.cycles_completed,
         final_score=result.final_score,
         score_history=result.score_history,
@@ -148,6 +155,11 @@ def main() -> int:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evolve the OR-Interact ReAct harness.")
     parser.add_argument("--benchmark-dir", default=str(REPO_ROOT / "OR-Interact-Bench"))
+    parser.add_argument(
+        "--dataset",
+        default="IndustryOR",
+        help="Dataset directory under OR-Interact-Bench, for example IndustryOR or LargeScaleOR.",
+    )
     parser.add_argument(
         "--work-dir",
         default=str(REPO_ROOT / "a-evolve" / "evolution_workdir_or_interact"),
@@ -166,6 +178,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-skills", type=int, default=8)
     parser.add_argument("--limit-train", type=int)
     parser.add_argument("--limit-test", type=int)
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Expose the optional answer_checker tool during evolution and final evaluation.",
+    )
     return parser.parse_args()
 
 
@@ -191,6 +208,19 @@ def load_yaml(path: str | Path) -> dict[str, Any]:
         return {}
     data = yaml.safe_load(file_path.read_text(encoding="utf-8")) or {}
     return data if isinstance(data, dict) else {}
+
+
+@contextmanager
+def _answer_checker_setting(enabled: bool):
+    previous = os.environ.get(ANSWER_CHECKER_ENV)
+    os.environ[ANSWER_CHECKER_ENV] = "1" if enabled else "0"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(ANSWER_CHECKER_ENV, None)
+        else:
+            os.environ[ANSWER_CHECKER_ENV] = previous
 
 
 if __name__ == "__main__":

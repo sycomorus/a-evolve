@@ -14,6 +14,11 @@ tools:
     module: tools.seed_tools.read_csv
     function: read_csv
     description: Read visible CSV files.
+  - name: read_json
+    kind: seed
+    module: tools.seed_tools.read_json
+    function: read_json
+    description: Read visible JSON files.
   - name: run_solver
     kind: seed
     module: tools.seed_tools.run_solver
@@ -38,4 +43,4 @@ tools:
     kind: evolved
     file: answer_checker.py
     function: answer_checker
-    description: Check final code and submitted objective against selected evolved harness checklists before finalize.
+    description: Optional checker registered only when evaluate/evolve is run with --check.
