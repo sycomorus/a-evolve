@@ -10,7 +10,11 @@ from pathlib import Path
 import pytest
 
 from agent_evolve.agents.or_interact.react_agent import ANSWER_CHECKER_ENV, ORReactAgent
-from agent_evolve.benchmarks.or_interact import ORInteractBenchmark
+from agent_evolve.benchmarks.or_interact import (
+    ORInteractBenchmark,
+    evaluation_limit_for_split,
+    train_size_from_limit,
+)
 from agent_evolve.types import Task, Trajectory
 
 
@@ -306,6 +310,72 @@ def test_or_interact_cli_check_flags(monkeypatch: pytest.MonkeyPatch) -> None:
     assert evolve_or_interact.parse_args().check is False
     monkeypatch.setattr(sys, "argv", ["evolve_or_interact.py", "--check"])
     assert evolve_or_interact.parse_args().check is True
+
+
+def test_evaluate_and_evolve_use_matching_or_interact_splits(monkeypatch: pytest.MonkeyPatch) -> None:
+    from examples.or_interact_examples import evaluate_or_interact, evolve_or_interact
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "evaluate_or_interact.py",
+            "--dataset",
+            "RCO-mini",
+            "--split",
+            "test",
+            "--limit-train",
+            "5",
+            "--limit-test",
+            "3",
+        ],
+    )
+    evaluate_args = evaluate_or_interact.parse_args()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "evolve_or_interact.py",
+            "--dataset",
+            "RCO-mini",
+            "--limit-train",
+            "5",
+            "--limit-test",
+            "3",
+        ],
+    )
+    evolve_args = evolve_or_interact.parse_args()
+
+    evaluate_benchmark = ORInteractBenchmark(
+        benchmark_dir=BENCHMARK_DIR,
+        dataset=evaluate_args.dataset,
+        train_size=train_size_from_limit(evaluate_args.limit_train),
+    )
+    evolve_benchmark = ORInteractBenchmark(
+        benchmark_dir=BENCHMARK_DIR,
+        dataset=evolve_args.dataset,
+        train_size=train_size_from_limit(evolve_args.limit_train),
+    )
+
+    assert [task.id for task in evaluate_benchmark.get_tasks("train", limit=None)] == [
+        task.id for task in evolve_benchmark.get_tasks("train", limit=None)
+    ]
+    assert [task.id for task in evaluate_benchmark.get_tasks("test", limit=None)] == [
+        task.id for task in evolve_benchmark.get_tasks("test", limit=None)
+    ]
+    assert (
+        evaluation_limit_for_split(
+            evaluate_args.split,
+            limit_train=evaluate_args.limit_train,
+            limit_test=evaluate_args.limit_test,
+        )
+        == evaluation_limit_for_split(
+            "test",
+            limit_train=evolve_args.limit_train,
+            limit_test=evolve_args.limit_test,
+        )
+        == 3
+    )
 
 
 def test_type_router_returns_selected_harness_content_and_old_skill_defaults(

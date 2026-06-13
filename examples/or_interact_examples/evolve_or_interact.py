@@ -24,7 +24,11 @@ if str(REPO_ROOT) not in sys.path:
 
 from agent_evolve.api import Evolver  # noqa: E402
 from agent_evolve.algorithms.adaptive_skill import AdaptiveSkillEngine  # noqa: E402
-from agent_evolve.benchmarks.or_interact import ORInteractBenchmark  # noqa: E402
+from agent_evolve.benchmarks.or_interact import (  # noqa: E402
+    ORInteractBenchmark,
+    evaluation_limit_for_split,
+    train_size_from_limit,
+)
 from agent_evolve.config import EvolveConfig  # noqa: E402
 from agent_evolve.display import print_evolve_summary, print_run_header  # noqa: E402
 from agent_evolve.evaluation import run_evaluation  # noqa: E402
@@ -41,7 +45,7 @@ def main() -> int:
         benchmark_dir=args.benchmark_dir,
         dataset=args.dataset,
         seed=42,
-        train_size=args.limit_train if args.limit_train is not None else 50,
+        train_size=train_size_from_limit(args.limit_train),
     )
     config = EvolveConfig(
         batch_size=args.batch_size,
@@ -125,7 +129,11 @@ def main() -> int:
 
         workspace = evolver.agent.workspace.root
         final_dir = workspace / "evolution" / "final_test"
-        test_limit = args.limit_test if args.limit_test is not None else 50
+        test_limit = evaluation_limit_for_split(
+            "test",
+            limit_train=args.limit_train,
+            limit_test=args.limit_test,
+        )
         console.rule("[bold cyan]Final test evaluation")
         eval_summary = run_evaluation(
             evolver.agent,

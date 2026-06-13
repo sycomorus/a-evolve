@@ -20,7 +20,11 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from agent_evolve.agents.or_interact.react_agent import ORReactAgent  # noqa: E402
-from agent_evolve.benchmarks.or_interact import ORInteractBenchmark  # noqa: E402
+from agent_evolve.benchmarks.or_interact import (  # noqa: E402
+    ORInteractBenchmark,
+    evaluation_limit_for_split,
+    train_size_from_limit,
+)
 from agent_evolve.display import print_evaluation_summary, print_run_header  # noqa: E402
 from agent_evolve.evaluation import run_evaluation  # noqa: E402
 from agent_evolve.runs import resolve_workspace_source  # noqa: E402
@@ -53,7 +57,13 @@ def main() -> int:
         benchmark_dir=args.benchmark_dir,
         dataset=args.dataset,
         seed=42,
-        train_size=50,
+        train_size=train_size_from_limit(args.limit_train),
+    )
+    evaluation_limit = evaluation_limit_for_split(
+        args.split,
+        limit_train=args.limit_train,
+        limit_test=args.limit_test,
+        legacy_limit=args.limit,
     )
     with _answer_checker_setting(args.check):
         previous_results_dir = os.environ.get("OR_REACT_RESULTS_DIR")
@@ -64,7 +74,7 @@ def main() -> int:
                 agent,
                 benchmark,
                 split=args.split,
-                limit=args.limit,
+                limit=evaluation_limit,
                 output_dir=output_dir,
                 show_progress=True,
                 console=console,
@@ -76,6 +86,8 @@ def main() -> int:
                 os.environ["OR_REACT_RESULTS_DIR"] = previous_results_dir
     summary["source_type"] = source_type
     summary["dataset"] = args.dataset
+    summary["limit_train"] = args.limit_train
+    summary["limit_test"] = args.limit_test
     summary["check"] = args.check
     (output_dir / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2),
@@ -107,7 +119,25 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--split", default="test")
-    parser.add_argument("--limit", type=int, default=50)
+    parser.add_argument(
+        "--limit",
+        type=int,
+        help="Backward-compatible alias for the active split limit when split-specific limits are omitted.",
+    )
+    parser.add_argument(
+        "--limit-train",
+        "--limit_train",
+        dest="limit_train",
+        type=int,
+        help="Train split size and evaluation limit when --split train.",
+    )
+    parser.add_argument(
+        "--limit-test",
+        "--limit_test",
+        dest="limit_test",
+        type=int,
+        help="Evaluation limit when --split test or holdout.",
+    )
     parser.add_argument("--output-dir")
     parser.add_argument(
         "--check",
