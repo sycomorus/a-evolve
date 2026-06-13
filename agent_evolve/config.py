@@ -23,6 +23,7 @@ class EvolveConfig:
     """
 
     batch_size: int = 10
+    train_limit: int | None = None
     max_cycles: int = 20
     holdout_ratio: float = 0.2
 

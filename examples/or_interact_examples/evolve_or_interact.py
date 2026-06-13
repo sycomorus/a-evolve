@@ -41,11 +41,11 @@ def main() -> int:
         benchmark_dir=args.benchmark_dir,
         dataset=args.dataset,
         seed=42,
-        train_size=50,
+        train_size=args.limit_train if args.limit_train is not None else 50,
     )
-    train_batch = args.limit_train if args.limit_train is not None else args.batch_size
     config = EvolveConfig(
-        batch_size=train_batch,
+        batch_size=args.batch_size,
+        train_limit=args.limit_train,
         max_cycles=args.max_cycles,
         evolver_model=evolver_model,
         evolve_prompts=True,
@@ -61,6 +61,12 @@ def main() -> int:
         },
     )
     engine = AdaptiveSkillEngine(config)
+    total_updates = _total_updates(
+        benchmark=benchmark,
+        max_epochs=args.max_cycles,
+        batch_size=args.batch_size,
+        train_limit=args.limit_train,
+    )
     seed_workspace = ROOT / "seed_workspaces" / "or_interact_react"
     run = create_run_workspace(
         args.work_dir,
@@ -89,13 +95,18 @@ def main() -> int:
             TextColumn("[bold magenta]Evolving"),
             BarColumn(),
             MofNCompleteColumn(),
-            TextColumn("[dim]score={task.fields[score]} mutated={task.fields[mutated]}"),
+            TextColumn(
+                "[dim]epoch={task.fields[epoch]} batch={task.fields[batch]} "
+                "score={task.fields[score]} mutated={task.fields[mutated]}"
+            ),
             TimeElapsedColumn(),
             console=console,
         ) as progress:
             progress_task = progress.add_task(
                 "evolve",
-                total=args.max_cycles,
+                total=total_updates,
+                epoch="n/a",
+                batch="n/a",
                 score="n/a",
                 mutated="n/a",
             )
@@ -104,6 +115,8 @@ def main() -> int:
                 progress.update(
                     progress_task,
                     completed=int(event["cycle"]),
+                    epoch=str(event.get("epoch", "n/a")),
+                    batch=str(event.get("batch_index", "n/a")),
                     score=f"{float(event['score']):.3f}",
                     mutated="yes" if event["mutated"] else "no",
                 )
@@ -130,6 +143,11 @@ def main() -> int:
         "dataset": args.dataset,
         "check": args.check,
         "cycles_completed": result.cycles_completed,
+        "epochs_completed": result.details.get("epochs_completed"),
+        "updates_completed": result.details.get("updates_completed"),
+        "max_epochs": args.max_cycles,
+        "train_limit": args.limit_train,
+        "batch_size": args.batch_size,
         "score_history": result.score_history,
         "test_total": eval_summary["total"],
         "test_success": eval_summary["success"],
@@ -173,10 +191,17 @@ def parse_args() -> argparse.Namespace:
             "a run path, or a workspace path."
         ),
     )
-    parser.add_argument("--batch-size", type=int, default=10)
-    parser.add_argument("--max-cycles", "--cycles", dest="max_cycles", type=int, default=5)
+    parser.add_argument("--batch-size", type=int, default=10, help="Tasks per harness update.")
+    parser.add_argument(
+        "--max-cycles",
+        "--cycles",
+        dest="max_cycles",
+        type=int,
+        default=5,
+        help="Number of training epochs. Kept as --max-cycles for backward compatibility.",
+    )
     parser.add_argument("--max-skills", type=int, default=8)
-    parser.add_argument("--limit-train", type=int)
+    parser.add_argument("--limit-train", type=int, help="Total number of train tasks for this run.")
     parser.add_argument("--limit-test", type=int)
     parser.add_argument(
         "--check",
@@ -184,6 +209,20 @@ def parse_args() -> argparse.Namespace:
         help="Expose the optional answer_checker tool during evolution and final evaluation.",
     )
     return parser.parse_args()
+
+
+def _total_updates(
+    *,
+    benchmark: ORInteractBenchmark,
+    max_epochs: int,
+    batch_size: int,
+    train_limit: int | None,
+) -> int:
+    if train_limit is None:
+        return max_epochs
+    train_count = len(benchmark.get_tasks(split="train", limit=train_limit))
+    batches = (train_count + max(1, batch_size) - 1) // max(1, batch_size)
+    return max_epochs * batches
 
 
 def resolve_evolver_llm() -> tuple[str, str, str | None, float | None]:

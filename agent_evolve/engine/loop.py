@@ -72,16 +72,28 @@ class EvolutionLoop:
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> EvolutionResult:
         """Run the evolution loop for the specified number of cycles."""
-        max_cycles = cycles or self.config.max_cycles
+        max_epochs = cycles or self.config.max_cycles
         evolution_dir = self.agent.workspace.root / "evolution"
 
         self.versioning.init()
 
         score_history: list[float] = []
+        completed_updates = 0
+        completed_epochs = 0
+        schedule = self._build_training_schedule(max_epochs)
+        total_updates = len(schedule)
 
-        for cycle in range(max_cycles):
-            cycle_num = cycle + 1
-            logger.info("=== Evolution Cycle %d/%d ===", cycle_num, max_cycles)
+        for update_index, item in enumerate(schedule, start=1):
+            cycle_num = update_index
+            logger.info(
+                "=== Evolution Cycle %d/%d (epoch %d/%d, batch %d/%d) ===",
+                cycle_num,
+                total_updates,
+                item["epoch"],
+                max_epochs,
+                item["batch_index"],
+                item["batch_count"],
+            )
 
             # 1. SOLVE + 2. OBSERVE
             if self.engine.manages_own_evaluation:
@@ -90,7 +102,12 @@ class EvolutionLoop:
                 batch_path = self.observer.collect(observations)
                 cycle_score = 0.0
             else:
-                tasks = self.benchmark.get_tasks(split="train", limit=self.config.batch_size)
+                tasks = item["tasks"]
+                if tasks is None:
+                    tasks = self.benchmark.get_tasks(
+                        split="train",
+                        limit=self.config.batch_size,
+                    )
                 task_results = run_task_evaluations(self.agent, self.benchmark, tasks)
                 observations = []
                 for result in task_results:
@@ -114,6 +131,8 @@ class EvolutionLoop:
                     else 0.0
                 )
             score_history.append(cycle_score)
+            completed_updates = cycle_num
+            completed_epochs = max(completed_epochs, int(item["epoch"]))
             logger.info("Cycle %d score: %.3f", cycle_num, cycle_score)
 
             # 3. PRE-EVOLVE SNAPSHOT
@@ -166,18 +185,26 @@ class EvolutionLoop:
                 self._notify_progress(
                     progress_callback,
                     cycle_num,
-                    max_cycles,
+                    total_updates,
                     cycle_score,
                     step_result.mutated,
                     step_result.summary,
                     stopped=True,
                     converged=True,
+                    epoch=int(item["epoch"]),
+                    batch_index=int(item["batch_index"]),
+                    batch_count=int(item["batch_count"]),
                 )
                 return EvolutionResult(
-                    cycles_completed=cycle_num,
+                    cycles_completed=completed_updates,
                     final_score=cycle_score,
                     score_history=score_history,
                     converged=True,
+                    details={
+                        "epochs_completed": completed_epochs,
+                        "updates_completed": completed_updates,
+                        "total_updates": total_updates,
+                    },
                 )
 
             # 8. LOGGING
@@ -186,27 +213,40 @@ class EvolutionLoop:
             self._notify_progress(
                 progress_callback,
                 cycle_num,
-                max_cycles,
+                total_updates,
                 cycle_score,
                 step_result.mutated,
                 step_result.summary,
+                epoch=int(item["epoch"]),
+                batch_index=int(item["batch_index"]),
+                batch_count=int(item["batch_count"]),
             )
 
             # 9. CONVERGENCE CHECK
             if _is_score_converged(score_history, window=self.config.egl_window):
                 logger.info("Score converged after %d cycles.", cycle_num)
                 return EvolutionResult(
-                    cycles_completed=cycle_num,
+                    cycles_completed=completed_updates,
                     final_score=cycle_score,
                     score_history=score_history,
                     converged=True,
+                    details={
+                        "epochs_completed": completed_epochs,
+                        "updates_completed": completed_updates,
+                        "total_updates": total_updates,
+                    },
                 )
 
         return EvolutionResult(
-            cycles_completed=max_cycles,
+            cycles_completed=completed_updates,
             final_score=score_history[-1] if score_history else 0.0,
             score_history=score_history,
             converged=False,
+            details={
+                "epochs_completed": completed_epochs,
+                "updates_completed": completed_updates,
+                "total_updates": total_updates,
+            },
         )
 
     # ── Internal helpers ──────────────────────────────────────
@@ -222,20 +262,60 @@ class EvolutionLoop:
         *,
         stopped: bool = False,
         converged: bool = False,
+        epoch: int | None = None,
+        batch_index: int | None = None,
+        batch_count: int | None = None,
     ) -> None:
         if progress_callback is None:
             return
-        progress_callback(
+        event = {
+            "cycle": cycle,
+            "total_cycles": total_cycles,
+            "score": score,
+            "mutated": mutated,
+            "summary": summary,
+            "stopped": stopped,
+            "converged": converged,
+        }
+        if epoch is not None:
+            event["epoch"] = epoch
+        if batch_index is not None:
+            event["batch_index"] = batch_index
+        if batch_count is not None:
+            event["batch_count"] = batch_count
+        progress_callback(event)
+
+    def _build_training_schedule(self, max_epochs: int) -> list[dict[str, Any]]:
+        if self.engine.manages_own_evaluation or self.config.train_limit is None:
+            return [
+                {
+                    "epoch": cycle + 1,
+                    "batch_index": 1,
+                    "batch_count": 1,
+                    "tasks": None,
+                }
+                for cycle in range(max_epochs)
+            ]
+
+        train_tasks = self.benchmark.get_tasks(split="train", limit=self.config.train_limit)
+        if not train_tasks:
+            return []
+        batch_size = max(1, int(self.config.batch_size))
+        batches = [
+            train_tasks[start : start + batch_size]
+            for start in range(0, len(train_tasks), batch_size)
+        ]
+        batch_count = len(batches)
+        return [
             {
-                "cycle": cycle,
-                "total_cycles": total_cycles,
-                "score": score,
-                "mutated": mutated,
-                "summary": summary,
-                "stopped": stopped,
-                "converged": converged,
+                "epoch": epoch,
+                "batch_index": batch_index,
+                "batch_count": batch_count,
+                "tasks": batch,
             }
-        )
+            for epoch in range(1, max_epochs + 1)
+            for batch_index, batch in enumerate(batches, start=1)
+        ]
 
     def _append_history(
         self, evolution_dir: Path, cycle: int, score: float, mutated: bool
