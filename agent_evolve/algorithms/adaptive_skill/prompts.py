@@ -388,6 +388,7 @@ def build_evolution_prompt(
     prompt_only: bool = False,
     protect_skills: bool = False,
     judge_llm: Any | None = None,
+    scope_instruction: str | None = None,
 ) -> str:
     """Build the user-message prompt for one evolution cycle.
 
@@ -476,6 +477,8 @@ def build_evolution_prompt(
 
 ### Permissions
 {chr(10).join(permission_lines)}
+
+{f"### Scope\n{scope_instruction}" if scope_instruction else ""}
 
 {summary_heading}
 ```json

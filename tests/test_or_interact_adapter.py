@@ -6,16 +6,26 @@ import shutil
 import sys
 import types
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from baseline.react.agent import AgentResult
+from baseline.react.trace import TraceWriter
+from agent_evolve.config import EvolveConfig
+from agent_evolve.contract.workspace import AgentWorkspace
 from agent_evolve.agents.or_interact.react_agent import ANSWER_CHECKER_ENV, ORReactAgent
 from agent_evolve.benchmarks.or_interact import (
     ORInteractBenchmark,
     evaluation_limit_for_split,
     train_size_from_limit,
 )
-from agent_evolve.types import Task, Trajectory
+from agent_evolve.engine.versioning import VersionControl
+from agent_evolve.types import Feedback, Task, Trajectory
+from examples.or_interact_examples.harness_tree import (
+    HarnessTreeRunner,
+    sanitize_branch_name,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -170,7 +180,7 @@ def test_agent_prompt_uses_harness_catalog_and_protocol(tmp_path: Path, monkeypa
             captured["system_prompt"] = system_prompt
             captured["tools"] = registry.list_tools()
 
-        def run(self):
+        def run(self, **kwargs):
             from baseline.react.agent import AgentResult
 
             return AgentResult(status="success", turns=1, objective_value=1)
@@ -182,7 +192,7 @@ def test_agent_prompt_uses_harness_catalog_and_protocol(tmp_path: Path, monkeypa
     agent.solve(task)
 
     prompt = str(captured["system_prompt"])
-    assert "Call type_router" in prompt
+    assert "type_router(evidence_text) is available" in prompt
     assert "answer_checker" not in prompt
     assert "Prefer explicit variable bounds." not in prompt
     assert "Check objective direction before finalizing." not in prompt
@@ -194,12 +204,17 @@ def test_agent_prompt_uses_harness_catalog_and_protocol(tmp_path: Path, monkeypa
 
 
 def test_seed_workspace_skips_checker_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    from baseline.react.agent import tool_schemas
+
     monkeypatch.setenv(ANSWER_CHECKER_ENV, "0")
     workspace = REPO_ROOT / "a-evolve" / "seed_workspaces" / "or_interact_react"
     agent = ORReactAgent(workspace)
 
     assert agent.registry.get("type_router").kind == "evolved"
     assert "answer_checker" not in agent.registry.list_tools()
+    schemas = {schema["function"]["name"]: schema for schema in tool_schemas(agent.registry)}
+    router_parameters = schemas["type_router"]["function"]["parameters"]["properties"]
+    assert router_parameters["existing_branches"]["type"] == "array"
 
 
 def test_seed_workspace_loads_checker_when_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -238,7 +253,7 @@ def test_retailopt_task_can_index_and_call_read_json(
             captured["read_json_file"] = output["json"]["file"]
             captured["read_json_content"] = output["json"]["content"]
 
-        def run(self):
+        def run(self, **kwargs):
             return AgentResult(status="success", turns=1, objective_value="smoke")
 
     monkeypatch.setattr(react_module, "ReActAgent", FakeReActAgent)
@@ -283,7 +298,7 @@ def test_check_flag_enables_checker_in_solve_prompt_and_schema(
             captured["schema_names"] = [tool["function"]["name"] for tool in tool_schemas(registry)]
             captured["system_prompt"] = system_prompt
 
-        def run(self):
+        def run(self, **kwargs):
             return AgentResult(status="success", turns=1, objective_value="smoke")
 
     monkeypatch.setattr(react_module, "ReActAgent", FakeReActAgent)
@@ -409,6 +424,120 @@ def test_type_router_returns_selected_harness_content_and_old_skill_defaults(
     assert result["selected_skills"][0]["path"] == "skills/legacy-skill/SKILL.md"
     assert "Legacy skill body." in result["selected_skills"][0]["content"]
     assert result["selected_memories"][0]["content"] == "Legacy memory."
+
+
+def test_type_router_returns_branch_route_with_existing_branches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = _workspace(tmp_path / "workspace")
+    _copy_harness_tool(workspace, "type_router")
+    _write_registry(workspace, [{"name": "type_router", "file": "type_router.py", "function": "type_router"}])
+    _install_fake_openai(
+        monkeypatch,
+        [
+            {
+                "task_types": ["routing_vrp"],
+                "selected_skill_paths": [],
+                "selected_memory_paths": [],
+                "branch_action": "use_existing",
+                "branch_name": "branch/Routing VRP",
+                "branch_label": "Routing VRP",
+                "confidence": 0.9,
+                "rationale": "routing evidence matches existing branch",
+            }
+        ],
+    )
+
+    agent = ORReactAgent(workspace)
+    result = agent.registry.call(
+        "type_router",
+        evidence_text="Visible vehicle route evidence.",
+        existing_branches=[
+            {
+                "name": "branch/routing-vrp",
+                "label": "Routing VRP",
+                "description": "Vehicle routing tasks.",
+            }
+        ],
+    )
+
+    assert result["task_types"] == ["routing_vrp"]
+    assert result["branch_action"] == "use_existing"
+    assert result["branch_name"] == "branch/routing-vrp"
+    assert result["branch_label"] == "Routing VRP"
+    assert result["confidence"] == 0.9
+
+
+def test_sanitize_branch_name_handles_empty_unicode_and_special_chars() -> None:
+    assert sanitize_branch_name("") == "branch/general"
+    assert sanitize_branch_name("   ") == "branch/general"
+    assert sanitize_branch_name("中文") == "branch/general"
+    assert sanitize_branch_name("Routing VRP!") == "branch/routing-vrp"
+    assert sanitize_branch_name("branch/Piecewise Discount") == "branch/piecewise-discount"
+
+
+def test_version_control_branch_api(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "manifest.yaml").write_text("name: test\n", encoding="utf-8")
+
+    vc = VersionControl(workspace)
+    vc.init()
+
+    assert vc.get_current_branch() == "main"
+    assert vc.branch_exists("main")
+    vc.create_branch("branch/routing-vrp", "main")
+    assert vc.branch_exists("branch/routing-vrp")
+    assert "branch/routing-vrp" in vc.list_branches()
+    vc.checkout_branch("branch/routing-vrp")
+    assert vc.get_current_branch() == "branch/routing-vrp"
+    vc.checkout_branch("main")
+    assert vc.get_current_branch() == "main"
+
+
+def test_harness_tree_routes_buffers_and_final_eval_does_not_evolve(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path / "workspace")
+    benchmark = FakeBenchmark(tmp_path)
+    agent = FakeAgent(workspace)
+    engine = FakeEngine(workspace)
+    runner = HarnessTreeRunner(
+        agent=agent,
+        benchmark=benchmark,
+        engine=engine,
+        config=EvolveConfig(batch_size=3, train_limit=3),
+        type_buffer_size=2,
+        router_confidence_threshold=0.5,
+    )
+
+    result = runner.run_training(max_epochs=1)
+    state = json.loads((workspace / "evolution" / "harness_tree" / "state.json").read_text())
+
+    assert result.details["updates_completed"] == 2
+    assert engine.evolved_scopes == ["main", "alpha"]
+    assert sorted(state["branches"]) == ["branch/alpha", "branch/beta"]
+    assert state["main_pending"] == []
+    assert state["branches"]["branch/alpha"]["pending"] == []
+    assert len(state["branches"]["branch/beta"]["pending"]) == 1
+    assert (workspace / "memory" / "main.jsonl").is_file()
+    alpha_overlay = workspace / "evolution" / "harness_tree" / "overlays" / "alpha" / "files"
+    assert (alpha_overlay / "skills" / "domain-alpha" / "SKILL.md").is_file()
+    assert not (alpha_overlay / "memory" / "main.jsonl").exists()
+
+    pending_before = {
+        name: list(branch["pending"])
+        for name, branch in state["branches"].items()
+    }
+    eval_summary = runner.run_final_evaluation(limit=1, output_dir=workspace / "evolution" / "final_test")
+    state_after = json.loads((workspace / "evolution" / "harness_tree" / "state.json").read_text())
+
+    assert eval_summary["total"] == 1
+    assert eval_summary["per_branch"]["branch/alpha"]["total"] == 1
+    assert engine.evolved_scopes == ["main", "alpha"]
+    assert {
+        name: branch["pending"]
+        for name, branch in state_after["branches"].items()
+    } == pending_before
 
 
 def test_answer_checker_returns_failed_checklist_from_mocked_llm(
@@ -781,6 +910,144 @@ def test_forbidden_evolved_tool_is_rejected(tmp_path: Path) -> None:
         ORReactAgent(workspace)
 
 
+class FakeRegistry:
+    def call(self, name: str, **kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("harness-tree must not call type_router outside agent solve")
+
+
+class FakeAgent:
+    def __init__(self, workspace: Path) -> None:
+        self.workspace = AgentWorkspace(workspace)
+        self.registry = FakeRegistry()
+        self.config = types.SimpleNamespace(task_timeout_seconds=0)
+
+    def reload_from_fs(self) -> None:
+        self.registry = FakeRegistry()
+
+    def export_to_fs(self) -> None:
+        return None
+
+    def start_task_run(self, task: Task) -> tuple[Path, TraceWriter]:
+        runtime_dir = self.workspace.root / "runs" / task.id
+        return runtime_dir, TraceWriter(runtime_dir)
+
+    def run_phase(
+        self,
+        task: Task,
+        *,
+        runtime_dir: Path,
+        trace: TraceWriter,
+        phase: str = "solve",
+        initial_messages: list[dict[str, Any]] | None = None,
+        user_message: str | None = None,
+        system_prompt: str | None = None,
+        max_turns: int | None = None,
+        stop_after_tools: set[str] | None = None,
+    ) -> AgentResult:
+        messages = list(initial_messages or [{"role": "system", "content": "fake"}])
+        label = "beta" if "beta" in task.input else "alpha"
+        if phase.endswith(":route"):
+            trace.event("assistant_message", {"phase": phase, "content": "routing", "tool_calls": []})
+            trace.event(
+                "tool_output",
+                {
+                    "phase": phase,
+                    "name": "type_router",
+                    "output": {
+                        "task_types": [label],
+                        "branch_action": "use_existing",
+                        "branch_name": f"branch/{label}",
+                        "branch_label": label,
+                        "confidence": 0.95,
+                        "rationale": f"{label} evidence",
+                    },
+                },
+            )
+            messages.extend(
+                [
+                    {"role": "assistant", "content": "routing"},
+                    {
+                        "role": "tool",
+                        "tool_call_id": "route",
+                        "content": json.dumps({"branch_name": f"branch/{label}"}),
+                    },
+                ]
+            )
+            return AgentResult(status="stopped_after_type_router", turns=1, messages=messages)
+
+        assert initial_messages, "solve phase should inherit route messages"
+        trace.event("assistant_message", {"phase": phase, "content": "solving", "tool_calls": []})
+        return AgentResult(status="success", turns=1, objective_value=1, messages=messages)
+
+    def finish_task_run(
+        self,
+        task: Task,
+        *,
+        runtime_dir: Path,
+        result: AgentResult,
+        elapsed: float,
+    ) -> Trajectory:
+        steps = []
+        trace_path = runtime_dir / "trace.jsonl"
+        if trace_path.is_file():
+            steps = [json.loads(line) for line in trace_path.read_text().splitlines() if line.strip()]
+        steps.append({"runtime_dir": str(runtime_dir), "status": result.status})
+        return Trajectory(
+            task_id=task.id,
+            output=f"solved {task.id}",
+            steps=steps,
+            conversation=steps,
+        )
+
+
+class FakeBenchmark:
+    def __init__(self, tmp_path: Path) -> None:
+        self.train_tasks = [
+            _harness_task(tmp_path, "alpha_1", "alpha model"),
+            _harness_task(tmp_path, "beta_1", "beta model"),
+            _harness_task(tmp_path, "alpha_2", "alpha model again"),
+        ]
+        self.test_tasks = [_harness_task(tmp_path, "alpha_test", "alpha eval")]
+
+    def get_tasks(self, split: str = "train", limit: int | None = 10) -> list[Task]:
+        tasks = self.train_tasks if split == "train" else self.test_tasks
+        return tasks[:limit] if limit is not None else list(tasks)
+
+    def evaluate(self, task: Task, trajectory: Trajectory) -> Feedback:
+        return Feedback(
+            success=True,
+            score=1.0,
+            detail="ok",
+            raw={"evaluation": {"task_id": task.id, "correct": True}},
+        )
+
+
+class FakeEngine:
+    def __init__(self, workspace: Path) -> None:
+        self.workspace = workspace
+        self.evolved_scopes: list[str] = []
+
+    def evolve(
+        self,
+        workspace: AgentWorkspace,
+        observation_logs: list[dict[str, Any]],
+        evo_number: int = 0,
+    ) -> dict[str, Any]:
+        scope = "main" if workspace.root == self.workspace.resolve() else workspace.root.name
+        self.evolved_scopes.append(scope)
+        if scope == "main":
+            workspace.memory_dir.mkdir(parents=True, exist_ok=True)
+            (workspace.memory_dir / "main.jsonl").write_text('{"content": "main"}\n', encoding="utf-8")
+        else:
+            skill_dir = workspace.skills_dir / f"domain-{scope}"
+            skill_dir.mkdir(parents=True, exist_ok=True)
+            (skill_dir / "SKILL.md").write_text(
+                f"---\nname: domain-{scope}\ndescription: Domain {scope}\n---\n",
+                encoding="utf-8",
+            )
+        return {"evo_number": evo_number, "tasks_analyzed": len(observation_logs)}
+
+
 def _task_by_id(benchmark: ORInteractBenchmark, task_id: str) -> Task:
     for split in ("train", "test"):
         for task in benchmark.get_tasks(split, limit=50):
@@ -876,6 +1143,17 @@ def _visible_task(tmp_path: Path) -> Path:
     (task_dir / "data").mkdir()
     (task_dir / "docs" / "business_requirement.md").write_text("Task", encoding="utf-8")
     return task_dir
+
+
+def _harness_task(tmp_path: Path, task_id: str, overview: str) -> Task:
+    task_dir = tmp_path / "tasks" / task_id
+    (task_dir / "docs").mkdir(parents=True)
+    (task_dir / "docs" / "overview.md").write_text(overview, encoding="utf-8")
+    return Task(
+        id=task_id,
+        input=overview,
+        metadata={"task_dir": str(task_dir), "visible_files": ["docs/overview.md"]},
+    )
 
 
 def _minimal_visible_task(task_dir: Path) -> None:

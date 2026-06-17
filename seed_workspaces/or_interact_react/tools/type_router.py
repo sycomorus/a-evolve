@@ -9,7 +9,7 @@ from typing import Any
 import yaml
 
 
-def type_router(evidence_text: str) -> dict[str, Any]:
+def type_router(evidence_text: str, existing_branches: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Route visible task evidence to relevant workspace skills and memory."""
     root = Path(__file__).resolve().parents[1]
     skills = _load_skills(root)
@@ -18,11 +18,17 @@ def type_router(evidence_text: str) -> dict[str, Any]:
         "skills": [_catalog_skill(item) for item in skills],
         "memories": [_catalog_memory(item) for item in memories],
     }
-    judge = _judge_route(evidence_text=evidence_text, catalog=catalog)
+    branch_summaries = existing_branches or []
+    judge = _judge_route(
+        evidence_text=evidence_text,
+        catalog=catalog,
+        existing_branches=branch_summaries,
+    )
     task_types = _normalize_types(judge.get("task_types"))
     selected_skills = _select_skills(skills, judge, task_types)
     selected_memories = _select_memories(memories, judge, task_types)
     checklist = _merge_checklists(selected_skills + selected_memories)
+    branch_route = _branch_route(judge, task_types, branch_summaries)
     return {
         "task_types": task_types,
         "selected_skills": [
@@ -44,19 +50,28 @@ def type_router(evidence_text: str) -> dict[str, Any]:
         ],
         "required_checklist": checklist,
         "rationale": str(judge.get("rationale") or "Selected matching general harness entries."),
+        **branch_route,
     }
 
 
-def _judge_route(evidence_text: str, catalog: dict[str, Any]) -> dict[str, Any]:
+def _judge_route(
+    evidence_text: str,
+    catalog: dict[str, Any],
+    existing_branches: list[dict[str, Any]],
+) -> dict[str, Any]:
     system = (
         "You are a routing judge for reusable optimization-modeling harness guidance. "
         "Use only the supplied visible evidence and harness catalog. Return JSON with "
-        "task_types, selected_skill_paths, selected_memory_paths, and rationale."
+        "task_types, selected_skill_paths, selected_memory_paths, branch_action, "
+        "branch_name, branch_label, confidence, and rationale. branch_action must be "
+        "use_existing or create_new. Reuse an existing branch only when its description "
+        "clearly matches the visible evidence."
     )
     user = json.dumps(
         {
             "visible_evidence": evidence_text[:12000],
             "harness_catalog": catalog,
+            "existing_branches": existing_branches,
         },
         ensure_ascii=False,
     )
@@ -85,6 +100,58 @@ def _judge_route(evidence_text: str, catalog: dict[str, Any]) -> dict[str, Any]:
             "rationale": f"LLM routing unavailable; used keyword fallback: {type(exc).__name__}.",
         }
     return {"task_types": _heuristic_types(evidence_text), "rationale": "Router returned invalid JSON."}
+
+
+def _branch_route(
+    judge: dict[str, Any],
+    task_types: list[str],
+    existing_branches: list[dict[str, Any]],
+) -> dict[str, Any]:
+    existing_names = {str(item.get("name") or "") for item in existing_branches if item.get("name")}
+    raw_name = str(judge.get("branch_name") or "").strip()
+    raw_label = str(judge.get("branch_label") or "").strip()
+    label = raw_label or _first_specific_type(task_types)
+    if raw_name:
+        branch_name = _sanitize_branch_name(raw_name)
+    else:
+        branch_name = _sanitize_branch_name(label)
+
+    action = str(judge.get("branch_action") or "").strip().lower()
+    if action not in {"use_existing", "create_new"}:
+        action = "use_existing" if branch_name in existing_names else "create_new"
+    if branch_name in existing_names:
+        action = "use_existing"
+
+    try:
+        confidence = float(judge.get("confidence", 0.5))
+    except (TypeError, ValueError):
+        confidence = 0.5
+
+    return {
+        "branch_action": action,
+        "branch_name": branch_name,
+        "branch_label": label or "general",
+        "confidence": max(0.0, min(1.0, confidence)),
+    }
+
+
+def _first_specific_type(task_types: list[str]) -> str:
+    for task_type in task_types:
+        if task_type and task_type != "general":
+            return task_type
+    return task_types[0] if task_types else "general"
+
+
+def _sanitize_branch_name(value: str) -> str:
+    text = value.strip()
+    if text.startswith("branch/"):
+        text = text[len("branch/") :]
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9._-]+", "-", text)
+    text = re.sub(r"[-.]+$", "", text).strip("-._")
+    if not text:
+        text = "general"
+    return f"branch/{text[:80]}"
 
 
 def _load_skills(root: Path) -> list[dict[str, Any]]:

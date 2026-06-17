@@ -24,6 +24,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from agent_evolve.api import Evolver  # noqa: E402
 from agent_evolve.algorithms.adaptive_skill import AdaptiveSkillEngine  # noqa: E402
+from agent_evolve.agents.or_interact.react_agent import ORReactAgent  # noqa: E402
 from agent_evolve.benchmarks.or_interact import (  # noqa: E402
     ORInteractBenchmark,
     evaluation_limit_for_split,
@@ -33,6 +34,7 @@ from agent_evolve.config import EvolveConfig  # noqa: E402
 from agent_evolve.display import print_evolve_summary, print_run_header  # noqa: E402
 from agent_evolve.evaluation import run_evaluation  # noqa: E402
 from agent_evolve.runs import create_run_workspace, update_run_metadata  # noqa: E402
+from examples.or_interact_examples.harness_tree import run_harness_tree  # noqa: E402
 
 ANSWER_CHECKER_ENV = "OR_REACT_ENABLE_ANSWER_CHECKER"
 
@@ -87,63 +89,85 @@ def main() -> int:
         console=console,
     )
     with _answer_checker_setting(args.check):
-        evolver = Evolver(
-            agent=run.workspace_dir,
-            benchmark=benchmark,
-            config=config,
-            engine=engine,
-            work_dir=run.run_dir,
-        )
-
-        with Progress(
-            TextColumn("[bold magenta]Evolving"),
-            BarColumn(),
-            MofNCompleteColumn(),
-            TextColumn(
-                "[dim]epoch={task.fields[epoch]} batch={task.fields[batch]} "
-                "score={task.fields[score]} mutated={task.fields[mutated]}"
-            ),
-            TimeElapsedColumn(),
-            console=console,
-        ) as progress:
-            progress_task = progress.add_task(
-                "evolve",
-                total=total_updates,
-                epoch="n/a",
-                batch="n/a",
-                score="n/a",
-                mutated="n/a",
+        if args.harness_tree:
+            agent = ORReactAgent(run.workspace_dir)
+            workspace = agent.workspace.root
+            final_dir = workspace / "evolution" / "final_test"
+            test_limit = evaluation_limit_for_split(
+                "test",
+                limit_train=args.limit_train,
+                limit_test=args.limit_test,
+            )
+            console.rule("[bold magenta]Harness tree evolution")
+            result, eval_summary = run_harness_tree(
+                agent=agent,
+                benchmark=benchmark,
+                engine=engine,
+                config=config,
+                max_epochs=args.max_cycles,
+                type_buffer_size=args.type_buffer_size or args.batch_size,
+                router_confidence_threshold=args.router_confidence_threshold,
+                final_test_limit=test_limit,
+                final_dir=final_dir,
+            )
+        else:
+            evolver = Evolver(
+                agent=run.workspace_dir,
+                benchmark=benchmark,
+                config=config,
+                engine=engine,
+                work_dir=run.run_dir,
             )
 
-            def update_progress(event: dict[str, object]) -> None:
-                progress.update(
-                    progress_task,
-                    completed=int(event["cycle"]),
-                    epoch=str(event.get("epoch", "n/a")),
-                    batch=str(event.get("batch_index", "n/a")),
-                    score=f"{float(event['score']):.3f}",
-                    mutated="yes" if event["mutated"] else "no",
+            with Progress(
+                TextColumn("[bold magenta]Evolving"),
+                BarColumn(),
+                MofNCompleteColumn(),
+                TextColumn(
+                    "[dim]epoch={task.fields[epoch]} batch={task.fields[batch]} "
+                    "score={task.fields[score]} mutated={task.fields[mutated]}"
+                ),
+                TimeElapsedColumn(),
+                console=console,
+            ) as progress:
+                progress_task = progress.add_task(
+                    "evolve",
+                    total=total_updates,
+                    epoch="n/a",
+                    batch="n/a",
+                    score="n/a",
+                    mutated="n/a",
                 )
 
-            result = evolver.run(cycles=args.max_cycles, progress_callback=update_progress)
+                def update_progress(event: dict[str, object]) -> None:
+                    progress.update(
+                        progress_task,
+                        completed=int(event["cycle"]),
+                        epoch=str(event.get("epoch", "n/a")),
+                        batch=str(event.get("batch_index", "n/a")),
+                        score=f"{float(event['score']):.3f}",
+                        mutated="yes" if event["mutated"] else "no",
+                    )
 
-        workspace = evolver.agent.workspace.root
-        final_dir = workspace / "evolution" / "final_test"
-        test_limit = evaluation_limit_for_split(
-            "test",
-            limit_train=args.limit_train,
-            limit_test=args.limit_test,
-        )
-        console.rule("[bold cyan]Final test evaluation")
-        eval_summary = run_evaluation(
-            evolver.agent,
-            benchmark,
-            split="test",
-            limit=test_limit,
-            output_dir=final_dir,
-            show_progress=True,
-            console=console,
-        )
+                result = evolver.run(cycles=args.max_cycles, progress_callback=update_progress)
+
+            workspace = evolver.agent.workspace.root
+            final_dir = workspace / "evolution" / "final_test"
+            test_limit = evaluation_limit_for_split(
+                "test",
+                limit_train=args.limit_train,
+                limit_test=args.limit_test,
+            )
+            console.rule("[bold cyan]Final test evaluation")
+            eval_summary = run_evaluation(
+                evolver.agent,
+                benchmark,
+                split="test",
+                limit=test_limit,
+                output_dir=final_dir,
+                show_progress=True,
+                console=console,
+            )
     summary = {
         "run_id": run.run_id,
         "run_dir": str(run.run_dir),
@@ -156,10 +180,15 @@ def main() -> int:
         "max_epochs": args.max_cycles,
         "train_limit": args.limit_train,
         "batch_size": args.batch_size,
+        "harness_tree": args.harness_tree,
+        "type_buffer_size": (args.type_buffer_size or args.batch_size) if args.harness_tree else None,
+        "router_confidence_threshold": args.router_confidence_threshold if args.harness_tree else None,
         "score_history": result.score_history,
         "test_total": eval_summary["total"],
         "test_success": eval_summary["success"],
         "test_accuracy": eval_summary["accuracy"],
+        "test_per_branch": eval_summary.get("per_branch"),
+        "test_results_csv": eval_summary.get("results_csv"),
     }
     (final_dir / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2),
@@ -200,6 +229,23 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--batch-size", type=int, default=10, help="Tasks per harness update.")
+    parser.add_argument(
+        "--harness-tree",
+        action="store_true",
+        help="Enable OR-only type-router branch routing and branch-local evolution.",
+    )
+    parser.add_argument(
+        "--type-buffer-size",
+        type=int,
+        default=None,
+        help="Observations per type branch before evolving that branch. Defaults to --batch-size.",
+    )
+    parser.add_argument(
+        "--router-confidence-threshold",
+        type=float,
+        default=0.5,
+        help="Fallback to branch/general when router confidence is below this threshold.",
+    )
     parser.add_argument(
         "--max-cycles",
         "--cycles",

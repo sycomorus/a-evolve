@@ -55,35 +55,81 @@ class ORReactAgent(BaseAgent):
         self.registry = self._build_registry()
 
     def solve(self, task: Task) -> Trajectory:
+        runtime_dir, trace = self.start_task_run(task)
+        start = time.monotonic()
+        result = self.run_phase(task, runtime_dir=runtime_dir, trace=trace)
+        elapsed = time.monotonic() - start
+        return self.finish_task_run(
+            task,
+            runtime_dir=runtime_dir,
+            result=result,
+            elapsed=elapsed,
+        )
+
+    def start_task_run(self, task: Task) -> tuple[Path, TraceWriter]:
         task_dir = Path(task.metadata["task_dir"]).resolve()
         runtime_dir = self._prepare_runtime_dir(task.id)
         configure_environment(context_dir=task_dir, runtime_dir=runtime_dir)
+        return runtime_dir, TraceWriter(runtime_dir)
 
-        trace = TraceWriter(runtime_dir)
+    def run_phase(
+        self,
+        task: Task,
+        *,
+        runtime_dir: Path,
+        trace: TraceWriter,
+        phase: str = "solve",
+        initial_messages: list[dict[str, Any]] | None = None,
+        user_message: str | None = None,
+        system_prompt: str | None = None,
+        max_turns: int | None = None,
+        stop_after_tools: set[str] | None = None,
+    ) -> AgentResult:
+        task_dir = Path(task.metadata["task_dir"]).resolve()
+        configure_environment(context_dir=task_dir, runtime_dir=runtime_dir)
         registry = self._build_registry()
         self.registry = registry
-        system_prompt = self._build_system_prompt()
-        start = time.monotonic()
-        error: str | None = None
-
         try:
             with _task_timeout(self.config.task_timeout_seconds):
-                result = ReActAgent(
+                return ReActAgent(
                     config=self.config,
                     trace=trace,
                     registry=registry,
-                    system_prompt=system_prompt,
-                ).run()
+                    system_prompt=system_prompt or self._build_system_prompt(),
+                ).run(
+                    initial_messages=initial_messages,
+                    user_message=user_message,
+                    phase=phase,
+                    max_turns=max_turns,
+                    stop_after_tools=stop_after_tools,
+                )
         except TimeoutError as exc:
             error = str(exc)
             trace.event("error", {"message": error})
-            result = AgentResult(status="task_timeout", turns=0, error=error)
+            return AgentResult(
+                status="task_timeout",
+                turns=0,
+                error=error,
+                messages=initial_messages or [],
+            )
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
             trace.event("error", {"message": error})
-            result = AgentResult(status="error", turns=0, error=error)
+            return AgentResult(
+                status="error",
+                turns=0,
+                error=error,
+                messages=initial_messages or [],
+            )
 
-        elapsed = time.monotonic() - start
+    def finish_task_run(
+        self,
+        task: Task,
+        *,
+        runtime_dir: Path,
+        result: AgentResult,
+        elapsed: float,
+    ) -> Trajectory:
         summary = {
             "task_id": task.id,
             "dataset": task.metadata.get("dataset"),
@@ -91,7 +137,7 @@ class ORReactAgent(BaseAgent):
             "status": result.status,
             "turns": result.turns,
             "objective": result.objective_value,
-            "error": error or result.error,
+            "error": result.error,
             "elapsed_seconds": elapsed,
         }
         (runtime_dir / "run_summary.json").write_text(
@@ -107,8 +153,8 @@ class ORReactAgent(BaseAgent):
                 "status": result.status,
                 "turns": result.turns,
                 "objective": result.objective_value,
-                "error": error or result.error,
-                "tools": registry.list_tools(),
+                "error": result.error,
+                "tools": self.registry.list_tools(),
             }
         )
         return Trajectory(
@@ -366,26 +412,24 @@ def _harness_protocol(enable_answer_checker: bool) -> str:
         return """## Harness Interaction Protocol
 You must use the evolved workspace harness tools instead of relying on hidden prompt-injected skill bodies.
 
-Required workflow:
-1. Call list_context, then read_md/read_csv/read_json to collect visible evidence from docs/ and data/.
-2. Call type_router(evidence_text) after summarizing that visible evidence yourself.
-3. Use the returned task_types, selected skills, selected memories, and required_checklist while building the model.
-4. Call answer_checker(compressed_trace, final_code, objective_value, task_types, harness_notes) before finalize.
-5. If answer_checker returns passed=false, revise the model or submitted value and call answer_checker again.
-6. If answer_checker returns an answer_checker_budget_exhausted warning, stop calling answer_checker and call finalize with the best available objective value.
-7. Call finalize after answer_checker returns passed=true, or after answer_checker reports that its revision budget is exhausted.
+Context workflow:
+1. Use list_context, then read_md/read_csv/read_json to collect visible evidence from docs/ and data/.
+2. type_router(evidence_text) is available after you summarize visible evidence yourself; use its task_types, selected skills, selected memories, and required_checklist when they help the formulation.
+3. Call answer_checker(compressed_trace, final_code, objective_value, task_types, harness_notes) before finalize.
+4. If answer_checker returns passed=false, revise the model or submitted value and call answer_checker again.
+5. If answer_checker returns an answer_checker_budget_exhausted warning, stop calling answer_checker and call finalize with the best available objective value.
+6. Call finalize after answer_checker returns passed=true, or after answer_checker reports that its revision budget is exhausted.
 
 The router/checker tools may read the workspace harness library, but they only receive evidence, trace notes, code, and values that you provide. Do not treat the catalog below as full guidance; use type_router to load relevant harness content."""
 
     return """## Harness Interaction Protocol
 You must use the evolved workspace harness tools instead of relying on hidden prompt-injected skill bodies.
 
-Required workflow:
-1. Call list_context, then read_md/read_csv/read_json to collect visible evidence from docs/ and data/.
-2. Call type_router(evidence_text) after summarizing that visible evidence yourself.
-3. Use the returned task_types, selected skills, selected memories, and required_checklist while building the model.
-4. Before finalize, act as a skeptical reviewer: challenge your own formulation, include concrete evidence for every checklist item, and include unresolved warnings or competing interpretations.
-5. Call finalize with the best available objective value.
+Context workflow:
+1. Use list_context, then read_md/read_csv/read_json to collect visible evidence from docs/ and data/.
+2. type_router(evidence_text) is available after you summarize visible evidence yourself; use its task_types, selected skills, selected memories, and required_checklist when they help the formulation.
+3. Before finalize, act as a skeptical reviewer: challenge your own formulation, include concrete evidence for every checklist item, and include unresolved warnings or competing interpretations.
+4. Call finalize with the best available objective value.
 
 The router tool may read the workspace harness library, but it only receives evidence that you provide. Do not treat the catalog below as full guidance; use type_router to load relevant harness content."""
 

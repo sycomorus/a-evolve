@@ -21,7 +21,8 @@ class VersionControl:
 
     def init(self) -> None:
         """Initialize a git repo in the workspace (idempotent)."""
-        if not (self.root / ".git").exists():
+        new_repo = not (self.root / ".git").exists()
+        if new_repo:
             logger.info("Initializing git repo at %s", self.root)
             self._git("init")
             self._git("config", "user.email", "evolver@agent-evolve")
@@ -31,6 +32,8 @@ class VersionControl:
         try:
             self._git("commit", "-m", "Initial workspace state")
             self._git("tag", "evo-0")
+            if new_repo:
+                self._git("branch", "-M", "main")
             logger.info("Created initial commit with tag evo-0")
         except RuntimeError:
             pass  # already committed
@@ -76,6 +79,33 @@ class VersionControl:
     def list_tags(self) -> list[str]:
         output = self._git("tag", "-l", "evo-*", "--sort=-version:refname")
         return [t.strip() for t in output.splitlines() if t.strip()]
+
+    def create_branch(self, branch: str, start_point: str = "HEAD", *, checkout: bool = False) -> None:
+        """Create *branch* from *start_point* if it does not already exist."""
+        if self.branch_exists(branch):
+            if checkout:
+                self.checkout_branch(branch)
+            return
+        args = ["checkout", "-b", branch, start_point] if checkout else ["branch", branch, start_point]
+        self._git(*args)
+
+    def checkout_branch(self, branch: str) -> None:
+        """Checkout an existing branch."""
+        self._git("checkout", branch)
+
+    def branch_exists(self, branch: str) -> bool:
+        try:
+            self._git("rev-parse", "--verify", f"refs/heads/{branch}")
+        except RuntimeError:
+            return False
+        return True
+
+    def list_branches(self) -> list[str]:
+        output = self._git("branch", "--format=%(refname:short)")
+        return [line.strip() for line in output.splitlines() if line.strip()]
+
+    def get_current_branch(self) -> str:
+        return self._git("branch", "--show-current")
 
     def show_file_at(self, ref: str, filepath: str) -> str:
         return self._git("show", f"{ref}:{filepath}")
