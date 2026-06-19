@@ -410,9 +410,6 @@ def test_type_router_returns_selected_harness_content_and_old_skill_defaults(
         [
             {
                 "task_types": ["general"],
-                "selected_skill_paths": ["skills/legacy-skill/SKILL.md"],
-                "selected_memory_paths": ["memory/memories.jsonl:1"],
-                "rationale": "legacy general route",
             }
         ],
     )
@@ -437,12 +434,7 @@ def test_type_router_returns_branch_route_with_existing_branches(
         monkeypatch,
         [
             {
-                "task_types": ["routing_vrp"],
-                "selected_skill_paths": [],
-                "selected_memory_paths": [],
-                "branch_action": "use_existing",
                 "branch_name": "branch/Routing VRP",
-                "branch_label": "Routing VRP",
                 "confidence": 0.9,
                 "rationale": "routing evidence matches existing branch",
             }
@@ -455,18 +447,57 @@ def test_type_router_returns_branch_route_with_existing_branches(
         evidence_text="Visible vehicle route evidence.",
         existing_branches=[
             {
-                "name": "branch/routing-vrp",
-                "label": "Routing VRP",
-                "description": "Vehicle routing tasks.",
+                "branch_name": "branch/routing-vrp",
+                "rationale": "Vehicle routing tasks.",
             }
         ],
     )
 
-    assert result["task_types"] == ["routing_vrp"]
-    assert result["branch_action"] == "use_existing"
     assert result["branch_name"] == "branch/routing-vrp"
-    assert result["branch_label"] == "Routing VRP"
     assert result["confidence"] == 0.9
+    assert result["rationale"] == "routing evidence matches existing branch"
+
+
+def test_type_router_judge_only_routes_branches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = _workspace(tmp_path / "workspace")
+    _write_skill(workspace, "legacy-skill", "Legacy skill body.")
+    _copy_harness_tool(workspace, "type_router")
+    _write_registry(workspace, [{"name": "type_router", "file": "type_router.py", "function": "type_router"}])
+    captured_requests: list[dict[str, Any]] = []
+    _install_fake_openai(
+        monkeypatch,
+        [
+            {
+                "branch_name": "branch/general",
+                "confidence": 0.7,
+                "rationale": "general route",
+            }
+        ],
+        captured_requests=captured_requests,
+    )
+
+    agent = ORReactAgent(workspace)
+    agent.registry.call(
+        "type_router",
+        evidence_text="Visible production planning evidence.",
+        existing_branches=[],
+    )
+
+    messages = captured_requests[0]["messages"]
+    system = messages[0]["content"]
+    user_payload = json.loads(messages[1]["content"])
+    assert "branch_action" not in system
+    assert "branch_label" not in system
+    assert "confidence" in system
+    assert "rationale" in system
+    assert "task_types" not in system
+    assert "selected_skill_paths" not in system
+    assert "selected_memory_paths" not in system
+    assert "harness_catalog" not in user_payload
+    assert user_payload["existing_branches"] == []
 
 
 def test_sanitize_branch_name_handles_empty_unicode_and_special_chars() -> None:
@@ -954,10 +985,7 @@ class FakeAgent:
                     "phase": phase,
                     "name": "type_router",
                     "output": {
-                        "task_types": [label],
-                        "branch_action": "use_existing",
                         "branch_name": f"branch/{label}",
-                        "branch_label": label,
                         "confidence": 0.95,
                         "rationale": f"{label} evidence",
                     },
@@ -1114,11 +1142,18 @@ def _copy_harness_tool(workspace: Path, name: str) -> None:
     shutil.copyfile(source, workspace / "tools" / f"{name}.py")
 
 
-def _install_fake_openai(monkeypatch: pytest.MonkeyPatch, payloads: list[dict[str, object]]) -> None:
+def _install_fake_openai(
+    monkeypatch: pytest.MonkeyPatch,
+    payloads: list[dict[str, object]],
+    *,
+    captured_requests: list[dict[str, Any]] | None = None,
+) -> None:
     remaining = list(payloads)
 
     class FakeCompletions:
         def create(self, **kwargs):
+            if captured_requests is not None:
+                captured_requests.append(kwargs)
             if not remaining:
                 raise AssertionError("unexpected OpenAI call")
             content = json.dumps(remaining.pop(0))

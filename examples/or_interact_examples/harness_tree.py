@@ -27,7 +27,7 @@ GENERAL_BRANCH = "branch/general"
 MATERIALIZED_DIR = STATE_DIR / "materialized"
 OVERLAYS_DIR = STATE_DIR / "overlays"
 HARNESS_PATHS = ("prompts", "skills", "memory", "tools", "manifest.yaml")
-ROUTE_PHASE_TURNS = 4
+ROUTE_PHASE_TURNS = 16
 
 ROUTE_PHASE_USER_MESSAGE = """\
 Route this operations research task before solving it.
@@ -45,6 +45,7 @@ Routing is complete.
 
 Selected branch: {branch_name}
 Route confidence: {confidence:.3f}
+Route rationale: {rationale}
 
 Continue from the context already gathered above and solve the optimization task using the selected domain harness.
 Do not repeat context discovery unless required information is missing or ambiguous.
@@ -55,12 +56,8 @@ Call finalize with the best available objective value when done.
 @dataclass(frozen=True)
 class RouteDecision:
     branch_name: str
-    branch_action: str
-    branch_label: str
     confidence: float
     rationale: str
-    task_types: list[str]
-    raw: dict[str, Any]
     fallback_reason: str | None = None
 
 
@@ -131,8 +128,8 @@ class HarnessTreeRunner:
             record = self._collect_observation(observation)
             record["harness_tree"] = {
                 "branch_name": branch,
-                "branch_label": self.state["branches"][branch]["label"],
                 "route_confidence": decision.confidence,
+                "route_rationale": decision.rationale,
                 "fallback_reason": decision.fallback_reason,
             }
             self.state.setdefault("main_pending", []).append(record)
@@ -222,11 +219,9 @@ class HarnessTreeRunner:
         ]
 
     def _route_from_observation(self, observation: Observation, *, phase: str) -> RouteDecision:
-        existing = _branch_summaries(self.state)
         raw, extraction_reason = _extract_type_router_output(observation.trajectory)
         decision = _normalize_route_decision(
             raw,
-            existing_branches=existing,
             threshold=self.router_confidence_threshold,
             fallback_reason=extraction_reason,
         )
@@ -235,12 +230,9 @@ class HarnessTreeRunner:
                 "phase": phase,
                 "task_id": observation.task.id,
                 "branch_name": decision.branch_name,
-                "branch_action": decision.branch_action,
-                "branch_label": decision.branch_label,
                 "confidence": decision.confidence,
-                "task_types": decision.task_types,
-                "fallback_reason": decision.fallback_reason,
                 "rationale": decision.rationale,
+                "fallback_reason": decision.fallback_reason,
                 "timestamp": datetime.now().isoformat(),
             }
         )
@@ -257,8 +249,7 @@ class HarnessTreeRunner:
             branch,
             {
                 "name": branch,
-                "label": decision.branch_label,
-                "description": decision.rationale,
+                "rationale": decision.rationale,
                 "overlay": str(self._overlay_dir(branch).relative_to(self.workspace_root)),
                 "created_cycle": cycle,
                 "solve_count": 0,
@@ -313,6 +304,7 @@ class HarnessTreeRunner:
                 user_message=SOLVE_PHASE_USER_MESSAGE.format(
                     branch_name=branch,
                     confidence=decision.confidence,
+                    rationale=decision.rationale or "n/a",
                 ),
             )
             elapsed = (datetime.now() - started_at).total_seconds()
@@ -340,7 +332,6 @@ class HarnessTreeRunner:
                 "feedback": Feedback(False, 0.0, f"{type(exc).__name__}: {exc}"),
                 "route_decision": _normalize_route_decision(
                     {},
-                    existing_branches=_branch_summaries(self.state),
                     threshold=self.router_confidence_threshold,
                     fallback_reason=f"{type(exc).__name__}: {exc}",
                 ),
@@ -561,16 +552,11 @@ def _trajectory_from_runtime(task: Task, runtime_dir: Path) -> Trajectory:
 def _normalize_route_decision(
     raw: dict[str, Any],
     *,
-    existing_branches: list[dict[str, Any]],
     threshold: float,
     fallback_reason: str | None = None,
 ) -> RouteDecision:
-    existing_names = {str(item["name"]) for item in existing_branches if item.get("name")}
     task_types = _normalize_types(raw.get("task_types"))
     branch_name = sanitize_branch_name(raw.get("branch_name") or _first_specific_type(task_types))
-    action = str(raw.get("branch_action") or "").strip().lower()
-    if action not in {"use_existing", "create_new"}:
-        action = "use_existing" if branch_name in existing_names else "create_new"
     try:
         confidence = float(raw.get("confidence", 0.5))
     except (TypeError, ValueError):
@@ -580,19 +566,10 @@ def _normalize_route_decision(
         confidence_reason = f"router confidence {confidence:.3f} below threshold {threshold:.3f}"
         fallback_reason = f"{fallback_reason}; {confidence_reason}" if fallback_reason else confidence_reason
         branch_name = GENERAL_BRANCH
-        action = "use_existing" if branch_name in existing_names else "create_new"
-    elif action == "use_existing" and branch_name not in existing_names:
-        action = "create_new"
-    if branch_name in existing_names:
-        action = "use_existing"
     return RouteDecision(
         branch_name=branch_name,
-        branch_action=action,
-        branch_label=str(raw.get("branch_label") or branch_name.removeprefix("branch/") or "general"),
         confidence=confidence,
         rationale=str(raw.get("rationale") or ""),
-        task_types=task_types,
-        raw=raw,
         fallback_reason=fallback_reason,
     )
 
@@ -601,9 +578,8 @@ def _branch_summaries(state: dict[str, Any]) -> list[dict[str, Any]]:
     branches = state.get("branches", {})
     return [
         {
-            "name": item.get("name") or name,
-            "label": item.get("label") or name.removeprefix("branch/"),
-            "description": item.get("description") or "",
+            "branch_name": item.get("name") or name,
+            "rationale": item.get("rationale") or "",
             "solve_count": item.get("solve_count", 0),
             "evolve_count": item.get("evolve_count", 0),
         }
@@ -699,6 +675,7 @@ def _row_from_evaluation(
         "task_id": task.id,
         "branch_name": branch,
         "route_confidence": decision.confidence,
+        "route_rationale": decision.rationale,
         "route_fallback_reason": decision.fallback_reason or "",
         "success": False,
         "score": 0.0,
@@ -756,7 +733,7 @@ def _evaluation_summary(
 
 
 def _write_results_csv(path: Path, rows: list[dict[str, Any]]) -> None:
-    fieldnames = ["task_id", "branch_name", "route_confidence", "success", "score", "detail"]
+    fieldnames = ["task_id", "branch_name", "route_confidence", "route_rationale", "success", "score", "detail"]
     for row in rows:
         for key in row:
             if key not in fieldnames:

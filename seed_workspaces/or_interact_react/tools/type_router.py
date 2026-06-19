@@ -14,21 +14,16 @@ def type_router(evidence_text: str, existing_branches: list[dict[str, Any]] | No
     root = Path(__file__).resolve().parents[1]
     skills = _load_skills(root)
     memories = _load_memories(root)
-    catalog = {
-        "skills": [_catalog_skill(item) for item in skills],
-        "memories": [_catalog_memory(item) for item in memories],
-    }
     branch_summaries = existing_branches or []
     judge = _judge_route(
         evidence_text=evidence_text,
-        catalog=catalog,
         existing_branches=branch_summaries,
     )
-    task_types = _normalize_types(judge.get("task_types"))
-    selected_skills = _select_skills(skills, judge, task_types)
-    selected_memories = _select_memories(memories, judge, task_types)
+    branch_route = _branch_route(judge)
+    task_types = _normalize_types(judge.get("task_types") or _task_type_from_branch(branch_route["branch_name"]))
+    selected_skills = _select_skills(skills, task_types)
+    selected_memories = _select_memories(memories, task_types)
     checklist = _merge_checklists(selected_skills + selected_memories)
-    branch_route = _branch_route(judge, task_types, branch_summaries)
     return {
         "task_types": task_types,
         "selected_skills": [
@@ -49,28 +44,27 @@ def type_router(evidence_text: str, existing_branches: list[dict[str, Any]] | No
             for item in selected_memories
         ],
         "required_checklist": checklist,
-        "rationale": str(judge.get("rationale") or "Selected matching general harness entries."),
+        "rationale": str(judge.get("rationale") or ""),
         **branch_route,
     }
 
 
 def _judge_route(
     evidence_text: str,
-    catalog: dict[str, Any],
     existing_branches: list[dict[str, Any]],
 ) -> dict[str, Any]:
     system = (
-        "You are a routing judge for reusable optimization-modeling harness guidance. "
-        "Use only the supplied visible evidence and harness catalog. Return JSON with "
-        "task_types, selected_skill_paths, selected_memory_paths, branch_action, "
-        "branch_name, branch_label, confidence, and rationale. branch_action must be "
-        "use_existing or create_new. Reuse an existing branch only when its description "
-        "clearly matches the visible evidence."
+        "You are a task-type router for an operations-research harness tree. "
+        "Use only the supplied visible evidence and existing branch summaries. "
+        "Return JSON with only branch_name, confidence, and rationale. "
+        "Use an existing branch_name only when it clearly matches the visible evidence; "
+        "otherwise propose a new branch/<slug> name. "
+        "Do not select skills or memories; branch-local harness content is managed "
+        "downstream by the workspace overlay."
     )
     user = json.dumps(
         {
             "visible_evidence": evidence_text[:12000],
-            "harness_catalog": catalog,
             "existing_branches": existing_branches,
         },
         ensure_ascii=False,
@@ -93,46 +87,36 @@ def _judge_route(
         if isinstance(parsed, dict):
             return parsed
     except Exception as exc:
+        fallback_types = _heuristic_types(evidence_text)
         return {
-            "task_types": _heuristic_types(evidence_text),
-            "selected_skill_paths": [],
-            "selected_memory_paths": [],
+            "branch_name": _first_specific_type(fallback_types),
+            "confidence": 0.5,
             "rationale": f"LLM routing unavailable; used keyword fallback: {type(exc).__name__}.",
+            "task_types": fallback_types,
         }
-    return {"task_types": _heuristic_types(evidence_text), "rationale": "Router returned invalid JSON."}
+    fallback_types = _heuristic_types(evidence_text)
+    return {
+        "branch_name": _first_specific_type(fallback_types),
+        "confidence": 0.5,
+        "rationale": "Router returned invalid JSON; used keyword fallback.",
+        "task_types": fallback_types,
+    }
 
 
-def _branch_route(
-    judge: dict[str, Any],
-    task_types: list[str],
-    existing_branches: list[dict[str, Any]],
-) -> dict[str, Any]:
-    existing_names = {str(item.get("name") or "") for item in existing_branches if item.get("name")}
+def _branch_route(judge: dict[str, Any]) -> dict[str, Any]:
     raw_name = str(judge.get("branch_name") or "").strip()
-    raw_label = str(judge.get("branch_label") or "").strip()
-    label = raw_label or _first_specific_type(task_types)
-    if raw_name:
-        branch_name = _sanitize_branch_name(raw_name)
-    else:
-        branch_name = _sanitize_branch_name(label)
-
-    action = str(judge.get("branch_action") or "").strip().lower()
-    if action not in {"use_existing", "create_new"}:
-        action = "use_existing" if branch_name in existing_names else "create_new"
-    if branch_name in existing_names:
-        action = "use_existing"
-
     try:
         confidence = float(judge.get("confidence", 0.5))
     except (TypeError, ValueError):
         confidence = 0.5
-
     return {
-        "branch_action": action,
-        "branch_name": branch_name,
-        "branch_label": label or "general",
+        "branch_name": _sanitize_branch_name(raw_name or "general"),
         "confidence": max(0.0, min(1.0, confidence)),
     }
+
+
+def _task_type_from_branch(branch_name: str) -> str:
+    return _sanitize_branch_name(branch_name).removeprefix("branch/") or "general"
 
 
 def _first_specific_type(task_types: list[str]) -> str:
@@ -207,58 +191,14 @@ def _frontmatter(text: str) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def _catalog_skill(item: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "path": item["path"],
-        "name": item["name"],
-        "description": item["description"],
-        "types": item["types"],
-        "checklist": item["checklist"],
-    }
-
-
-def _catalog_memory(item: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "path": item["path"],
-        "content": item["content"][:400],
-        "types": item["types"],
-        "checklist": item["checklist"],
-    }
-
-
-def _select_skills(skills: list[dict[str, Any]], judge: dict[str, Any], task_types: list[str]) -> list[dict[str, Any]]:
-    selected_keys = _selected_keys(judge, "selected_skill_paths", "selected_skills")
-    selected = [item for item in skills if item["path"] in selected_keys or item["name"] in selected_keys]
-    if selected:
-        return selected
+def _select_skills(skills: list[dict[str, Any]], task_types: list[str]) -> list[dict[str, Any]]:
     wanted = set(task_types) | {"general"}
     return [item for item in skills if wanted.intersection(item["types"])]
 
 
-def _select_memories(memories: list[dict[str, Any]], judge: dict[str, Any], task_types: list[str]) -> list[dict[str, Any]]:
-    selected_keys = _selected_keys(judge, "selected_memory_paths", "selected_memories")
-    selected = [item for item in memories if item["path"] in selected_keys]
-    if selected:
-        return selected
+def _select_memories(memories: list[dict[str, Any]], task_types: list[str]) -> list[dict[str, Any]]:
     wanted = set(task_types) | {"general"}
     return [item for item in memories if wanted.intersection(item["types"])]
-
-
-def _selected_keys(judge: dict[str, Any], *names: str) -> set[str]:
-    keys: set[str] = set()
-    for name in names:
-        value = judge.get(name)
-        if isinstance(value, str):
-            keys.add(value)
-        elif isinstance(value, list):
-            for item in value:
-                if isinstance(item, dict):
-                    for key in ("path", "name"):
-                        if item.get(key):
-                            keys.add(str(item[key]))
-                elif item is not None:
-                    keys.add(str(item))
-    return keys
 
 
 def _merge_checklists(items: list[dict[str, Any]]) -> list[dict[str, str]]:
