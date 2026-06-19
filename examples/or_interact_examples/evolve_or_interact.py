@@ -12,7 +12,14 @@ from typing import Any
 
 import yaml
 from rich.console import Console
-from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeElapsedColumn
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 REPO_ROOT = ROOT.parent
@@ -99,17 +106,140 @@ def main() -> int:
                 limit_test=args.limit_test,
             )
             console.rule("[bold magenta]Harness tree evolution")
-            result, eval_summary = run_harness_tree(
-                agent=agent,
-                benchmark=benchmark,
-                engine=engine,
-                config=config,
-                max_epochs=args.max_cycles,
-                type_buffer_size=args.type_buffer_size or args.batch_size,
-                router_confidence_threshold=args.router_confidence_threshold,
-                final_test_limit=test_limit,
-                final_dir=final_dir,
-            )
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[bold magenta]{task.description}"),
+                BarColumn(),
+                MofNCompleteColumn(),
+                TextColumn(
+                    "[dim]{task.fields[phase]} task={task.fields[task_id]} "
+                    "branch={task.fields[branch]} score={task.fields[score]} "
+                    "pending={task.fields[pending]}"
+                ),
+                TimeElapsedColumn(),
+                console=console,
+            ) as progress:
+                train_task = progress.add_task(
+                    "Harness train",
+                    total=0,
+                    visible=False,
+                    phase="waiting",
+                    task_id="n/a",
+                    branch="n/a",
+                    score="n/a",
+                    pending="n/a",
+                )
+                eval_task = progress.add_task(
+                    "Final eval",
+                    total=0,
+                    visible=False,
+                    phase="waiting",
+                    task_id="n/a",
+                    branch="n/a",
+                    score="n/a",
+                    pending="n/a",
+                )
+
+                def update_harness_progress(event: dict[str, Any]) -> None:
+                    phase = str(event.get("phase", "train"))
+                    progress_task = eval_task if phase == "final_eval" else train_task
+                    event_name = str(event.get("event", ""))
+                    total = int(event.get("total") or 0)
+                    completed = int(event.get("completed") or 0)
+                    task_id = str(event.get("task_id") or "n/a")
+                    branch = _short_branch(event.get("branch_name"))
+                    score = _score_text(event.get("score"))
+
+                    if event_name == "start":
+                        progress.update(
+                            progress_task,
+                            total=total,
+                            completed=0,
+                            visible=True,
+                            phase="starting",
+                            task_id="n/a",
+                            branch="n/a",
+                            score="n/a",
+                            pending="n/a",
+                        )
+                        if phase == "final_eval":
+                            progress.console.rule("[bold cyan]Final test evaluation")
+                        return
+
+                    if event_name == "task_start":
+                        progress.update(
+                            progress_task,
+                            completed=completed,
+                            phase="routing/solving",
+                            task_id=task_id,
+                            branch="pending",
+                            score="n/a",
+                            pending="n/a",
+                        )
+                        return
+
+                    if event_name == "task_done":
+                        main_pending = event.get("main_pending")
+                        branch_pending = event.get("branch_pending")
+                        type_buffer_size = event.get("type_buffer_size")
+                        if main_pending is None:
+                            pending = "n/a"
+                        else:
+                            pending = f"main {main_pending}/{args.batch_size}"
+                            if branch_pending is not None and type_buffer_size is not None:
+                                pending += f", branch {branch_pending}/{type_buffer_size}"
+                        success = "ok" if event.get("success") else "fail"
+                        progress.update(
+                            progress_task,
+                            completed=completed,
+                            phase=success,
+                            task_id=task_id,
+                            branch=branch,
+                            score=score,
+                            pending=pending,
+                        )
+                        progress.console.log(
+                            f"[{phase}] {task_id} -> {branch} "
+                            f"score={score} confidence={float(event.get('route_confidence') or 0.0):.2f} "
+                            f"{success}"
+                        )
+                        return
+
+                    if event_name == "evolve_start":
+                        scope = _short_branch(event.get("scope"))
+                        records = int(event.get("records") or 0)
+                        progress.update(
+                            train_task,
+                            phase=f"evolving {scope}",
+                            branch=scope,
+                            pending=f"{records} records",
+                        )
+                        progress.console.log(f"[train] evolving {scope} with {records} records")
+                        return
+
+                    if event_name == "evolve_done":
+                        scope = _short_branch(event.get("scope"))
+                        updates = int(event.get("updates_completed") or 0)
+                        progress.update(
+                            train_task,
+                            phase=f"evolved {scope}",
+                            branch=scope,
+                            pending=f"updates {updates}",
+                        )
+                        progress.console.log(f"[train] evolved {scope}; updates={updates}")
+
+                result, eval_summary = run_harness_tree(
+                    agent=agent,
+                    benchmark=benchmark,
+                    engine=engine,
+                    config=config,
+                    max_epochs=args.max_cycles,
+                    type_buffer_size=args.type_buffer_size or args.batch_size,
+                    router_confidence_threshold=args.router_confidence_threshold,
+                    final_test_limit=test_limit,
+                    final_dir=final_dir,
+                    progress_callback=update_harness_progress,
+                )
         else:
             evolver = Evolver(
                 agent=run.workspace_dir,
@@ -301,6 +431,24 @@ def load_yaml(path: str | Path) -> dict[str, Any]:
         return {}
     data = yaml.safe_load(file_path.read_text(encoding="utf-8")) or {}
     return data if isinstance(data, dict) else {}
+
+
+def _short_branch(value: object) -> str:
+    text = str(value or "n/a")
+    if text.startswith("branch/"):
+        text = text[len("branch/") :]
+    if len(text) > 34:
+        return f"{text[:31]}..."
+    return text
+
+
+def _score_text(value: object) -> str:
+    if value is None:
+        return "n/a"
+    try:
+        return f"{float(value):.3f}"
+    except (TypeError, ValueError):
+        return str(value)
 
 
 @contextmanager

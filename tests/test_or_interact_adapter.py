@@ -541,7 +541,8 @@ def test_harness_tree_routes_buffers_and_final_eval_does_not_evolve(tmp_path: Pa
         router_confidence_threshold=0.5,
     )
 
-    result = runner.run_training(max_epochs=1)
+    progress_events: list[dict[str, Any]] = []
+    result = runner.run_training(max_epochs=1, progress_callback=progress_events.append)
     state = json.loads((workspace / "evolution" / "harness_tree" / "state.json").read_text())
 
     assert result.details["updates_completed"] == 2
@@ -550,6 +551,14 @@ def test_harness_tree_routes_buffers_and_final_eval_does_not_evolve(tmp_path: Pa
     assert state["main_pending"] == []
     assert state["branches"]["branch/alpha"]["pending"] == []
     assert len(state["branches"]["branch/beta"]["pending"]) == 1
+    observation_files = sorted((workspace / "evolution" / "observations").glob("batch_*.jsonl"))
+    assert [path.name for path in observation_files] == [
+        "batch_0001_main.jsonl",
+        "batch_0002_branch_alpha.jsonl",
+    ]
+    assert [len(path.read_text(encoding="utf-8").splitlines()) for path in observation_files] == [3, 2]
+    assert [event["event"] for event in progress_events].count("task_done") == 3
+    assert any(event.get("event") == "evolve_done" and event.get("scope") == "main" for event in progress_events)
     assert (workspace / "memory" / "main.jsonl").is_file()
     alpha_overlay = workspace / "evolution" / "harness_tree" / "overlays" / "alpha" / "files"
     assert (alpha_overlay / "skills" / "domain-alpha" / "SKILL.md").is_file()

@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from agent_evolve.benchmarks.base import BenchmarkAdapter
 from agent_evolve.config import EvolveConfig
@@ -72,6 +72,7 @@ def run_harness_tree(
     router_confidence_threshold: float,
     final_test_limit: int | None,
     final_dir: Path,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[EvolutionResult, dict[str, Any]]:
     runner = HarnessTreeRunner(
         agent=agent,
@@ -81,8 +82,12 @@ def run_harness_tree(
         type_buffer_size=type_buffer_size,
         router_confidence_threshold=router_confidence_threshold,
     )
-    result = runner.run_training(max_epochs=max_epochs)
-    eval_summary = runner.run_final_evaluation(limit=final_test_limit, output_dir=final_dir)
+    result = runner.run_training(max_epochs=max_epochs, progress_callback=progress_callback)
+    eval_summary = runner.run_final_evaluation(
+        limit=final_test_limit,
+        output_dir=final_dir,
+        progress_callback=progress_callback,
+    )
     return result, eval_summary
 
 
@@ -110,14 +115,41 @@ class HarnessTreeRunner:
         self.state = _empty_state()
         self.evolve_number = 0
 
-    def run_training(self, *, max_epochs: int) -> EvolutionResult:
+    def run_training(
+        self,
+        *,
+        max_epochs: int,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> EvolutionResult:
         self._prepare_repo()
         self.state = _load_state(self.state_path)
         score_history: list[float] = []
         completed_tasks = 0
+        schedule = self._training_schedule(max_epochs)
+        _emit_progress(
+            progress_callback,
+            {
+                "phase": "train",
+                "event": "start",
+                "total": len(schedule),
+                "max_epochs": max_epochs,
+            },
+        )
 
-        for schedule_item in self._training_schedule(max_epochs):
+        for schedule_item in schedule:
             task = schedule_item["task"]
+            _emit_progress(
+                progress_callback,
+                {
+                    "phase": "train",
+                    "event": "task_start",
+                    "completed": completed_tasks,
+                    "total": len(schedule),
+                    "epoch": schedule_item["epoch"],
+                    "cycle": schedule_item["cycle"],
+                    "task_id": task.id,
+                },
+            )
             evaluation = self._run_two_phase_task(task, phase="train")
             observation = self._observation_from_evaluation(evaluation)
             decision = evaluation["route_decision"]
@@ -125,7 +157,7 @@ class HarnessTreeRunner:
             completed_tasks += 1
             score_history.append(observation.feedback.score)
 
-            record = self._collect_observation(observation)
+            record = self._record_from_observation(observation)
             record["harness_tree"] = {
                 "branch_name": branch,
                 "route_confidence": decision.confidence,
@@ -140,11 +172,66 @@ class HarnessTreeRunner:
                 branch_state["success_count"] += 1
             branch_state["last_task_id"] = task.id
             _save_state(self.state_path, self.state)
+            _emit_progress(
+                progress_callback,
+                {
+                    "phase": "train",
+                    "event": "task_done",
+                    "completed": completed_tasks,
+                    "total": len(schedule),
+                    "epoch": schedule_item["epoch"],
+                    "cycle": schedule_item["cycle"],
+                    "task_id": task.id,
+                    "branch_name": branch,
+                    "route_confidence": decision.confidence,
+                    "score": observation.feedback.score,
+                    "success": observation.feedback.success,
+                    "main_pending": len(self.state.get("main_pending", [])),
+                    "branch_pending": len(branch_state["pending"]),
+                    "type_buffer_size": self.type_buffer_size,
+                },
+            )
 
             if len(self.state.get("main_pending", [])) >= max(1, int(self.config.batch_size)):
+                _emit_progress(
+                    progress_callback,
+                    {
+                        "phase": "train",
+                        "event": "evolve_start",
+                        "scope": "main",
+                        "records": len(self.state.get("main_pending", [])),
+                    },
+                )
                 self._evolve_main()
+                _emit_progress(
+                    progress_callback,
+                    {
+                        "phase": "train",
+                        "event": "evolve_done",
+                        "scope": "main",
+                        "updates_completed": len(self.state.get("main_evolutions", [])),
+                    },
+                )
             if len(branch_state["pending"]) >= self.type_buffer_size:
+                _emit_progress(
+                    progress_callback,
+                    {
+                        "phase": "train",
+                        "event": "evolve_start",
+                        "scope": branch,
+                        "records": len(branch_state["pending"]),
+                    },
+                )
                 self._evolve_branch(branch)
+                _emit_progress(
+                    progress_callback,
+                    {
+                        "phase": "train",
+                        "event": "evolve_done",
+                        "scope": branch,
+                        "updates_completed": branch_state["evolve_count"],
+                    },
+                )
 
         total_evolves = len(self.state.get("main_evolutions", [])) + sum(
             int(item.get("evolve_count", 0)) for item in self.state["branches"].values()
@@ -163,17 +250,57 @@ class HarnessTreeRunner:
             },
         )
 
-    def run_final_evaluation(self, *, limit: int | None, output_dir: Path) -> dict[str, Any]:
+    def run_final_evaluation(
+        self,
+        *,
+        limit: int | None,
+        output_dir: Path,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
         self._prepare_repo()
         self.state = _load_state(self.state_path)
         output_dir.mkdir(parents=True, exist_ok=True)
 
         rows: list[dict[str, Any]] = []
-        for task in self.benchmark.get_tasks(split="test", limit=limit):
+        tasks = self.benchmark.get_tasks(split="test", limit=limit)
+        _emit_progress(
+            progress_callback,
+            {
+                "phase": "final_eval",
+                "event": "start",
+                "total": len(tasks),
+            },
+        )
+        for index, task in enumerate(tasks, start=1):
+            _emit_progress(
+                progress_callback,
+                {
+                    "phase": "final_eval",
+                    "event": "task_start",
+                    "completed": index - 1,
+                    "total": len(tasks),
+                    "task_id": task.id,
+                },
+            )
             evaluation = self._run_two_phase_task(task, phase="final_eval")
             decision = evaluation["route_decision"]
             branch = self._reported_eval_branch(decision)
-            rows.append(_row_from_evaluation(evaluation, branch, decision))
+            row = _row_from_evaluation(evaluation, branch, decision)
+            rows.append(row)
+            _emit_progress(
+                progress_callback,
+                {
+                    "phase": "final_eval",
+                    "event": "task_done",
+                    "completed": index,
+                    "total": len(tasks),
+                    "task_id": task.id,
+                    "branch_name": branch,
+                    "route_confidence": decision.confidence,
+                    "score": row.get("score", 0.0),
+                    "success": _as_bool(row.get("success")),
+                },
+            )
 
         summary = _evaluation_summary(
             rows=rows,
@@ -348,15 +475,14 @@ class HarnessTreeRunner:
         )
         return Observation(task=task, trajectory=trajectory, feedback=feedback)
 
-    def _collect_observation(self, observation: Observation) -> dict[str, Any]:
-        batch_path = self.observer.collect([observation])
-        lines = [line for line in batch_path.read_text(encoding="utf-8").splitlines() if line.strip()]
-        return json.loads(lines[-1]) if lines else {}
+    def _record_from_observation(self, observation: Observation) -> dict[str, Any]:
+        return self.observer.record_from_observation(observation)
 
     def _evolve_main(self) -> None:
         buffer = list(self.state.get("main_pending", []))
         if not buffer:
             return
+        self.observer.collect_records(buffer, suffix="main")
         self.versioning.checkout_branch(MAIN_BRANCH)
         self.agent.reload_from_fs()
         self.evolve_number += 1
@@ -379,6 +505,7 @@ class HarnessTreeRunner:
         buffer = list(branch_state["pending"])
         if not buffer:
             return
+        self.observer.collect_records(buffer, suffix=f"branch_{_branch_slug(branch)}")
         materialized = self._materialize_branch_workspace(branch)
         phase_agent = self.agent.__class__(materialized)
         self.evolve_number += 1
@@ -750,3 +877,11 @@ def _as_bool(value: Any) -> bool:
     if isinstance(value, str):
         return value.lower() == "true"
     return bool(value)
+
+
+def _emit_progress(
+    progress_callback: Callable[[dict[str, Any]], None] | None,
+    event: dict[str, Any],
+) -> None:
+    if progress_callback is not None:
+        progress_callback(event)
