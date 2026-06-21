@@ -27,13 +27,17 @@ GENERAL_BRANCH = "branch/general"
 MATERIALIZED_DIR = STATE_DIR / "materialized"
 OVERLAYS_DIR = STATE_DIR / "overlays"
 HARNESS_PATHS = ("prompts", "skills", "memory", "tools", "manifest.yaml")
-ROUTE_PHASE_TURNS = 16
+ROUTE_PHASE_TURNS = 8
 
 ROUTE_PHASE_USER_MESSAGE = """\
 Route this operations research task before solving it.
 
 Use list_context and read_md/read_csv/read_json as needed to inspect visible docs/ and data/.
 Summarize the visible evidence yourself, then call type_router(evidence_text, existing_branches).
+The branch should be a broad OR problem family, not a narrow instance-specific subproblem.
+Use categories like TSP, CVRP, vehicle routing, network flow, assignment, scheduling,
+facility location, inventory planning, production planning, bin packing, knapsack, or
+travel planning when supported by the evidence.
 Do not build the optimization model, do not run solvers, and do not call finalize in this phase.
 
 Existing branch summaries:
@@ -51,7 +55,6 @@ Continue from the context already gathered above and solve the optimization task
 Do not repeat context discovery unless required information is missing or ambiguous.
 Call finalize with the best available objective value when done.
 """
-
 
 @dataclass(frozen=True)
 class RouteDecision:
@@ -186,6 +189,8 @@ class HarnessTreeRunner:
                     "route_confidence": decision.confidence,
                     "score": observation.feedback.score,
                     "success": observation.feedback.success,
+                    "fallback_reason": decision.fallback_reason,
+                    "feedback_detail": observation.feedback.detail,
                     "main_pending": len(self.state.get("main_pending", [])),
                     "branch_pending": len(branch_state["pending"]),
                     "type_buffer_size": self.type_buffer_size,
@@ -299,6 +304,8 @@ class HarnessTreeRunner:
                     "route_confidence": decision.confidence,
                     "score": row.get("score", 0.0),
                     "success": _as_bool(row.get("success")),
+                    "fallback_reason": decision.fallback_reason,
+                    "feedback_detail": row.get("detail"),
                 },
             )
 
@@ -402,6 +409,8 @@ class HarnessTreeRunner:
         self.agent.reload_from_fs()
         runtime_dir, trace = self.agent.start_task_run(task)
         started_at = datetime.now()
+        decision: RouteDecision | None = None
+        branch: str | None = None
         try:
             route_result = self.agent.run_phase(
                 task,
@@ -414,6 +423,7 @@ class HarnessTreeRunner:
                 max_turns=ROUTE_PHASE_TURNS,
                 stop_after_tools={"type_router"},
             )
+            route_messages = route_result.messages or None
             route_trajectory = _trajectory_from_runtime(task, runtime_dir)
             decision = self._route_from_observation(
                 Observation(task=task, trajectory=route_trajectory, feedback=Feedback(False, 0.0, "")),
@@ -427,7 +437,7 @@ class HarnessTreeRunner:
                 runtime_dir=runtime_dir,
                 trace=trace,
                 phase=f"{phase}:solve",
-                initial_messages=route_result.messages or None,
+                initial_messages=route_messages,
                 user_message=SOLVE_PHASE_USER_MESSAGE.format(
                     branch_name=branch,
                     confidence=decision.confidence,
@@ -453,15 +463,17 @@ class HarnessTreeRunner:
             }
         except Exception as exc:
             trajectory = _trajectory_from_runtime(task, runtime_dir)
+            fallback_decision = decision or _normalize_route_decision(
+                {},
+                threshold=self.router_confidence_threshold,
+                fallback_reason=f"{type(exc).__name__}: {exc}",
+            )
             return {
                 "task": task,
                 "trajectory": trajectory,
                 "feedback": Feedback(False, 0.0, f"{type(exc).__name__}: {exc}"),
-                "route_decision": _normalize_route_decision(
-                    {},
-                    threshold=self.router_confidence_threshold,
-                    fallback_reason=f"{type(exc).__name__}: {exc}",
-                ),
+                "route_decision": fallback_decision,
+                "branch_name": branch or fallback_decision.branch_name,
                 "error": f"{type(exc).__name__}: {exc}",
             }
 
@@ -682,8 +694,7 @@ def _normalize_route_decision(
     threshold: float,
     fallback_reason: str | None = None,
 ) -> RouteDecision:
-    task_types = _normalize_types(raw.get("task_types"))
-    branch_name = sanitize_branch_name(raw.get("branch_name") or _first_specific_type(task_types))
+    branch_name = sanitize_branch_name(raw.get("branch_name") or GENERAL_BRANCH)
     try:
         confidence = float(raw.get("confidence", 0.5))
     except (TypeError, ValueError):
@@ -771,24 +782,6 @@ def _exclude_state_dir(workspace_root: Path) -> None:
     if line not in existing.splitlines():
         suffix = "" if existing.endswith("\n") or not existing else "\n"
         exclude_path.write_text(f"{existing}{suffix}{line}\n", encoding="utf-8")
-
-
-def _normalize_types(value: Any) -> list[str]:
-    if isinstance(value, str):
-        items = [value]
-    elif isinstance(value, list):
-        items = value
-    else:
-        items = ["general"]
-    normalized = [str(item).strip() for item in items if str(item).strip()]
-    return normalized or ["general"]
-
-
-def _first_specific_type(task_types: list[str]) -> str:
-    for task_type in task_types:
-        if task_type and task_type != "general":
-            return task_type
-    return task_types[0] if task_types else "general"
 
 
 def _row_from_evaluation(

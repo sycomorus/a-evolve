@@ -130,6 +130,7 @@ class ORInteractBenchmark(BenchmarkAdapter):
     def _task_from_index_item(self, item: dict[str, Any], task_dir: Path) -> Task:
         task_id = str(item["task_id"])
         visible_files = _visible_files(task_dir)
+        task_metadata = _read_task_metadata(task_dir)
         metadata = {
             "dataset": self.dataset,
             "task_dir": str(task_dir),
@@ -137,6 +138,9 @@ class ORInteractBenchmark(BenchmarkAdapter):
             "visible_roots": ["docs", "data"],
             "visible_files": visible_files,
         }
+        category = _task_category(task_metadata)
+        if category:
+            metadata["category"] = category
         task_input = (
             f"{self.dataset} optimization task {task_id}. "
             "Only docs/ and data/ are visible to the agent."
@@ -239,6 +243,29 @@ def _read_reference_solution(task_dir: Path) -> str:
         f"{source.rstrip()}\n"
         "```"
     )
+
+
+def _read_task_metadata(task_dir: Path) -> dict[str, Any]:
+    path = task_dir / "metadata.json"
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _task_category(metadata: dict[str, Any]) -> str | None:
+    category = metadata.get("category")
+    if category is None:
+        source = metadata.get("source")
+        if isinstance(source, dict):
+            category = source.get("category")
+    if category is None:
+        return None
+    text = str(category).strip()
+    return text or None
 
 
 def _trajectory_diagnostics(trajectory: Trajectory) -> str:

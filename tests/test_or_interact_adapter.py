@@ -14,7 +14,7 @@ from baseline.react.agent import AgentResult
 from baseline.react.trace import TraceWriter
 from agent_evolve.config import EvolveConfig
 from agent_evolve.contract.workspace import AgentWorkspace
-from agent_evolve.agents.or_interact.react_agent import ANSWER_CHECKER_ENV, ORReactAgent
+from agent_evolve.agents.or_interact.react_agent import ORReactAgent
 from agent_evolve.benchmarks.or_interact import (
     ORInteractBenchmark,
     evaluation_limit_for_split,
@@ -80,6 +80,25 @@ def test_loads_dataset_directory_when_index_lacks_dataset(tmp_path: Path) -> Non
     assert tasks[0].metadata["visible_roots"] == ["docs", "data"]
 
 
+def test_task_metadata_includes_category_from_task_metadata_json(tmp_path: Path) -> None:
+    benchmark_dir = tmp_path / "OR-Interact-Bench"
+    task_dir = benchmark_dir / "RCO" / "task_001"
+    _minimal_visible_task(task_dir)
+    (task_dir / "metadata.json").write_text(
+        json.dumps({"category": "logistics_distribution_and_routing_optimization"}),
+        encoding="utf-8",
+    )
+
+    benchmark = ORInteractBenchmark(
+        benchmark_dir=benchmark_dir,
+        dataset="RCO",
+        train_size=50,
+    )
+    task = benchmark.get_tasks("train", limit=1)[0]
+
+    assert task.metadata["category"] == "logistics_distribution_and_routing_optimization"
+
+
 def test_task_metadata_does_not_expose_oracle_names() -> None:
     benchmark = ORInteractBenchmark(benchmark_dir=BENCHMARK_DIR)
     task = benchmark.get_tasks("train", limit=1)[0]
@@ -141,8 +160,7 @@ def test_evaluate_bad_answer_csv(tmp_path: Path, rows: list[dict[str, str]] | No
     assert message in feedback.detail
 
 
-def test_agent_prompt_uses_harness_catalog_and_protocol(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(ANSWER_CHECKER_ENV, "0")
+def test_agent_prompt_uses_catalog_without_harness_tree_router(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     workspace = _workspace(tmp_path / "workspace")
     _write_skill(workspace, "modeling", "Prefer explicit variable bounds.")
     (workspace / "memory" / "memories.jsonl").write_text(
@@ -154,22 +172,10 @@ def test_agent_prompt_uses_harness_catalog_and_protocol(tmp_path: Path, monkeypa
         "diagnose",
         "from typing import Any\n\ndef diagnose() -> dict[str, Any]:\n    return {'ok': True}\n",
     )
-    _write_tool(
-        workspace,
-        "type_router",
-        "from typing import Any\n\ndef type_router(evidence_text: str) -> dict[str, Any]:\n    return {'task_types': ['general']}\n",
-    )
-    _write_tool(
-        workspace,
-        "answer_checker",
-        "from typing import Any\n\ndef answer_checker(compressed_trace: str, final_code: str, objective_value: str, task_types: str, harness_notes: str) -> dict[str, Any]:\n    return {'passed': True}\n",
-    )
     _write_registry(
         workspace,
         [
             {"name": "diagnose", "file": "diagnose.py", "function": "diagnose", "description": "diagnostic helper"},
-            {"name": "type_router", "file": "type_router.py", "function": "type_router"},
-            {"name": "answer_checker", "file": "answer_checker.py", "function": "answer_checker"},
         ],
     )
 
@@ -192,38 +198,60 @@ def test_agent_prompt_uses_harness_catalog_and_protocol(tmp_path: Path, monkeypa
     agent.solve(task)
 
     prompt = str(captured["system_prompt"])
-    assert "type_router(evidence_text) is available" in prompt
+    assert "type_router" not in prompt
     assert "answer_checker" not in prompt
     assert "Prefer explicit variable bounds." not in prompt
-    assert "Check objective direction before finalizing." not in prompt
-    assert "modeling; types=general" in prompt
-    assert "memory:1 category=memories types=general" in prompt
+    assert "modeling; description=Test skill" in prompt
+    assert "memory:1 category=memories; content=Check objective direction before finalizing." in prompt
     assert "diagnose" in captured["tools"]
-    assert "type_router" in captured["tools"]
+    assert "type_router" not in captured["tools"]
     assert "answer_checker" not in captured["tools"]
 
 
-def test_seed_workspace_skips_checker_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_type_router_is_available_only_for_route_phase(monkeypatch: pytest.MonkeyPatch) -> None:
     from baseline.react.agent import tool_schemas
 
-    monkeypatch.setenv(ANSWER_CHECKER_ENV, "0")
     workspace = REPO_ROOT / "a-evolve" / "seed_workspaces" / "or_interact_react"
     agent = ORReactAgent(workspace)
 
-    assert agent.registry.get("type_router").kind == "evolved"
+    assert "type_router" not in agent.registry.list_tools()
     assert "answer_checker" not in agent.registry.list_tools()
-    schemas = {schema["function"]["name"]: schema for schema in tool_schemas(agent.registry)}
+
+    route_registry = agent._build_registry(include_type_router=True)
+    assert route_registry.get("type_router").kind == "evolved"
+    assert "answer_checker" not in route_registry.list_tools()
+    schemas = {schema["function"]["name"]: schema for schema in tool_schemas(route_registry)}
     router_parameters = schemas["type_router"]["function"]["parameters"]["properties"]
     assert router_parameters["existing_branches"]["type"] == "array"
 
 
-def test_seed_workspace_loads_checker_when_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(ANSWER_CHECKER_ENV, "1")
+def test_answer_checker_is_not_registered_even_when_env_is_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OR_REACT_ENABLE_ANSWER_CHECKER", "1")
     workspace = REPO_ROOT / "a-evolve" / "seed_workspaces" / "or_interact_react"
     agent = ORReactAgent(workspace)
 
-    assert agent.registry.get("type_router").kind == "evolved"
-    assert agent.registry.get("answer_checker").kind == "evolved"
+    assert "answer_checker" not in agent.registry.list_tools()
+    assert "answer_checker" not in agent._build_registry(include_type_router=True).list_tools()
+
+
+def test_type_router_uses_metadata_category_from_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = REPO_ROOT / "a-evolve" / "seed_workspaces" / "or_interact_react"
+    agent = ORReactAgent(workspace)
+    monkeypatch.setenv("OR_INTERACT_TASK_CATEGORY", "Known Category")
+
+    result = agent._build_registry(include_type_router=True).call(
+        "type_router",
+        evidence_text="Visible routing evidence.",
+        existing_branches=[],
+    )
+
+    assert result == {
+        "branch_name": "branch/known-category",
+        "confidence": 1.0,
+        "rationale": "task metadata category: Known Category",
+    }
 
 
 def test_retailopt_task_can_index_and_call_read_json(
@@ -257,7 +285,6 @@ def test_retailopt_task_can_index_and_call_read_json(
             return AgentResult(status="success", turns=1, objective_value="smoke")
 
     monkeypatch.setattr(react_module, "ReActAgent", FakeReActAgent)
-    monkeypatch.setenv(ANSWER_CHECKER_ENV, "0")
     monkeypatch.setenv("OR_REACT_RESULTS_DIR", str(tmp_path / "runs"))
 
     trajectory = ORReactAgent(workspace).solve(task)
@@ -274,57 +301,14 @@ def test_retailopt_task_can_index_and_call_read_json(
     assert "products" in captured["read_json_content"]
 
 
-def test_check_flag_enables_checker_in_solve_prompt_and_schema(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from baseline.react.agent import AgentResult, tool_schemas
-
-    import agent_evolve.agents.or_interact.react_agent as react_module
-
-    workspace = tmp_path / "workspace"
-    shutil.copytree(REPO_ROOT / "a-evolve" / "seed_workspaces" / "or_interact_react", workspace)
-    benchmark = ORInteractBenchmark(
-        benchmark_dir=BENCHMARK_DIR,
-        dataset="RetailOpt",
-        train_size=999,
-    )
-    task = _task_by_id(benchmark, "task_001")
-    captured: dict[str, object] = {}
-
-    class FakeReActAgent:
-        def __init__(self, *, config, trace, registry, system_prompt):
-            captured["registry_tools"] = registry.list_tools()
-            captured["schema_names"] = [tool["function"]["name"] for tool in tool_schemas(registry)]
-            captured["system_prompt"] = system_prompt
-
-        def run(self, **kwargs):
-            return AgentResult(status="success", turns=1, objective_value="smoke")
-
-    monkeypatch.setattr(react_module, "ReActAgent", FakeReActAgent)
-    monkeypatch.setenv(ANSWER_CHECKER_ENV, "1")
-    monkeypatch.setenv("OR_REACT_RESULTS_DIR", str(tmp_path / "runs"))
-
-    trajectory = ORReactAgent(workspace).solve(task)
-
-    assert "answer_checker" in captured["registry_tools"]
-    assert "answer_checker" in captured["schema_names"]
-    assert "Call answer_checker" in str(captured["system_prompt"])
-    assert trajectory.steps[-1]["tools"] == captured["registry_tools"]
-
-
-def test_or_interact_cli_check_flags(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_or_interact_cli_has_no_check_flags(monkeypatch: pytest.MonkeyPatch) -> None:
     from examples.or_interact_examples import evaluate_or_interact, evolve_or_interact
 
     monkeypatch.setattr(sys, "argv", ["evaluate_or_interact.py"])
-    assert evaluate_or_interact.parse_args().check is False
-    monkeypatch.setattr(sys, "argv", ["evaluate_or_interact.py", "--check"])
-    assert evaluate_or_interact.parse_args().check is True
+    assert not hasattr(evaluate_or_interact.parse_args(), "check")
 
     monkeypatch.setattr(sys, "argv", ["evolve_or_interact.py"])
-    assert evolve_or_interact.parse_args().check is False
-    monkeypatch.setattr(sys, "argv", ["evolve_or_interact.py", "--check"])
-    assert evolve_or_interact.parse_args().check is True
+    assert not hasattr(evolve_or_interact.parse_args(), "check")
 
 
 def test_evaluate_and_evolve_use_matching_or_interact_splits(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -393,7 +377,7 @@ def test_evaluate_and_evolve_use_matching_or_interact_splits(monkeypatch: pytest
     )
 
 
-def test_type_router_returns_selected_harness_content_and_old_skill_defaults(
+def test_type_router_returns_only_branch_route(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -409,18 +393,27 @@ def test_type_router_returns_selected_harness_content_and_old_skill_defaults(
         monkeypatch,
         [
             {
-                "task_types": ["general"],
+                "branch_name": "branch/production-planning",
+                "confidence": 0.8,
+                "rationale": "production evidence",
             }
         ],
     )
 
     agent = ORReactAgent(workspace)
-    result = agent.registry.call("type_router", evidence_text="Visible production planning evidence.")
+    result = agent._build_registry(include_type_router=True).call(
+        "type_router",
+        evidence_text="Visible production planning evidence.",
+    )
 
-    assert result["task_types"] == ["general"]
-    assert result["selected_skills"][0]["path"] == "skills/legacy-skill/SKILL.md"
-    assert "Legacy skill body." in result["selected_skills"][0]["content"]
-    assert result["selected_memories"][0]["content"] == "Legacy memory."
+    assert result == {
+        "branch_name": "branch/production-planning",
+        "confidence": 0.8,
+        "rationale": "production evidence",
+    }
+    assert "selected_skills" not in result
+    assert "selected_memories" not in result
+    assert "task_types" not in result
 
 
 def test_type_router_returns_branch_route_with_existing_branches(
@@ -442,7 +435,7 @@ def test_type_router_returns_branch_route_with_existing_branches(
     )
 
     agent = ORReactAgent(workspace)
-    result = agent.registry.call(
+    result = agent._build_registry(include_type_router=True).call(
         "type_router",
         evidence_text="Visible vehicle route evidence.",
         existing_branches=[
@@ -480,7 +473,7 @@ def test_type_router_judge_only_routes_branches(
     )
 
     agent = ORReactAgent(workspace)
-    agent.registry.call(
+    agent._build_registry(include_type_router=True).call(
         "type_router",
         evidence_text="Visible production planning evidence.",
         existing_branches=[],
@@ -496,6 +489,8 @@ def test_type_router_judge_only_routes_branches(
     assert "task_types" not in system
     assert "selected_skill_paths" not in system
     assert "selected_memory_paths" not in system
+    assert "broad OR problem family" in system
+    assert "Do not select skills" in system
     assert "harness_catalog" not in user_payload
     assert user_payload["existing_branches"] == []
 
@@ -580,248 +575,56 @@ def test_harness_tree_routes_buffers_and_final_eval_does_not_evolve(tmp_path: Pa
     } == pending_before
 
 
-def test_answer_checker_returns_failed_checklist_from_mocked_llm(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv(ANSWER_CHECKER_ENV, "1")
+def test_harness_tree_route_phase_uses_metadata_category_in_router(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path / "workspace")
-    _write_skill(
-        workspace,
-        "objective-check",
-        "Check objective unit.",
-        frontmatter="\ntypes: [general]\nchecklist:\n  - id: objective_unit\n    prompt: Verify unit.\n",
-    )
-    _copy_harness_tool(workspace, "answer_checker")
-    _write_registry(workspace, [{"name": "answer_checker", "file": "answer_checker.py", "function": "answer_checker"}])
-    _install_fake_openai(
-        monkeypatch,
-        [
-            {
-                "passed": False,
-                "failed_items": ["objective_unit"],
-                "check_results": [
-                    {
-                        "id": "objective_unit",
-                        "passed": False,
-                        "reason": "Unit mismatch.",
-                        "evidence": ["objective_value=10; trace says quantity"],
-                    },
-                    {
-                        "id": "visible_constraints",
-                        "passed": True,
-                        "reason": "Constraints are supported.",
-                        "evidence": ["final_code contains stated model constraints"],
-                    },
-                    {
-                        "id": "warning_resolution",
-                        "passed": True,
-                        "reason": "No warnings remain.",
-                        "evidence": ["harness_notes=notes"],
-                    },
-                ],
-                "required_fix": "Submit profit, not quantity.",
-            }
-        ],
+    benchmark = FakeBenchmark(tmp_path)
+    benchmark.train_tasks = [_harness_task(tmp_path, "categorized_1", "alpha model")]
+    benchmark.train_tasks[0].metadata["category"] = "Known Category"
+    agent = FakeAgent(workspace)
+    engine = FakeEngine(workspace)
+    runner = HarnessTreeRunner(
+        agent=agent,
+        benchmark=benchmark,
+        engine=engine,
+        config=EvolveConfig(batch_size=2, train_limit=1),
+        type_buffer_size=2,
+        router_confidence_threshold=0.5,
     )
 
-    agent = ORReactAgent(workspace)
-    result = agent.registry.call(
-        "answer_checker",
-        compressed_trace="trace",
-        final_code="print('model')",
-        objective_value="10",
-        task_types='["general"]',
-        harness_notes="notes",
-    )
+    runner.run_training(max_epochs=1)
+    state = json.loads((workspace / "evolution" / "harness_tree" / "state.json").read_text())
 
-    assert result["passed"] is False
-    assert result["failed_items"] == ["objective_unit"]
-    assert result["check_results"][0]["evidence"] == ["objective_value=10; trace says quantity"]
-    assert result["required_fix"] == "Submit profit, not quantity."
+    assert sorted(state["branches"]) == ["branch/known-category"]
+    assert state["router_decisions"][0]["branch_name"] == "branch/known-category"
+    assert state["router_decisions"][0]["fallback_reason"] is None
+    assert any(phase.endswith(":route") for phase in agent.phases)
 
 
-def test_answer_checker_returns_pass_from_mocked_llm(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv(ANSWER_CHECKER_ENV, "1")
+def test_harness_tree_preserves_metadata_route_on_solve_error(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path / "workspace")
-    _write_skill(
-        workspace,
-        "objective-check",
-        "Check objective unit.",
-        frontmatter="\ntypes: [general]\nchecklist:\n  - id: objective_unit\n    prompt: Verify unit.\n",
-    )
-    _copy_harness_tool(workspace, "answer_checker")
-    _write_registry(workspace, [{"name": "answer_checker", "file": "answer_checker.py", "function": "answer_checker"}])
-    _install_fake_openai(
-        monkeypatch,
-        [
-            {
-                "passed": True,
-                "failed_items": [],
-                "check_results": [
-                    {
-                        "id": "objective_unit",
-                        "passed": True,
-                        "reason": "Matches.",
-                        "evidence": ["objective_value=10; trace says submitted profit"],
-                    },
-                    {
-                        "id": "visible_constraints",
-                        "passed": True,
-                        "reason": "Constraints are supported.",
-                        "evidence": ["final_code contains stated model constraints"],
-                    },
-                    {
-                        "id": "warning_resolution",
-                        "passed": True,
-                        "reason": "Warnings resolved.",
-                        "evidence": ["compressed_trace states no warnings"],
-                    },
-                ],
-                "required_fix": "",
-            }
-        ],
+    benchmark = FakeBenchmark(tmp_path)
+    benchmark.train_tasks = [_harness_task(tmp_path, "categorized_error", "explode")]
+    benchmark.train_tasks[0].metadata["category"] = "Known Category"
+    agent = FakeAgent(workspace)
+    engine = FakeEngine(workspace)
+    runner = HarnessTreeRunner(
+        agent=agent,
+        benchmark=benchmark,
+        engine=engine,
+        config=EvolveConfig(batch_size=2, train_limit=1),
+        type_buffer_size=2,
+        router_confidence_threshold=0.5,
     )
 
-    agent = ORReactAgent(workspace)
-    result = agent.registry.call(
-        "answer_checker",
-        compressed_trace="trace",
-        final_code="print('model')",
-        objective_value="10",
-        task_types="general",
-        harness_notes="notes",
-    )
+    progress_events: list[dict[str, Any]] = []
+    runner.run_training(max_epochs=1, progress_callback=progress_events.append)
+    state = json.loads((workspace / "evolution" / "harness_tree" / "state.json").read_text())
+    task_done = next(event for event in progress_events if event["event"] == "task_done")
 
-    assert result["passed"] is True
-    assert result["failed_items"] == []
-    assert result["check_results"][0]["evidence"] == ["objective_value=10; trace says submitted profit"]
-
-
-def test_answer_checker_requires_per_item_explanation_and_evidence(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv(ANSWER_CHECKER_ENV, "1")
-    workspace = _workspace(tmp_path / "workspace")
-    _write_skill(
-        workspace,
-        "objective-check",
-        "Check objective unit.",
-        frontmatter="\ntypes: [general]\nchecklist:\n  - id: objective_unit\n    prompt: Verify unit.\n",
-    )
-    _copy_harness_tool(workspace, "answer_checker")
-    _write_registry(workspace, [{"name": "answer_checker", "file": "answer_checker.py", "function": "answer_checker"}])
-    _install_fake_openai(
-        monkeypatch,
-        [
-            {
-                "passed": True,
-                "failed_items": [],
-                "check_results": [
-                    {"id": "objective_unit", "passed": True, "reason": "Matches."},
-                    {
-                        "id": "visible_constraints",
-                        "passed": True,
-                        "evidence": ["final_code contains stated model constraints"],
-                    },
-                    {
-                        "id": "warning_resolution",
-                        "passed": True,
-                        "reason": "Warnings resolved.",
-                        "evidence": ["compressed_trace states no warnings"],
-                    },
-                ],
-                "required_fix": "",
-            }
-        ],
-    )
-
-    agent = ORReactAgent(workspace)
-    result = agent.registry.call(
-        "answer_checker",
-        compressed_trace="trace",
-        final_code="print('model')",
-        objective_value="10",
-        task_types="general",
-        harness_notes="notes",
-    )
-
-    assert result["passed"] is False
-    assert "objective_unit" in result["failed_items"]
-    assert "visible_constraints" in result["failed_items"]
-    objective_check = result["check_results"][0]
-    assert objective_check["passed"] is False
-    assert objective_check["reason"].endswith("Missing explicit evidence.")
-    visible_check = result["check_results"][1]
-    assert visible_check["passed"] is False
-    assert visible_check["reason"] == "Missing per-item explanation."
-
-
-def test_answer_checker_warns_and_blocks_after_three_failures(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv(ANSWER_CHECKER_ENV, "1")
-    workspace = _workspace(tmp_path / "workspace")
-    _write_tool(
-        workspace,
-        "answer_checker",
-        "\n".join(
-            [
-                "from typing import Any",
-                "",
-                "CALLS = 0",
-                "",
-                "def answer_checker(",
-                "    compressed_trace: str,",
-                "    final_code: str,",
-                "    objective_value: str,",
-                "    task_types: str,",
-                "    harness_notes: str,",
-                ") -> dict[str, Any]:",
-                "    global CALLS",
-                "    CALLS += 1",
-                "    return {",
-                "        'passed': False,",
-                "        'failed_items': ['objective_unit'],",
-                "        'check_results': [],",
-                "        'required_fix': f'revise attempt {CALLS}',",
-                "        'calls': CALLS,",
-                "    }",
-            ]
-        )
-        + "\n",
-    )
-    _write_registry(workspace, [{"name": "answer_checker", "file": "answer_checker.py", "function": "answer_checker"}])
-
-    agent = ORReactAgent(workspace)
-    calls = [
-        agent.registry.call(
-            "answer_checker",
-            compressed_trace="trace",
-            final_code="print('model')",
-            objective_value="10",
-            task_types="general",
-            harness_notes="notes",
-        )
-        for _ in range(4)
-    ]
-
-    assert calls[0]["calls"] == 1
-    assert calls[1]["calls"] == 2
-    assert calls[2]["calls"] == 3
-    assert calls[2]["answer_checker_budget_exhausted"] is True
-    assert calls[2]["answer_checker_call_allowed"] is False
-    assert "call finalize" in calls[2]["warning"]
-    assert "calls" not in calls[3]
-    assert calls[3]["failed_items"] == ["answer_checker_budget_exhausted"]
-    assert calls[3]["answer_checker_budget_exhausted"] is True
-    assert calls[3]["answer_checker_call_allowed"] is False
-    assert "Call finalize now" in calls[3]["warning"]
+    assert sorted(state["branches"]) == ["branch/known-category"]
+    assert state["branches"]["branch/known-category"]["pending"][0]["feedback_detail"] == "RuntimeError: boom"
+    assert task_done["branch_name"] == "branch/known-category"
+    assert task_done["route_confidence"] == 1.0
 
 
 def test_workspace_tool_overrides_seed_tool(tmp_path: Path) -> None:
@@ -960,6 +763,7 @@ class FakeAgent:
         self.workspace = AgentWorkspace(workspace)
         self.registry = FakeRegistry()
         self.config = types.SimpleNamespace(task_timeout_seconds=0)
+        self.phases: list[str] = []
 
     def reload_from_fs(self) -> None:
         self.registry = FakeRegistry()
@@ -984,9 +788,19 @@ class FakeAgent:
         max_turns: int | None = None,
         stop_after_tools: set[str] | None = None,
     ) -> AgentResult:
+        self.phases.append(phase)
         messages = list(initial_messages or [{"role": "system", "content": "fake"}])
         label = "beta" if "beta" in task.input else "alpha"
         if phase.endswith(":route"):
+            category = task.metadata.get("category")
+            if category:
+                branch_name = sanitize_branch_name(category)
+                confidence = 1.0
+                rationale = f"task metadata category: {category}"
+            else:
+                branch_name = f"branch/{label}"
+                confidence = 0.95
+                rationale = f"{label} evidence"
             trace.event("assistant_message", {"phase": phase, "content": "routing", "tool_calls": []})
             trace.event(
                 "tool_output",
@@ -994,9 +808,9 @@ class FakeAgent:
                     "phase": phase,
                     "name": "type_router",
                     "output": {
-                        "branch_name": f"branch/{label}",
-                        "confidence": 0.95,
-                        "rationale": f"{label} evidence",
+                        "branch_name": branch_name,
+                        "confidence": confidence,
+                        "rationale": rationale,
                     },
                 },
             )
@@ -1006,12 +820,14 @@ class FakeAgent:
                     {
                         "role": "tool",
                         "tool_call_id": "route",
-                        "content": json.dumps({"branch_name": f"branch/{label}"}),
+                        "content": json.dumps({"branch_name": branch_name}),
                     },
                 ]
             )
             return AgentResult(status="stopped_after_type_router", turns=1, messages=messages)
 
+        if "explode" in task.input:
+            raise RuntimeError("boom")
         assert initial_messages, "solve phase should inherit route messages"
         trace.event("assistant_message", {"phase": phase, "content": "solving", "tool_calls": []})
         return AgentResult(status="success", turns=1, objective_value=1, messages=messages)

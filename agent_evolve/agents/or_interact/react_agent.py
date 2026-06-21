@@ -38,19 +38,17 @@ FORBIDDEN_TOOL_STRINGS = (
     "os.system",
     "popen",
 )
-ANSWER_CHECKER_ENV = "OR_REACT_ENABLE_ANSWER_CHECKER"
+TASK_CATEGORY_ENV = "OR_INTERACT_TASK_CATEGORY"
 
 
 class ORReactAgent(BaseAgent):
     """Reloadable a-evolve agent that runs the OR-Claw ReAct baseline."""
 
     def __init__(self, workspace_dir: str | Path):
-        self.enable_answer_checker = _resolve_answer_checker_enabled()
         super().__init__(workspace_dir)
         self.config = self._load_config()
 
     def reload_from_fs(self) -> None:
-        self.enable_answer_checker = _resolve_answer_checker_enabled()
         super().reload_from_fs()
         self.registry = self._build_registry()
 
@@ -87,22 +85,23 @@ class ORReactAgent(BaseAgent):
     ) -> AgentResult:
         task_dir = Path(task.metadata["task_dir"]).resolve()
         configure_environment(context_dir=task_dir, runtime_dir=runtime_dir)
-        registry = self._build_registry()
+        registry = self._build_registry(include_type_router=phase.endswith(":route"))
         self.registry = registry
         try:
             with _task_timeout(self.config.task_timeout_seconds):
-                return ReActAgent(
-                    config=self.config,
-                    trace=trace,
-                    registry=registry,
-                    system_prompt=system_prompt or self._build_system_prompt(),
-                ).run(
-                    initial_messages=initial_messages,
-                    user_message=user_message,
-                    phase=phase,
-                    max_turns=max_turns,
-                    stop_after_tools=stop_after_tools,
-                )
+                with _task_category_env(task.metadata.get("category")):
+                    return ReActAgent(
+                        config=self.config,
+                        trace=trace,
+                        registry=registry,
+                        system_prompt=system_prompt or self._build_system_prompt(),
+                    ).run(
+                        initial_messages=initial_messages,
+                        user_message=user_message,
+                        phase=phase,
+                        max_turns=max_turns,
+                        stop_after_tools=stop_after_tools,
+                    )
         except TimeoutError as exc:
             error = str(exc)
             trace.event("error", {"message": error})
@@ -207,7 +206,6 @@ class ORReactAgent(BaseAgent):
             return hook(self.system_prompt, self.skills, self.memories, self.registry)
 
         sections = [self.system_prompt.strip()]
-        sections.append(_harness_protocol(self.enable_answer_checker))
 
         skill_catalog = self._skill_catalog()
         if skill_catalog:
@@ -228,40 +226,37 @@ class ORReactAgent(BaseAgent):
         lines = []
         for index, memory in enumerate(self.memories[-20:], start=1):
             category = memory.get("_category", "memory")
-            types = _normalize_types(memory.get("types"))
-            checklist = _normalize_checklist(memory.get("checklist"))
-            checklist_ids = ", ".join(item["id"] for item in checklist) or "none"
+            content = " ".join(str(memory.get("content") or "").split())
+            if not content:
+                continue
             lines.append(
-                f"- memory:{index} category={category} types={', '.join(types)} "
-                f"checklist={checklist_ids}"
+                f"- memory:{index} category={category}; content={content[:300]}"
             )
         return "\n".join(lines)
 
     def _skill_catalog(self) -> str:
         lines = []
         for skill in self.skills:
-            types = skill.types or ["general"]
-            checklist_ids = ", ".join(item["id"] for item in skill.checklist) or "none"
             description = " ".join(skill.description.split())
             lines.append(
-                f"- {skill.path or skill.name}: {skill.name}; types={', '.join(types)}; "
-                f"checklist={checklist_ids}; description={description}"
+                f"- {skill.path or skill.name}: {skill.name}; description={description}"
             )
         return "\n".join(lines)
 
-    def _build_registry(self) -> ToolRegistry:
+    def _build_registry(self, *, include_type_router: bool = False) -> ToolRegistry:
         registry = register_seed_tools(ToolRegistry())
         for entry in self.workspace.read_tool_registry():
             if entry.get("kind") == "seed":
                 continue
-            if entry.get("name") == "answer_checker" and not self.enable_answer_checker:
+            name = str(entry.get("name") or "")
+            if name == "type_router" and not include_type_router:
+                continue
+            if name == "answer_checker":
                 continue
             if not _is_evolved_tool_entry(entry):
                 continue
             spec = self._load_evolved_tool(entry)
             registry.register(spec, overwrite=True)
-        if self.enable_answer_checker:
-            _install_answer_checker_budget(registry)
         return registry
 
     def _load_evolved_tool(self, entry: dict[str, Any]) -> ToolSpec:
@@ -323,142 +318,21 @@ def _is_evolved_tool_entry(entry: dict[str, Any]) -> bool:
     return bool(entry.get("name")) and (bool(entry.get("file")) or bool(entry.get("module")))
 
 
-def _install_answer_checker_budget(registry: ToolRegistry) -> None:
-    try:
-        spec = registry.get("answer_checker")
-    except KeyError:
-        return
-
-    failure_count = 0
-    blocked = False
-
-    def answer_checker(
-        compressed_trace: str,
-        final_code: str,
-        objective_value: str,
-        task_types: str,
-        harness_notes: str,
-    ) -> dict[str, Any]:
-        nonlocal blocked, failure_count
-        if blocked:
-            return _answer_checker_budget_exhausted()
-
-        result = spec.function(
-            compressed_trace=compressed_trace,
-            final_code=final_code,
-            objective_value=objective_value,
-            task_types=task_types,
-            harness_notes=harness_notes,
-        )
-        if result.get("passed") is False:
-            failure_count += 1
-            if failure_count >= 3:
-                blocked = True
-                return _with_answer_checker_budget_warning(result)
-        return result
-
-    registry.register(
-        ToolSpec(
-            name=spec.name,
-            function=answer_checker,
-            description=spec.description,
-            kind=spec.kind,
-            metadata={**spec.metadata, "answer_checker_failure_budget": 3},
-        ),
-        overwrite=True,
-    )
-
-
-def _with_answer_checker_budget_warning(result: dict[str, Any]) -> dict[str, Any]:
-    warning = (
-        "WARNING: answer_checker has returned failed three times. The answer_checker "
-        "revision budget is exhausted. Do not call answer_checker again; call finalize "
-        "now with the best available objective value."
-    )
-    updated = dict(result)
-    updated["warning"] = warning
-    updated["answer_checker_budget_exhausted"] = True
-    updated["answer_checker_call_allowed"] = False
-    updated["required_fix"] = warning
-    return updated
-
-
-def _answer_checker_budget_exhausted() -> dict[str, Any]:
-    warning = (
-        "WARNING: answer_checker calls are disabled because it already returned failed "
-        "three times. The revision budget is exhausted. Call finalize now with the best "
-        "available objective value."
-    )
-    return {
-        "passed": False,
-        "failed_items": ["answer_checker_budget_exhausted"],
-        "check_results": [
-            {
-                "id": "answer_checker_budget_exhausted",
-                "passed": False,
-                "reason": warning,
-                "evidence": ["answer_checker failed three times earlier in this task."],
-            }
-        ],
-        "required_fix": warning,
-        "warning": warning,
-        "answer_checker_budget_exhausted": True,
-        "answer_checker_call_allowed": False,
-    }
-
-
-def _harness_protocol(enable_answer_checker: bool) -> str:
-    if enable_answer_checker:
-        return """## Harness Interaction Protocol
-You must use the evolved workspace harness tools instead of relying on hidden prompt-injected skill bodies.
-
-Context workflow:
-1. Use list_context, then read_md/read_csv/read_json to collect visible evidence from docs/ and data/.
-2. type_router(evidence_text) is available after you summarize visible evidence yourself; use its task_types, selected skills, selected memories, and required_checklist when they help the formulation.
-3. Call answer_checker(compressed_trace, final_code, objective_value, task_types, harness_notes) before finalize.
-4. If answer_checker returns passed=false, revise the model or submitted value and call answer_checker again.
-5. If answer_checker returns an answer_checker_budget_exhausted warning, stop calling answer_checker and call finalize with the best available objective value.
-6. Call finalize after answer_checker returns passed=true, or after answer_checker reports that its revision budget is exhausted.
-
-The router/checker tools may read the workspace harness library, but they only receive evidence, trace notes, code, and values that you provide. Do not treat the catalog below as full guidance; use type_router to load relevant harness content."""
-
-    return """## Harness Interaction Protocol
-You must use the evolved workspace harness tools instead of relying on hidden prompt-injected skill bodies.
-
-Context workflow:
-1. Use list_context, then read_md/read_csv/read_json to collect visible evidence from docs/ and data/.
-2. type_router(evidence_text) is available after you summarize visible evidence yourself; use its task_types, selected skills, selected memories, and required_checklist when they help the formulation.
-3. Before finalize, act as a skeptical reviewer: challenge your own formulation, include concrete evidence for every checklist item, and include unresolved warnings or competing interpretations.
-4. Call finalize with the best available objective value.
-
-The router tool may read the workspace harness library, but it only receives evidence that you provide. Do not treat the catalog below as full guidance; use type_router to load relevant harness content."""
-
-
-def _normalize_types(value: Any) -> list[str]:
-    if isinstance(value, str):
-        items = [value]
-    elif isinstance(value, list):
-        items = value
+@contextmanager
+def _task_category_env(category: Any):
+    previous = os.environ.get(TASK_CATEGORY_ENV)
+    text = str(category or "").strip()
+    if text:
+        os.environ[TASK_CATEGORY_ENV] = text
     else:
-        items = ["general"]
-    normalized = [str(item).strip() for item in items if str(item).strip()]
-    return normalized or ["general"]
-
-
-def _normalize_checklist(value: Any) -> list[dict[str, str]]:
-    if not isinstance(value, list):
-        return []
-    items: list[dict[str, str]] = []
-    for index, item in enumerate(value, start=1):
-        if isinstance(item, dict):
-            prompt = str(item.get("prompt", "")).strip()
-            check_id = str(item.get("id", f"check_{index}")).strip()
+        os.environ.pop(TASK_CATEGORY_ENV, None)
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(TASK_CATEGORY_ENV, None)
         else:
-            prompt = str(item).strip()
-            check_id = f"check_{index}"
-        if prompt:
-            items.append({"id": check_id or f"check_{index}", "prompt": prompt})
-    return items
+            os.environ[TASK_CATEGORY_ENV] = previous
 
 
 def _resolve_temperature(base_temperature: float | None) -> float | None:
@@ -469,11 +343,6 @@ def _resolve_temperature(base_temperature: float | None) -> float | None:
     if text in {"", "none", "null"}:
         return None
     return float(raw)
-
-
-def _resolve_answer_checker_enabled() -> bool:
-    raw = os.environ.get(ANSWER_CHECKER_ENV, "")
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _resolve_workspace_tool_path(tools_dir: Path, file_name: str) -> Path:

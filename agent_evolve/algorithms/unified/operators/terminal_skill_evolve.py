@@ -92,7 +92,7 @@ ones the agent will actually choose to read and benefit from.
 5. **Skip tasks with score >= 7** -- the agent likely solved them without help.
 {skill_budget_note}
 
-**Skill quality checklist:**
+**Skill quality requirements:**
 - Store each skill at `skills/<name>/SKILL.md`; the directory `<name>` and YAML frontmatter `name` MUST be identical
 - `name` must be short, descriptive lowercase kebab-case matching `^[a-z0-9]+(-[a-z0-9]+)*$`
 - Never use spaces, underscores, uppercase letters, slashes, or display-title names in `name`

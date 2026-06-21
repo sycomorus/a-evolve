@@ -38,9 +38,4 @@ tools:
     kind: evolved
     file: type_router.py
     function: type_router
-    description: Route agent-supplied visible evidence to relevant evolved skills, memories, and checklists.
-  - name: answer_checker
-    kind: evolved
-    file: answer_checker.py
-    function: answer_checker
-    description: Optional checker registered only when evaluate/evolve is run with --check.
+    description: Route agent-supplied visible evidence to a broad OR harness-tree branch.

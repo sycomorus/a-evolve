@@ -51,8 +51,6 @@ class SkillMeta:
     name: str
     description: str
     path: str  # relative path within workspace
-    types: list[str] = field(default_factory=list)
-    checklist: list[dict[str, str]] = field(default_factory=list)
 
 
 @dataclass

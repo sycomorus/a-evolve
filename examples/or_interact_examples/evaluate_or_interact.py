@@ -6,7 +6,6 @@ import argparse
 import json
 import os
 import sys
-from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -28,9 +27,6 @@ from agent_evolve.benchmarks.or_interact import (  # noqa: E402
 from agent_evolve.display import print_evaluation_summary, print_run_header  # noqa: E402
 from agent_evolve.evaluation import run_evaluation  # noqa: E402
 from agent_evolve.runs import resolve_workspace_source  # noqa: E402
-
-ANSWER_CHECKER_ENV = "OR_REACT_ENABLE_ANSWER_CHECKER"
-
 
 def main() -> int:
     args = parse_args()
@@ -65,30 +61,29 @@ def main() -> int:
         limit_test=args.limit_test,
         legacy_limit=args.limit,
     )
-    with _answer_checker_setting(args.check):
-        previous_results_dir = os.environ.get("OR_REACT_RESULTS_DIR")
-        os.environ["OR_REACT_RESULTS_DIR"] = str((output_dir / "runs").resolve())
-        try:
-            agent = ORReactAgent(workspace)
-            summary = run_evaluation(
-                agent,
-                benchmark,
-                split=args.split,
-                limit=evaluation_limit,
-                output_dir=output_dir,
-                show_progress=True,
-                console=console,
-            )
-        finally:
-            if previous_results_dir is None:
-                os.environ.pop("OR_REACT_RESULTS_DIR", None)
-            else:
-                os.environ["OR_REACT_RESULTS_DIR"] = previous_results_dir
+    previous_results_dir = os.environ.get("OR_REACT_RESULTS_DIR")
+    os.environ["OR_REACT_RESULTS_DIR"] = str((output_dir / "runs").resolve())
+    try:
+        agent = ORReactAgent(workspace)
+        summary = run_evaluation(
+            agent,
+            benchmark,
+            split=args.split,
+            limit=evaluation_limit,
+            output_dir=output_dir,
+            show_progress=True,
+            console=console,
+        )
+    finally:
+        if previous_results_dir is None:
+            os.environ.pop("OR_REACT_RESULTS_DIR", None)
+        else:
+            os.environ["OR_REACT_RESULTS_DIR"] = previous_results_dir
     summary["source_type"] = source_type
     summary["dataset"] = args.dataset
     summary["limit_train"] = args.limit_train
     summary["limit_test"] = args.limit_test
-    summary["check"] = args.check
+    summary["check"] = False
     (output_dir / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -139,30 +134,12 @@ def parse_args() -> argparse.Namespace:
         help="Evaluation limit when --split test or holdout.",
     )
     parser.add_argument("--output-dir")
-    parser.add_argument(
-        "--check",
-        action="store_true",
-        help="Expose the optional answer_checker tool and require the checker workflow.",
-    )
     return parser.parse_args()
 
 
 def _default_output_dir(work_dir: str | Path, _workspace: Path, split: str) -> Path:
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     return Path(work_dir) / "evaluations" / stamp / split
-
-
-@contextmanager
-def _answer_checker_setting(enabled: bool):
-    previous = os.environ.get(ANSWER_CHECKER_ENV)
-    os.environ[ANSWER_CHECKER_ENV] = "1" if enabled else "0"
-    try:
-        yield
-    finally:
-        if previous is None:
-            os.environ.pop(ANSWER_CHECKER_ENV, None)
-        else:
-            os.environ[ANSWER_CHECKER_ENV] = previous
 
 
 if __name__ == "__main__":

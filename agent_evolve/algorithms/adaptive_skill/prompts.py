@@ -276,14 +276,14 @@ def _compress_trajectory(conversation: list[dict[str, Any]]) -> str:
         cmd_counts[c] = cmd_counts.get(c, 0) + 1
     loops = {c: n for c, n in cmd_counts.items() if n >= 3}
     if loops:
-        parts.append(f"\n--- Repeated commands ---")
+        parts.append("\n--- Repeated commands ---")
         for c, n in loops.items():
             parts.append(f"  {c} (x{n})")
 
     # Last 3 commands
     last_cmds = [e for e in events if e["type"] == "cmd"][-3:]
     if last_cmds:
-        parts.append(f"\n--- Final commands ---")
+        parts.append("\n--- Final commands ---")
         for e in last_cmds:
             parts.append(f"  {e['fn']}({e['cmd']})")
 
@@ -472,13 +472,15 @@ def build_evolution_prompt(
         summary_heading = _build_standard_heading()
         instruction_lines = _build_standard_instructions()
 
+    scope_section = f"### Scope\n{scope_instruction}" if scope_instruction else ""
+
     return f"""\
 ## Evolution Cycle #{evo_number}
 
 ### Permissions
 {chr(10).join(permission_lines)}
 
-{f"### Scope\n{scope_instruction}" if scope_instruction else ""}
+{scope_section}
 
 {summary_heading}
 ```json
@@ -574,7 +576,7 @@ ones the agent will actually choose to read and benefit from.
 5. **Skip tasks with score >= 7** — the agent likely solved them without help.
 {skill_budget_note}
 
-**Skill quality checklist:**
+**Skill quality requirements:**
 - Store each skill at `skills/<name>/SKILL.md`; the directory `<name>` and YAML frontmatter `name` MUST be identical
 - `name` must be short, descriptive lowercase kebab-case matching `^[a-z0-9]+(-[a-z0-9]+)*$`
 - Never use spaces, underscores, uppercase letters, slashes, or display-title names in `name`
@@ -613,7 +615,7 @@ failure, then add concise strategy rules to the system prompt.
 
 **BAD rules (domain knowledge — the agent already knows these):**
 - Specific library names, API calls, or package versions
-- Task-category-specific checklists
+- Task-category-specific review procedures
 - Tool installation instructions
 
 **Constraints:**
