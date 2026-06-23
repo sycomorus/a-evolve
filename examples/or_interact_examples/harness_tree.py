@@ -75,6 +75,7 @@ def run_harness_tree(
     router_confidence_threshold: float,
     final_test_limit: int | None,
     final_dir: Path,
+    disable_main_evolve: bool = False,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[EvolutionResult, dict[str, Any]]:
     runner = HarnessTreeRunner(
@@ -84,6 +85,7 @@ def run_harness_tree(
         config=config,
         type_buffer_size=type_buffer_size,
         router_confidence_threshold=router_confidence_threshold,
+        disable_main_evolve=disable_main_evolve,
     )
     result = runner.run_training(max_epochs=max_epochs, progress_callback=progress_callback)
     eval_summary = runner.run_final_evaluation(
@@ -104,6 +106,7 @@ class HarnessTreeRunner:
         config: EvolveConfig,
         type_buffer_size: int,
         router_confidence_threshold: float,
+        disable_main_evolve: bool = False,
     ) -> None:
         self.agent = agent
         self.benchmark = benchmark
@@ -111,12 +114,15 @@ class HarnessTreeRunner:
         self.config = config
         self.type_buffer_size = max(1, int(type_buffer_size))
         self.router_confidence_threshold = float(router_confidence_threshold)
+        self.disable_main_evolve = bool(disable_main_evolve)
         self.workspace_root = self.agent.workspace.root
         self.state_path = self.workspace_root / STATE_FILE
         self.observer = Observer(self.workspace_root / "evolution")
         self.versioning = VersionControl(self.workspace_root)
         self.state = _empty_state()
         self.evolve_number = 0
+        self._base_harness_snapshot: dict[Path, bytes] | None = None
+        self._external_materialized_root = self.workspace_root.parent / "harness_tree_branch_workspaces"
 
     def run_training(
         self,
@@ -126,6 +132,7 @@ class HarnessTreeRunner:
     ) -> EvolutionResult:
         self._prepare_repo()
         self.state = _load_state(self.state_path)
+        self._capture_base_harness_snapshot()
         score_history: list[float] = []
         completed_tasks = 0
         schedule = self._training_schedule(max_epochs)
@@ -167,7 +174,10 @@ class HarnessTreeRunner:
                 "route_rationale": decision.rationale,
                 "fallback_reason": decision.fallback_reason,
             }
-            self.state.setdefault("main_pending", []).append(record)
+            if self.disable_main_evolve:
+                self.state["main_pending"] = []
+            else:
+                self.state.setdefault("main_pending", []).append(record)
             branch_state = self.state["branches"][branch]
             branch_state["pending"].append(record)
             branch_state["solve_count"] += 1
@@ -191,13 +201,18 @@ class HarnessTreeRunner:
                     "success": observation.feedback.success,
                     "fallback_reason": decision.fallback_reason,
                     "feedback_detail": observation.feedback.detail,
-                    "main_pending": len(self.state.get("main_pending", [])),
+                    "main_pending": None
+                    if self.disable_main_evolve
+                    else len(self.state.get("main_pending", [])),
                     "branch_pending": len(branch_state["pending"]),
                     "type_buffer_size": self.type_buffer_size,
                 },
             )
 
-            if len(self.state.get("main_pending", [])) >= max(1, int(self.config.batch_size)):
+            if (
+                not self.disable_main_evolve
+                and len(self.state.get("main_pending", [])) >= max(1, int(self.config.batch_size))
+            ):
                 _emit_progress(
                     progress_callback,
                     {
@@ -252,6 +267,7 @@ class HarnessTreeRunner:
                 "epochs_completed": max_epochs,
                 "branches": sorted(self.state["branches"]),
                 "type_buffer_size": self.type_buffer_size,
+                "disable_main_evolve": self.disable_main_evolve,
             },
         )
 
@@ -264,6 +280,7 @@ class HarnessTreeRunner:
     ) -> dict[str, Any]:
         self._prepare_repo()
         self.state = _load_state(self.state_path)
+        self._capture_base_harness_snapshot()
         output_dir.mkdir(parents=True, exist_ok=True)
 
         rows: list[dict[str, Any]] = []
@@ -335,6 +352,15 @@ class HarnessTreeRunner:
                 self.versioning.create_branch(MAIN_BRANCH, current)
         self.versioning.checkout_branch(MAIN_BRANCH)
         self.agent.reload_from_fs()
+
+    def _capture_base_harness_snapshot(self) -> None:
+        if self.disable_main_evolve and self._base_harness_snapshot is None:
+            self._base_harness_snapshot = _snapshot_harness_workspace(self.workspace_root)
+
+    def _restore_base_harness_snapshot(self) -> None:
+        if self.disable_main_evolve and self._base_harness_snapshot is not None:
+            _restore_harness_workspace(self.workspace_root, self._base_harness_snapshot)
+            self.agent.reload_from_fs()
 
     def _training_schedule(self, max_epochs: int) -> list[dict[str, Any]]:
         if self.config.train_limit is None:
@@ -521,18 +547,21 @@ class HarnessTreeRunner:
         materialized = self._materialize_branch_workspace(branch)
         phase_agent = self.agent.__class__(materialized)
         self.evolve_number += 1
-        with _scope_instruction(
-            self.config,
-            (
-                f"Update only specialization for {branch}. Keep changes domain-specific; "
-                "do not duplicate generic main harness behavior unless it must be overridden."
-            ),
-        ):
-            result = self.engine.evolve(
-                phase_agent.workspace,
-                observation_logs=buffer,
-                evo_number=self.evolve_number,
-            )
+        try:
+            with _scope_instruction(
+                self.config,
+                (
+                    f"Update only specialization for {branch}. Keep changes domain-specific; "
+                    "do not duplicate generic main harness behavior unless it must be overridden."
+                ),
+            ):
+                result = self.engine.evolve(
+                    phase_agent.workspace,
+                    observation_logs=buffer,
+                    evo_number=self.evolve_number,
+                )
+        finally:
+            self._restore_base_harness_snapshot()
         _save_overlay_from_workspace(
             materialized_root=materialized,
             main_root=self.workspace_root,
@@ -545,7 +574,12 @@ class HarnessTreeRunner:
         phase_agent.reload_from_fs()
 
     def _materialize_branch_workspace(self, branch: str) -> Path:
-        destination = self.workspace_root / MATERIALIZED_DIR / _branch_slug(branch)
+        self._restore_base_harness_snapshot()
+        destination = (
+            self._external_materialized_root / _branch_slug(branch)
+            if self.disable_main_evolve
+            else self.workspace_root / MATERIALIZED_DIR / _branch_slug(branch)
+        )
         _copy_harness_workspace(self.workspace_root, destination)
         _apply_overlay(destination, self._overlay_dir(branch))
         return destination
@@ -655,6 +689,31 @@ def _harness_files(root: Path) -> set[Path]:
                 if child.is_file() and not _ignored_generated_file(child):
                     files.add(child.relative_to(root))
     return files
+
+
+def _snapshot_harness_workspace(root: Path) -> dict[Path, bytes]:
+    return {relative: (root / relative).read_bytes() for relative in _harness_files(root)}
+
+
+def _restore_harness_workspace(root: Path, snapshot: dict[Path, bytes]) -> None:
+    current_files = _harness_files(root)
+    for relative in sorted(current_files - set(snapshot)):
+        target = root / relative
+        if target.is_file():
+            target.unlink()
+    for relative, content in snapshot.items():
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+    for relative in HARNESS_PATHS:
+        path = root / relative
+        if not path.is_dir():
+            continue
+        for child in sorted((item for item in path.rglob("*") if item.is_dir()), reverse=True):
+            try:
+                child.rmdir()
+            except OSError:
+                pass
 
 
 def _ignored_generated_file(path: Path) -> bool:

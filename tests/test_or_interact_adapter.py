@@ -627,6 +627,49 @@ def test_harness_tree_preserves_metadata_route_on_solve_error(tmp_path: Path) ->
     assert task_done["route_confidence"] == 1.0
 
 
+def test_harness_tree_disable_main_evolve_isolates_branch_workspace(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path / "workspace")
+    original_prompt = (workspace / "prompts" / "system.md").read_text(encoding="utf-8")
+    benchmark = FakeBenchmark(tmp_path)
+    benchmark.train_tasks = [benchmark.train_tasks[0]]
+    agent = FakeAgent(workspace)
+    engine = LeakyEngine(workspace)
+    runner = HarnessTreeRunner(
+        agent=agent,
+        benchmark=benchmark,
+        engine=engine,
+        config=EvolveConfig(batch_size=1, train_limit=1),
+        type_buffer_size=1,
+        router_confidence_threshold=0.5,
+        disable_main_evolve=True,
+    )
+
+    result = runner.run_training(max_epochs=1)
+    state = json.loads((workspace / "evolution" / "harness_tree" / "state.json").read_text())
+
+    assert result.details["disable_main_evolve"] is True
+    assert state["main_evolutions"] == []
+    assert state["main_pending"] == []
+    assert engine.evolved_scopes == ["alpha"]
+    assert not (workspace / "skills" / "domain-alpha").exists()
+    assert not (workspace / "skills" / "leaked-main").exists()
+    assert (workspace / "prompts" / "system.md").read_text(encoding="utf-8") == original_prompt
+    assert (
+        workspace
+        / "evolution"
+        / "harness_tree"
+        / "overlays"
+        / "alpha"
+        / "files"
+        / "skills"
+        / "domain-alpha"
+        / "SKILL.md"
+    ).is_file()
+    isolated_workspace = workspace.parent / "harness_tree_branch_workspaces" / "alpha"
+    assert isolated_workspace.is_dir()
+    assert workspace.resolve() not in isolated_workspace.resolve().parents
+
+
 def test_workspace_tool_overrides_seed_tool(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path / "workspace")
     _write_tool(
@@ -899,6 +942,24 @@ class FakeEngine:
                 encoding="utf-8",
             )
         return {"evo_number": evo_number, "tasks_analyzed": len(observation_logs)}
+
+
+class LeakyEngine(FakeEngine):
+    def evolve(
+        self,
+        workspace: AgentWorkspace,
+        observation_logs: list[dict[str, Any]],
+        evo_number: int = 0,
+    ) -> dict[str, Any]:
+        result = super().evolve(workspace, observation_logs, evo_number=evo_number)
+        leaked_skill = self.workspace / "skills" / "leaked-main"
+        leaked_skill.mkdir(parents=True, exist_ok=True)
+        (leaked_skill / "SKILL.md").write_text(
+            "---\nname: leaked-main\ndescription: leaked\n---\n",
+            encoding="utf-8",
+        )
+        (self.workspace / "prompts" / "system.md").write_text("leaked main prompt", encoding="utf-8")
+        return result
 
 
 def _task_by_id(benchmark: ORInteractBenchmark, task_id: str) -> Task:

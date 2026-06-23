@@ -239,6 +239,7 @@ def main() -> int:
                 router_confidence_threshold=args.router_confidence_threshold,
                 final_test_limit=test_limit,
                 final_dir=final_dir,
+                disable_main_evolve=args.disable_main_evolve,
                 progress_callback=update_harness_progress,
             )
     else:
@@ -312,6 +313,7 @@ def main() -> int:
         "train_limit": args.limit_train,
         "batch_size": args.batch_size,
         "harness_tree": args.harness_tree,
+        "disable_main_evolve": args.disable_main_evolve if args.harness_tree else None,
         "type_buffer_size": (args.type_buffer_size or args.batch_size) if args.harness_tree else None,
         "router_confidence_threshold": args.router_confidence_threshold if args.harness_tree else None,
         "score_history": result.score_history,
@@ -370,6 +372,14 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Observations per type branch before evolving that branch. Defaults to --batch-size.",
+    )
+    parser.add_argument(
+        "--disable-main-evolve",
+        action="store_true",
+        help=(
+            "With --harness-tree, disable global main evolution and keep branch "
+            "evolution isolated to branch workspaces."
+        ),
     )
     parser.add_argument(
         "--router-confidence-threshold",
