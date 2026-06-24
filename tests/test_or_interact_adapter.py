@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import shutil
 import sys
+import time
 import types
 from pathlib import Path
 from typing import Any
@@ -540,21 +542,22 @@ def test_harness_tree_routes_buffers_and_final_eval_does_not_evolve(tmp_path: Pa
     result = runner.run_training(max_epochs=1, progress_callback=progress_events.append)
     state = json.loads((workspace / "evolution" / "harness_tree" / "state.json").read_text())
 
-    assert result.details["updates_completed"] == 2
-    assert engine.evolved_scopes == ["main", "alpha"]
+    assert result.details["tasks_completed"] == 2
+    assert result.details["updates_completed"] == 1
+    assert engine.evolved_scopes == ["alpha"]
     assert sorted(state["branches"]) == ["branch/alpha", "branch/beta"]
-    assert state["main_pending"] == []
+    assert len(state["main_pending"]) == 2
     assert state["branches"]["branch/alpha"]["pending"] == []
-    assert len(state["branches"]["branch/beta"]["pending"]) == 1
+    assert state["branches"]["branch/beta"]["pending"] == []
+    assert state["branches"]["branch/beta"]["solve_count"] == 0
     observation_files = sorted((workspace / "evolution" / "observations").glob("batch_*.jsonl"))
     assert [path.name for path in observation_files] == [
-        "batch_0001_main.jsonl",
-        "batch_0002_branch_alpha.jsonl",
+        "batch_0001_branch_alpha.jsonl",
     ]
-    assert [len(path.read_text(encoding="utf-8").splitlines()) for path in observation_files] == [3, 2]
-    assert [event["event"] for event in progress_events].count("task_done") == 3
-    assert any(event.get("event") == "evolve_done" and event.get("scope") == "main" for event in progress_events)
-    assert (workspace / "memory" / "main.jsonl").is_file()
+    assert [len(path.read_text(encoding="utf-8").splitlines()) for path in observation_files] == [2]
+    assert [event["event"] for event in progress_events].count("task_done") == 2
+    assert not any(event.get("event") == "evolve_done" and event.get("scope") == "main" for event in progress_events)
+    assert not (workspace / "memory" / "main.jsonl").is_file()
     alpha_overlay = workspace / "evolution" / "harness_tree" / "overlays" / "alpha" / "files"
     assert (alpha_overlay / "skills" / "domain-alpha" / "SKILL.md").is_file()
     assert not (alpha_overlay / "memory" / "main.jsonl").exists()
@@ -563,16 +566,116 @@ def test_harness_tree_routes_buffers_and_final_eval_does_not_evolve(tmp_path: Pa
         name: list(branch["pending"])
         for name, branch in state["branches"].items()
     }
+    main_pending_before = list(state["main_pending"])
     eval_summary = runner.run_final_evaluation(limit=1, output_dir=workspace / "evolution" / "final_test")
     state_after = json.loads((workspace / "evolution" / "harness_tree" / "state.json").read_text())
 
     assert eval_summary["total"] == 1
     assert eval_summary["per_branch"]["branch/alpha"]["total"] == 1
-    assert engine.evolved_scopes == ["main", "alpha"]
+    assert engine.evolved_scopes == ["alpha"]
     assert {
         name: branch["pending"]
         for name, branch in state_after["branches"].items()
     } == pending_before
+    assert state_after["main_pending"] == main_pending_before
+
+
+def test_harness_tree_final_eval_parallel_preserves_order(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path / "workspace")
+    benchmark = FakeBenchmark(tmp_path)
+    benchmark.test_tasks = [
+        _harness_task(tmp_path, f"alpha_eval_{index}", "alpha eval")
+        for index in range(6)
+    ]
+    agent = FakeAgent(workspace, parallelism=2)
+    engine = FakeEngine(workspace)
+    runner = HarnessTreeRunner(
+        agent=agent,
+        benchmark=benchmark,
+        engine=engine,
+        config=EvolveConfig(batch_size=10, train_limit=0),
+        type_buffer_size=2,
+        router_confidence_threshold=0.5,
+    )
+
+    runner.run_final_evaluation(limit=6, output_dir=workspace / "evolution" / "final_test")
+
+    with (workspace / "evolution" / "final_test" / "results.csv").open(
+        "r",
+        encoding="utf-8",
+        newline="",
+    ) as handle:
+        rows = list(csv.DictReader(handle))
+    assert [row["task_id"] for row in rows] == [f"alpha_eval_{index}" for index in range(6)]
+    assert len({row["pid"] for row in rows}) > 1
+
+    state = json.loads((workspace / "evolution" / "harness_tree" / "state.json").read_text())
+    assert [item["task_id"] for item in state["final_eval"]["decisions"]] == [
+        f"alpha_eval_{index}" for index in range(6)
+    ]
+
+
+def test_harness_tree_parallel_train_worker_error_is_recorded(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path / "workspace")
+    benchmark = FakeBenchmark(tmp_path)
+    benchmark.train_tasks = [
+        _harness_task(tmp_path, "alpha_error", "alpha explode"),
+        _harness_task(tmp_path, "alpha_ok", "alpha model"),
+    ]
+    agent = FakeAgent(workspace, parallelism=2)
+    engine = FakeEngine(workspace)
+    runner = HarnessTreeRunner(
+        agent=agent,
+        benchmark=benchmark,
+        engine=engine,
+        config=EvolveConfig(batch_size=10, train_limit=2),
+        type_buffer_size=2,
+        router_confidence_threshold=0.5,
+    )
+
+    result = runner.run_training(max_epochs=1)
+    observation_file = workspace / "evolution" / "observations" / "batch_0001_branch_alpha.jsonl"
+    records = [
+        json.loads(line)
+        for line in observation_file.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+    assert result.details["tasks_completed"] == 2
+    assert engine.evolved_scopes == ["alpha"]
+    assert [record["task_id"] for record in records] == ["alpha_error", "alpha_ok"]
+    assert records[0]["feedback_detail"] == "RuntimeError: boom"
+    assert records[0]["score"] == 0.0
+    assert records[1]["score"] == 1.0
+
+
+def test_harness_tree_parallel_train_solve_uses_multiple_workers(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path / "workspace")
+    benchmark = FakeBenchmark(tmp_path)
+    benchmark.train_tasks = [
+        _harness_task(tmp_path, "alpha_one", "alpha model"),
+        _harness_task(tmp_path, "alpha_two", "alpha model again"),
+    ]
+    agent = FakeAgent(workspace, parallelism=2)
+    engine = FakeEngine(workspace)
+    runner = HarnessTreeRunner(
+        agent=agent,
+        benchmark=benchmark,
+        engine=engine,
+        config=EvolveConfig(batch_size=10, train_limit=2),
+        type_buffer_size=2,
+        router_confidence_threshold=0.5,
+    )
+
+    runner.run_training(max_epochs=1)
+
+    observation_file = workspace / "evolution" / "observations" / "batch_0001_branch_alpha.jsonl"
+    records = [
+        json.loads(line)
+        for line in observation_file.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len({record["feedback"]["raw"]["evaluation"]["pid"] for record in records}) > 1
 
 
 def test_harness_tree_route_phase_uses_metadata_category_in_router(tmp_path: Path) -> None:
@@ -580,7 +683,7 @@ def test_harness_tree_route_phase_uses_metadata_category_in_router(tmp_path: Pat
     benchmark = FakeBenchmark(tmp_path)
     benchmark.train_tasks = [_harness_task(tmp_path, "categorized_1", "alpha model")]
     benchmark.train_tasks[0].metadata["category"] = "Known Category"
-    agent = FakeAgent(workspace)
+    agent = FakeAgent(workspace, parallelism=2)
     engine = FakeEngine(workspace)
     runner = HarnessTreeRunner(
         agent=agent,
@@ -598,20 +701,25 @@ def test_harness_tree_route_phase_uses_metadata_category_in_router(tmp_path: Pat
     assert state["router_decisions"][0]["branch_name"] == "branch/known-category"
     assert state["router_decisions"][0]["fallback_reason"] is None
     assert any(phase.endswith(":route") for phase in agent.phases)
+    assert [event for event in state["branches"]["branch/known-category"]["pending"]] == []
 
 
 def test_harness_tree_preserves_metadata_route_on_solve_error(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path / "workspace")
     benchmark = FakeBenchmark(tmp_path)
-    benchmark.train_tasks = [_harness_task(tmp_path, "categorized_error", "explode")]
+    benchmark.train_tasks = [
+        _harness_task(tmp_path, "categorized_error", "explode"),
+        _harness_task(tmp_path, "categorized_ok", "alpha model"),
+    ]
     benchmark.train_tasks[0].metadata["category"] = "Known Category"
+    benchmark.train_tasks[1].metadata["category"] = "Known Category"
     agent = FakeAgent(workspace)
     engine = FakeEngine(workspace)
     runner = HarnessTreeRunner(
         agent=agent,
         benchmark=benchmark,
         engine=engine,
-        config=EvolveConfig(batch_size=2, train_limit=1),
+        config=EvolveConfig(batch_size=3, train_limit=2),
         type_buffer_size=2,
         router_confidence_threshold=0.5,
     )
@@ -620,9 +728,16 @@ def test_harness_tree_preserves_metadata_route_on_solve_error(tmp_path: Path) ->
     runner.run_training(max_epochs=1, progress_callback=progress_events.append)
     state = json.loads((workspace / "evolution" / "harness_tree" / "state.json").read_text())
     task_done = next(event for event in progress_events if event["event"] == "task_done")
+    observation_file = workspace / "evolution" / "observations" / "batch_0001_branch_known-category.jsonl"
+    records = [
+        json.loads(line)
+        for line in observation_file.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
 
     assert sorted(state["branches"]) == ["branch/known-category"]
-    assert state["branches"]["branch/known-category"]["pending"][0]["feedback_detail"] == "RuntimeError: boom"
+    assert records[0]["feedback_detail"] == "RuntimeError: boom"
+    assert records[0]["harness_tree"]["branch_name"] == "branch/known-category"
     assert task_done["branch_name"] == "branch/known-category"
     assert task_done["route_confidence"] == 1.0
 
@@ -631,15 +746,18 @@ def test_harness_tree_disable_main_evolve_isolates_branch_workspace(tmp_path: Pa
     workspace = _workspace(tmp_path / "workspace")
     original_prompt = (workspace / "prompts" / "system.md").read_text(encoding="utf-8")
     benchmark = FakeBenchmark(tmp_path)
-    benchmark.train_tasks = [benchmark.train_tasks[0]]
-    agent = FakeAgent(workspace)
+    benchmark.train_tasks = [
+        _harness_task(tmp_path, "alpha_iso_1", "alpha model"),
+        _harness_task(tmp_path, "alpha_iso_2", "alpha model again"),
+    ]
+    agent = FakeAgent(workspace, parallelism=2)
     engine = LeakyEngine(workspace)
     runner = HarnessTreeRunner(
         agent=agent,
         benchmark=benchmark,
         engine=engine,
-        config=EvolveConfig(batch_size=1, train_limit=1),
-        type_buffer_size=1,
+        config=EvolveConfig(batch_size=1, train_limit=2),
+        type_buffer_size=2,
         router_confidence_threshold=0.5,
         disable_main_evolve=True,
     )
@@ -802,10 +920,10 @@ class FakeRegistry:
 
 
 class FakeAgent:
-    def __init__(self, workspace: Path) -> None:
+    def __init__(self, workspace: Path, parallelism: int = 1) -> None:
         self.workspace = AgentWorkspace(workspace)
         self.registry = FakeRegistry()
-        self.config = types.SimpleNamespace(task_timeout_seconds=0)
+        self.config = types.SimpleNamespace(task_timeout_seconds=0, parallelism=parallelism)
         self.phases: list[str] = []
 
     def reload_from_fs(self) -> None:
@@ -872,6 +990,7 @@ class FakeAgent:
         if "explode" in task.input:
             raise RuntimeError("boom")
         assert initial_messages, "solve phase should inherit route messages"
+        time.sleep(0.05)
         trace.event("assistant_message", {"phase": phase, "content": "solving", "tool_calls": []})
         return AgentResult(status="success", turns=1, objective_value=1, messages=messages)
 
@@ -914,7 +1033,7 @@ class FakeBenchmark:
             success=True,
             score=1.0,
             detail="ok",
-            raw={"evaluation": {"task_id": task.id, "correct": True}},
+            raw={"evaluation": {"task_id": task.id, "correct": True, "pid": os.getpid()}},
         )
 
 

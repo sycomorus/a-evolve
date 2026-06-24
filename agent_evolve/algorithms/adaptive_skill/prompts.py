@@ -32,6 +32,9 @@ Your job each cycle:
 
 Guidelines:
 - Quality over quantity. Only create skills that genuinely help future tasks.
+- The task traces you need are already provided in the evolution prompt. Do not inspect raw
+  evolution logs, run traces, or files outside the current workspace.
+- Modify only files in the current workspace's prompts, skills, memory, tools, or manifest.
 - Skills live at `skills/<name>/SKILL.md`, where `<name>` exactly matches the YAML `name`.
 - Skill names must match `^[a-z0-9]+(-[a-z0-9]+)*$`: lowercase kebab-case only; no spaces, underscores, or uppercase.
 - Skills use SKILL.md format with YAML frontmatter (name, description).

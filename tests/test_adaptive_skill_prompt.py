@@ -6,7 +6,11 @@ from pathlib import Path
 
 from agent_evolve.algorithms.adaptive_skill.engine import AdaptiveSkillEngine
 from agent_evolve.algorithms.adaptive_skill.prompts import build_evolution_prompt
-from agent_evolve.algorithms.adaptive_skill.tools import create_default_llm
+from agent_evolve.algorithms.adaptive_skill.tools import (
+    WORKSPACE_BASH_OUTPUT_CHAR_LIMIT,
+    create_default_llm,
+    make_workspace_bash,
+)
 from agent_evolve.algorithms.unified.openai_compat import OpenAICompatProvider
 from agent_evolve.config import EvolveConfig
 from agent_evolve.contract.workspace import AgentWorkspace
@@ -236,6 +240,31 @@ def test_openai_compatible_evolver_accepts_json_string_tool_calls() -> None:
         "tool_call_id": "call_1",
         "content": "ran pwd",
     }
+
+
+def test_workspace_bash_rejects_outside_workspace_paths(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret", encoding="utf-8")
+    bash = make_workspace_bash(workspace)
+
+    assert bash("printf ok") == "ok"
+    blocked = bash("cat ../outside.txt")
+
+    assert "ERROR: workspace_bash may only access files under" in blocked
+    assert "secret" not in blocked
+
+
+def test_workspace_bash_truncates_large_output(tmp_path: Path) -> None:
+    big_file = tmp_path / "big.txt"
+    big_file.write_text("x" * (WORKSPACE_BASH_OUTPUT_CHAR_LIMIT + 100), encoding="utf-8")
+    bash = make_workspace_bash(tmp_path)
+
+    output = bash("cat big.txt")
+
+    assert len(output) < WORKSPACE_BASH_OUTPUT_CHAR_LIMIT + 200
+    assert "truncated 100 characters" in output
 
 
 def test_adaptive_skill_step_marks_prompt_diff_as_mutation(tmp_path: Path) -> None:

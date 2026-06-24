@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -12,8 +13,9 @@ from ...llm.base import LLMProvider
 BASH_TOOL_SPEC = {
     "name": "workspace_bash",
     "description": (
-        "Execute a bash command in the agent workspace directory. "
-        "Use this to read/write skills, prompts, memory files, and inspect git history."
+        "Execute a bash command inside the agent workspace directory. "
+        "Use this only to read/write workspace files such as skills, prompts, memory, "
+        "tools, and manifest.yaml; output is truncated."
     ),
     "input_schema": {
         "type": "object",
@@ -27,27 +29,57 @@ BASH_TOOL_SPEC = {
     },
 }
 
+WORKSPACE_BASH_OUTPUT_CHAR_LIMIT = 20_000
+_OUTSIDE_PATH_PATTERNS = (
+    re.compile(r"(^|[\s\"'=])\.\.(?=/|$)"),
+    re.compile(r"(^|[\s\"'=])~(?=/|$)"),
+    re.compile(r"(^|[\s\"'=])/(?!dev/null(?:\s|$))"),
+)
+
 
 def make_workspace_bash(workspace_root: str | Path):
     """Create a bash callable scoped to the workspace directory."""
+    root = Path(workspace_root).resolve()
 
     def bash(command: str) -> str:
+        violation = _outside_workspace_violation(command)
+        if violation:
+            return f"ERROR: workspace_bash may only access files under {root}: {violation}"
         try:
             result = subprocess.run(
                 ["bash", "-c", command],
                 capture_output=True,
                 text=True,
                 timeout=60,
-                cwd=str(workspace_root),
+                cwd=str(root),
             )
             output = (result.stdout + result.stderr).strip()
-            return output if output else "(no output)"
+            output = output if output else "(no output)"
+            return _truncate_output(output)
         except subprocess.TimeoutExpired:
             return "ERROR: Command timed out."
         except Exception as e:
             return f"ERROR: {e}"
 
     return bash
+
+
+def _outside_workspace_violation(command: str) -> str:
+    for pattern in _OUTSIDE_PATH_PATTERNS:
+        match = pattern.search(command)
+        if match:
+            return f"outside-workspace path reference {match.group(0).strip()!r}"
+    return ""
+
+
+def _truncate_output(output: str) -> str:
+    if len(output) <= WORKSPACE_BASH_OUTPUT_CHAR_LIMIT:
+        return output
+    omitted = len(output) - WORKSPACE_BASH_OUTPUT_CHAR_LIMIT
+    return (
+        output[:WORKSPACE_BASH_OUTPUT_CHAR_LIMIT]
+        + f"\n...[truncated {omitted} characters by workspace_bash output limit]"
+    )
 
 
 def create_default_llm(config: EvolveConfig) -> LLMProvider:
