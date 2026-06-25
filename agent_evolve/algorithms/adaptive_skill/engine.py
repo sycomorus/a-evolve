@@ -69,6 +69,7 @@ class AdaptiveSkillEngine(EvolutionEngine):
             protect_skills=self.config.extra.get("protect_skills", False),
             judge_llm=self.llm if self.config.trajectory_only else None,
             scope_instruction=self.config.extra.get("scope_instruction"),
+            evolution_instruction=self.config.extra.get("evolution_instruction"),
         )
         response = self._run_llm(prompt, workspace.root)
 
@@ -126,6 +127,7 @@ class AdaptiveSkillEngine(EvolutionEngine):
             protect_skills=self.config.extra.get("protect_skills", False),
             judge_llm=self.llm if self.config.trajectory_only else None,
             scope_instruction=self.config.extra.get("scope_instruction"),
+            evolution_instruction=self.config.extra.get("evolution_instruction"),
         )
         response = self._run_llm(prompt, workspace.root)
 

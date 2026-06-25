@@ -16,6 +16,7 @@ from typing import Any, get_args, get_origin, get_type_hints
 from baseline.react.agent import AgentResult, ReActAgent, tool_schemas
 from baseline.react.config import ReactConfig, load_config
 from baseline.react.trace import TraceWriter
+from baseline.heuristic.tools import RUN_HEURISTIC_DESCRIPTION, run_heuristic
 from tools.seed_tools._common import configure_environment
 from tools.tools_registery import ToolRegistry, ToolSpec, register_seed_tools
 
@@ -39,17 +40,30 @@ FORBIDDEN_TOOL_STRINGS = (
     "popen",
 )
 TASK_CATEGORY_ENV = "OR_INTERACT_TASK_CATEGORY"
+OR_INTERACT_SETTINGS_FILE = "or_interact_settings.json"
+HEURISTIC_PROMPT_EXTENSION = """\
+## Heuristic Algorithm Evolution
+
+This run enables the `run_heuristic` tool. The agent may execute heuristic,
+greedy, simulation, local-search, approximation, or metaheuristic Python code
+when exact solver modeling is difficult. Evolution may improve prompts, skills,
+memory, or tools that help design, validate, and refine such heuristic
+algorithms, while still requiring final answers to be submitted with
+`finalize`.
+"""
 
 
 class ORReactAgent(BaseAgent):
     """Reloadable a-evolve agent that runs the OR-Claw ReAct baseline."""
 
     def __init__(self, workspace_dir: str | Path):
+        self.or_interact_settings: dict[str, Any] = {}
         super().__init__(workspace_dir)
         self.config = self._load_config()
 
     def reload_from_fs(self) -> None:
         super().reload_from_fs()
+        self.or_interact_settings = self._load_or_interact_settings()
         self.registry = self._build_registry()
 
     def solve(self, task: Task) -> Trajectory:
@@ -206,6 +220,8 @@ class ORReactAgent(BaseAgent):
             return hook(self.system_prompt, self.skills, self.memories, self.registry)
 
         sections = [self.system_prompt.strip()]
+        if self._heuristic_enabled():
+            sections.append(HEURISTIC_PROMPT_EXTENSION.strip())
 
         skill_catalog = self._skill_catalog()
         if skill_catalog:
@@ -245,6 +261,13 @@ class ORReactAgent(BaseAgent):
 
     def _build_registry(self, *, include_type_router: bool = False) -> ToolRegistry:
         registry = register_seed_tools(ToolRegistry())
+        if self._heuristic_enabled():
+            registry.add_tool(
+                name="run_heuristic",
+                function=run_heuristic,
+                description=RUN_HEURISTIC_DESCRIPTION,
+                metadata={"source": "or_interact_settings"},
+            )
         for entry in self.workspace.read_tool_registry():
             if entry.get("kind") == "seed":
                 continue
@@ -258,6 +281,16 @@ class ORReactAgent(BaseAgent):
             spec = self._load_evolved_tool(entry)
             registry.register(spec, overwrite=True)
         return registry
+
+    def _load_or_interact_settings(self) -> dict[str, Any]:
+        path = self.workspace.root / OR_INTERACT_SETTINGS_FILE
+        if not path.is_file():
+            return {}
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+
+    def _heuristic_enabled(self) -> bool:
+        return bool(self.or_interact_settings.get("enable_heuristic_tool"))
 
     def _load_evolved_tool(self, entry: dict[str, Any]) -> ToolSpec:
         name = str(entry["name"])

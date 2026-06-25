@@ -42,6 +42,17 @@ from agent_evolve.evaluation import run_evaluation  # noqa: E402
 from agent_evolve.runs import create_run_workspace, update_run_metadata  # noqa: E402
 from examples.or_interact_examples.harness_tree import run_harness_tree  # noqa: E402
 
+OR_INTERACT_SETTINGS_FILE = "or_interact_settings.json"
+HEURISTIC_EVOLUTION_INSTRUCTION = (
+    "The OR-Interact solver agent has access to `run_heuristic`, a guarded "
+    "Python execution tool for heuristic, greedy, simulation, local-search, "
+    "approximation, or metaheuristic algorithms when exact solver modeling is "
+    "difficult. You may evolve prompts, skills, memory, or tools that help the "
+    "agent design, validate, and refine such heuristic algorithms, while still "
+    "requiring final answers to be submitted with finalize."
+)
+
+
 def main() -> int:
     args = parse_args()
     console = Console()
@@ -67,6 +78,9 @@ def main() -> int:
             "evolver_base_url": evolver_base_url,
             "evolver_api_key": evolver_api_key,
             "evolver_temperature": evolver_temperature,
+            "evolution_instruction": HEURISTIC_EVOLUTION_INSTRUCTION
+            if args.enable_heuristic_tool
+            else None,
         },
     )
     engine = AdaptiveSkillEngine(config)
@@ -83,6 +97,10 @@ def main() -> int:
         seed_workspace,
         agent="or-interact",
         benchmark=f"or-interact:{args.dataset}",
+    )
+    _write_or_interact_settings(
+        run.workspace_dir,
+        enable_heuristic_tool=args.enable_heuristic_tool,
     )
     print_run_header(
         title="OR-Interact Evolution",
@@ -398,7 +416,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-skills", type=int, default=8)
     parser.add_argument("--limit-train", type=int, help="Total number of train tasks for this run.")
     parser.add_argument("--limit-test", type=int)
+    parser.add_argument(
+        "--enable-heuristic-tool",
+        action="store_true",
+        help=(
+            "Expose run_heuristic to the OR-Interact solver agent and tell the "
+            "evolver it may improve heuristic-algorithm strategies. Default "
+            "keeps the original tool set and prompts unchanged."
+        ),
+    )
     return parser.parse_args()
+
+
+def _write_or_interact_settings(
+    workspace_dir: str | Path,
+    *,
+    enable_heuristic_tool: bool,
+) -> None:
+    settings = {
+        "enable_heuristic_tool": bool(enable_heuristic_tool),
+    }
+    (Path(workspace_dir) / OR_INTERACT_SETTINGS_FILE).write_text(
+        json.dumps(settings, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
 def _total_updates(

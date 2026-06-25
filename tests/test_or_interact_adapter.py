@@ -208,6 +208,41 @@ def test_agent_prompt_uses_catalog_without_harness_tree_router(tmp_path: Path, m
     assert "diagnose" in captured["tools"]
     assert "type_router" not in captured["tools"]
     assert "answer_checker" not in captured["tools"]
+    assert "run_heuristic" not in captured["tools"]
+    assert "run_heuristic" not in prompt
+
+
+def test_or_interact_heuristic_tool_is_enabled_only_by_workspace_setting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = _workspace(tmp_path / "workspace")
+    (workspace / "or_interact_settings.json").write_text(
+        json.dumps({"enable_heuristic_tool": True}),
+        encoding="utf-8",
+    )
+    captured: dict[str, object] = {}
+
+    class FakeReActAgent:
+        def __init__(self, *, config, trace, registry, system_prompt):
+            captured["system_prompt"] = system_prompt
+            captured["tools"] = registry.list_tools()
+
+        def run(self, **kwargs):
+            from baseline.react.agent import AgentResult
+
+            return AgentResult(status="success", turns=1, objective_value=1)
+
+    monkeypatch.setattr("agent_evolve.agents.or_interact.react_agent.ReActAgent", FakeReActAgent)
+    agent = ORReactAgent(workspace)
+    task = Task(id="task_x", input="", metadata={"task_dir": str(_visible_task(tmp_path)), "dataset": "IndustryOR"})
+
+    agent.solve(task)
+
+    prompt = str(captured["system_prompt"])
+    assert "run_heuristic" in captured["tools"]
+    assert "run_heuristic" in prompt
+    assert "Heuristic Algorithm Evolution" in prompt
 
 
 def test_type_router_is_available_only_for_route_phase(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -310,7 +345,21 @@ def test_or_interact_cli_has_no_check_flags(monkeypatch: pytest.MonkeyPatch) -> 
     assert not hasattr(evaluate_or_interact.parse_args(), "check")
 
     monkeypatch.setattr(sys, "argv", ["evolve_or_interact.py"])
-    assert not hasattr(evolve_or_interact.parse_args(), "check")
+    args = evolve_or_interact.parse_args()
+    assert not hasattr(args, "check")
+    assert args.enable_heuristic_tool is False
+
+    monkeypatch.setattr(sys, "argv", ["evolve_or_interact.py", "--enable-heuristic-tool"])
+    assert evolve_or_interact.parse_args().enable_heuristic_tool is True
+
+
+def test_or_interact_evolve_settings_writer_records_heuristic_switch(tmp_path: Path) -> None:
+    from examples.or_interact_examples.evolve_or_interact import _write_or_interact_settings
+
+    _write_or_interact_settings(tmp_path, enable_heuristic_tool=True)
+
+    settings = json.loads((tmp_path / "or_interact_settings.json").read_text(encoding="utf-8"))
+    assert settings == {"enable_heuristic_tool": True}
 
 
 def test_evaluate_and_evolve_use_matching_or_interact_splits(monkeypatch: pytest.MonkeyPatch) -> None:
