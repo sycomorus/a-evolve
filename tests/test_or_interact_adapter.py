@@ -243,6 +243,66 @@ def test_or_interact_heuristic_tool_is_enabled_only_by_workspace_setting(
     assert "run_heuristic" in captured["tools"]
     assert "run_heuristic" in prompt
     assert "Heuristic Algorithm Evolution" in prompt
+    assert "Do not" in prompt
+    assert "tools/run_heuristic.py" in prompt
+
+
+@pytest.mark.parametrize(
+    "tool_source",
+    [
+        "import subprocess\nfrom typing import Any\n\ndef run_heuristic() -> dict[str, Any]:\n    return {}\n",
+        "from typing import Any\n\ndef run_heuristic() -> dict[str, Any]:\n    return {'error': '\n",
+        "from typing import Any\n\ndef run_heuristic(*args: Any, **kwargs: Any) -> dict[str, Any]:\n    return {}\n",
+    ],
+)
+def test_workspace_run_heuristic_entries_are_reserved_and_ignored(
+    tmp_path: Path,
+    tool_source: str,
+) -> None:
+    workspace = _workspace(tmp_path / "workspace")
+    (workspace / "or_interact_settings.json").write_text(
+        json.dumps({"enable_heuristic_tool": True}),
+        encoding="utf-8",
+    )
+    _write_tool(workspace, "run_heuristic", tool_source)
+    _write_registry(
+        workspace,
+        [
+            {
+                "name": "run_heuristic",
+                "file": "run_heuristic.py",
+                "function": "run_heuristic",
+            }
+        ],
+    )
+
+    agent = ORReactAgent(workspace)
+
+    assert "run_heuristic" in agent.registry.list_tools()
+    assert agent.registry.get("run_heuristic").kind == "dynamic"
+
+
+def test_workspace_run_heuristic_entry_is_ignored_when_switch_is_off(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path / "workspace")
+    _write_tool(
+        workspace,
+        "run_heuristic",
+        "from typing import Any\n\ndef run_heuristic() -> dict[str, Any]:\n    return {}\n",
+    )
+    _write_registry(
+        workspace,
+        [
+            {
+                "name": "run_heuristic",
+                "file": "run_heuristic.py",
+                "function": "run_heuristic",
+            }
+        ],
+    )
+
+    agent = ORReactAgent(workspace)
+
+    assert "run_heuristic" not in agent.registry.list_tools()
 
 
 def test_type_router_is_available_only_for_route_phase(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -793,6 +853,10 @@ def test_harness_tree_preserves_metadata_route_on_solve_error(tmp_path: Path) ->
 
 def test_harness_tree_disable_main_evolve_isolates_branch_workspace(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path / "workspace")
+    (workspace / "or_interact_settings.json").write_text(
+        json.dumps({"enable_heuristic_tool": True}),
+        encoding="utf-8",
+    )
     original_prompt = (workspace / "prompts" / "system.md").read_text(encoding="utf-8")
     benchmark = FakeBenchmark(tmp_path)
     benchmark.train_tasks = [
@@ -835,6 +899,9 @@ def test_harness_tree_disable_main_evolve_isolates_branch_workspace(tmp_path: Pa
     isolated_workspace = workspace.parent / "harness_tree_branch_workspaces" / "alpha"
     assert isolated_workspace.is_dir()
     assert workspace.resolve() not in isolated_workspace.resolve().parents
+    assert json.loads(
+        (isolated_workspace / "or_interact_settings.json").read_text(encoding="utf-8")
+    ) == {"enable_heuristic_tool": True}
 
 
 def test_workspace_tool_overrides_seed_tool(tmp_path: Path) -> None:

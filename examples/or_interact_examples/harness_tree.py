@@ -30,7 +30,14 @@ MAIN_BRANCH = "main"
 GENERAL_BRANCH = "branch/general"
 MATERIALIZED_DIR = STATE_DIR / "materialized"
 OVERLAYS_DIR = STATE_DIR / "overlays"
-HARNESS_PATHS = ("prompts", "skills", "memory", "tools", "manifest.yaml")
+HARNESS_PATHS = (
+    "prompts",
+    "skills",
+    "memory",
+    "tools",
+    "manifest.yaml",
+    "or_interact_settings.json",
+)
 ROUTE_PHASE_TURNS = 8
 
 ROUTE_PHASE_USER_MESSAGE = """\

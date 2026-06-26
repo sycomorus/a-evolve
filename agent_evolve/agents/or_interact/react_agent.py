@@ -41,6 +41,7 @@ FORBIDDEN_TOOL_STRINGS = (
 )
 TASK_CATEGORY_ENV = "OR_INTERACT_TASK_CATEGORY"
 OR_INTERACT_SETTINGS_FILE = "or_interact_settings.json"
+RESERVED_DYNAMIC_TOOL_NAMES = {"run_heuristic"}
 HEURISTIC_PROMPT_EXTENSION = """\
 ## Heuristic Algorithm Evolution
 
@@ -50,6 +51,9 @@ when exact solver modeling is difficult. Evolution may improve prompts, skills,
 memory, or tools that help design, validate, and refine such heuristic
 algorithms, while still requiring final answers to be submitted with
 `finalize`.
+
+`run_heuristic` is a built-in runtime tool supplied by the harness. Do not
+create, modify, or register workspace files named `tools/run_heuristic.py`.
 """
 
 
@@ -275,6 +279,8 @@ class ORReactAgent(BaseAgent):
             if name == "type_router" and not include_type_router:
                 continue
             if name == "answer_checker":
+                continue
+            if name in RESERVED_DYNAMIC_TOOL_NAMES:
                 continue
             if not _is_evolved_tool_entry(entry):
                 continue

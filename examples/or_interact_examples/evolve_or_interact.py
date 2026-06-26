@@ -49,7 +49,9 @@ HEURISTIC_EVOLUTION_INSTRUCTION = (
     "approximation, or metaheuristic algorithms when exact solver modeling is "
     "difficult. You may evolve prompts, skills, memory, or tools that help the "
     "agent design, validate, and refine such heuristic algorithms, while still "
-    "requiring final answers to be submitted with finalize."
+    "requiring final answers to be submitted with finalize. `run_heuristic` is "
+    "already provided by the harness; do not create, modify, or register "
+    "`tools/run_heuristic.py`."
 )
 
 
