@@ -247,6 +247,51 @@ def test_or_interact_heuristic_tool_is_enabled_only_by_workspace_setting(
     assert "tools/run_heuristic.py" in prompt
 
 
+def test_or_interact_user_tool_is_enabled_only_by_workspace_setting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = _workspace(tmp_path / "workspace")
+    (workspace / "or_interact_settings.json").write_text(
+        json.dumps({"enable_user_tool": True}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OR_USER_SIM_MODEL", "fake-user-model")
+    captured: dict[str, object] = {}
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs) -> None:
+            self.chat = object()
+
+    class FakeReActAgent:
+        def __init__(self, *, config, trace, registry, system_prompt):
+            captured["system_prompt"] = system_prompt
+            captured["tools"] = registry.list_tools()
+
+        def run(self, **kwargs):
+            from baseline.react.agent import AgentResult
+
+            return AgentResult(status="success", turns=1, objective_value=1)
+
+    monkeypatch.setattr("user.simulator.OpenAI", FakeOpenAI)
+    monkeypatch.setattr("agent_evolve.agents.or_interact.react_agent.ReActAgent", FakeReActAgent)
+    task_dir = _visible_task(tmp_path)
+    (task_dir / "grounded").mkdir()
+    (task_dir / "grounded" / "clarification.md").write_text(
+        "## Question\nWhich depot?\n\n## Answer\nDepot A.\n",
+        encoding="utf-8",
+    )
+    agent = ORReactAgent(workspace)
+    task = Task(id="task_x", input="", metadata={"task_dir": str(task_dir), "dataset": "IndustryOR"})
+
+    agent.solve(task)
+
+    prompt = str(captured["system_prompt"])
+    assert "ask_user" in captured["tools"]
+    assert "ask_user" in prompt
+    assert "run_heuristic" not in captured["tools"]
+
+
 @pytest.mark.parametrize(
     "tool_source",
     [
@@ -408,9 +453,13 @@ def test_or_interact_cli_has_no_check_flags(monkeypatch: pytest.MonkeyPatch) -> 
     args = evolve_or_interact.parse_args()
     assert not hasattr(args, "check")
     assert args.enable_heuristic_tool is False
+    assert args.enable_user_tool is False
 
     monkeypatch.setattr(sys, "argv", ["evolve_or_interact.py", "--enable-heuristic-tool"])
     assert evolve_or_interact.parse_args().enable_heuristic_tool is True
+
+    monkeypatch.setattr(sys, "argv", ["evolve_or_interact.py", "--enable-user-tool"])
+    assert evolve_or_interact.parse_args().enable_user_tool is True
 
 
 def test_or_interact_evolve_settings_writer_records_heuristic_switch(tmp_path: Path) -> None:
@@ -419,7 +468,7 @@ def test_or_interact_evolve_settings_writer_records_heuristic_switch(tmp_path: P
     _write_or_interact_settings(tmp_path, enable_heuristic_tool=True)
 
     settings = json.loads((tmp_path / "or_interact_settings.json").read_text(encoding="utf-8"))
-    assert settings == {"enable_heuristic_tool": True}
+    assert settings == {"enable_heuristic_tool": True, "enable_user_tool": False}
 
 
 def test_evaluate_and_evolve_use_matching_or_interact_splits(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1017,12 +1066,13 @@ def test_agent_results_dir_env_override(
     assert agent.config.results_dir == results_dir.resolve()
 
 
-def test_forbidden_evolved_tool_is_rejected(tmp_path: Path) -> None:
+@pytest.mark.parametrize("forbidden_path", ["grounded/clarification.md", "oracle/objective.json"])
+def test_forbidden_evolved_tool_is_rejected(tmp_path: Path, forbidden_path: str) -> None:
     workspace = _workspace(tmp_path / "workspace")
     _write_tool(
         workspace,
         "bad_tool",
-        "from typing import Any\n\ndef bad_tool() -> dict[str, Any]:\n    return {'path': 'oracle/objective.json'}\n",
+        f"from typing import Any\n\ndef bad_tool() -> dict[str, Any]:\n    return {{'path': {forbidden_path!r}}}\n",
     )
     _write_registry(workspace, [{"name": "bad_tool", "file": "bad_tool.py", "function": "bad_tool"}])
 

@@ -15,16 +15,18 @@ from typing import Any, get_args, get_origin, get_type_hints
 
 from baseline.react.agent import AgentResult, ReActAgent, tool_schemas
 from baseline.react.config import ReactConfig, load_config
+from baseline.react.registry import build_react_registry, require_user_simulator_config
 from baseline.react.trace import TraceWriter
 from baseline.heuristic.tools import RUN_HEURISTIC_DESCRIPTION, run_heuristic
 from tools.seed_tools._common import configure_environment
-from tools.tools_registery import ToolRegistry, ToolSpec, register_seed_tools
+from tools.tools_registery import ToolRegistry, ToolSpec
 
 from ...protocol.base_agent import BaseAgent
 from ...types import Task, Trajectory
 
 
 FORBIDDEN_TOOL_STRINGS = (
+    "grounded",
     "oracle",
     "objective.json",
     "reference_solution",
@@ -41,7 +43,7 @@ FORBIDDEN_TOOL_STRINGS = (
 )
 TASK_CATEGORY_ENV = "OR_INTERACT_TASK_CATEGORY"
 OR_INTERACT_SETTINGS_FILE = "or_interact_settings.json"
-RESERVED_DYNAMIC_TOOL_NAMES = {"run_heuristic"}
+RESERVED_DYNAMIC_TOOL_NAMES = {"ask_user", "run_heuristic"}
 HEURISTIC_PROMPT_EXTENSION = """\
 ## Heuristic Algorithm Evolution
 
@@ -103,7 +105,10 @@ class ORReactAgent(BaseAgent):
     ) -> AgentResult:
         task_dir = Path(task.metadata["task_dir"]).resolve()
         configure_environment(context_dir=task_dir, runtime_dir=runtime_dir)
-        registry = self._build_registry(include_type_router=phase.endswith(":route"))
+        registry = self._build_registry(
+            include_type_router=phase.endswith(":route"),
+            task_dir=task_dir,
+        )
         self.registry = registry
         try:
             with _task_timeout(self.config.task_timeout_seconds):
@@ -199,6 +204,7 @@ class ORReactAgent(BaseAgent):
                 parallelism=int(os.environ.get("OR_REACT_PARALLELISM", "1")),
                 benchmark_dir=(Path.cwd() / "OR-Interact-Bench").resolve(),
                 results_dir=self.workspace.root / "evolution" / "runs",
+                user_simulator=None,
             )
 
         results_dir = os.environ.get("OR_REACT_RESULTS_DIR")
@@ -216,6 +222,7 @@ class ORReactAgent(BaseAgent):
             results_dir=Path(results_dir).expanduser().resolve()
             if results_dir
             else self.workspace.root / "evolution" / "runs",
+            user_simulator=base.user_simulator,
         )
 
     def _build_system_prompt(self) -> str:
@@ -263,8 +270,21 @@ class ORReactAgent(BaseAgent):
             )
         return "\n".join(lines)
 
-    def _build_registry(self, *, include_type_router: bool = False) -> ToolRegistry:
-        registry = register_seed_tools(ToolRegistry())
+    def _build_registry(
+        self,
+        *,
+        include_type_router: bool = False,
+        task_dir: str | Path | None = None,
+    ) -> ToolRegistry:
+        user_config = (
+            require_user_simulator_config(self.config)
+            if self._user_tool_enabled() and task_dir is not None
+            else None
+        )
+        registry = build_react_registry(
+            task_dir=task_dir,
+            user_simulator_config=user_config,
+        )
         if self._heuristic_enabled():
             registry.add_tool(
                 name="run_heuristic",
@@ -297,6 +317,9 @@ class ORReactAgent(BaseAgent):
 
     def _heuristic_enabled(self) -> bool:
         return bool(self.or_interact_settings.get("enable_heuristic_tool"))
+
+    def _user_tool_enabled(self) -> bool:
+        return bool(self.or_interact_settings.get("enable_user_tool"))
 
     def _load_evolved_tool(self, entry: dict[str, Any]) -> ToolSpec:
         name = str(entry["name"])

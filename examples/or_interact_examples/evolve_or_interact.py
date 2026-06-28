@@ -103,6 +103,7 @@ def main() -> int:
     _write_or_interact_settings(
         run.workspace_dir,
         enable_heuristic_tool=args.enable_heuristic_tool,
+        enable_user_tool=args.enable_user_tool,
     )
     print_run_header(
         title="OR-Interact Evolution",
@@ -427,6 +428,15 @@ def parse_args() -> argparse.Namespace:
             "keeps the original tool set and prompts unchanged."
         ),
     )
+    parser.add_argument(
+        "--enable-user-tool",
+        action="store_true",
+        help=(
+            "Expose ask_user to the OR-Interact solver agent. The simulator "
+            "only answers from task grounded clarifications. Default keeps "
+            "the original tool set unchanged."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -434,9 +444,11 @@ def _write_or_interact_settings(
     workspace_dir: str | Path,
     *,
     enable_heuristic_tool: bool,
+    enable_user_tool: bool = False,
 ) -> None:
     settings = {
         "enable_heuristic_tool": bool(enable_heuristic_tool),
+        "enable_user_tool": bool(enable_user_tool),
     }
     (Path(workspace_dir) / OR_INTERACT_SETTINGS_FILE).write_text(
         json.dumps(settings, ensure_ascii=False, indent=2),
