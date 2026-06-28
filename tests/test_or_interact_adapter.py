@@ -661,6 +661,7 @@ def test_sanitize_branch_name_handles_empty_unicode_and_special_chars() -> None:
     assert sanitize_branch_name("中文") == "branch/general"
     assert sanitize_branch_name("Routing VRP!") == "branch/routing-vrp"
     assert sanitize_branch_name("branch/Piecewise Discount") == "branch/piecewise-discount"
+    assert sanitize_branch_name("production_planning") == "branch/production-planning"
 
 
 def test_version_control_branch_api(tmp_path: Path) -> None:
@@ -700,22 +701,24 @@ def test_harness_tree_routes_buffers_and_final_eval_does_not_evolve(tmp_path: Pa
     result = runner.run_training(max_epochs=1, progress_callback=progress_events.append)
     state = json.loads((workspace / "evolution" / "harness_tree" / "state.json").read_text())
 
-    assert result.details["tasks_completed"] == 2
-    assert result.details["updates_completed"] == 1
-    assert engine.evolved_scopes == ["alpha"]
+    assert result.details["tasks_completed"] == 3
+    assert result.details["updates_completed"] == 3
+    assert engine.evolved_scopes == ["alpha", "main", "beta"]
     assert sorted(state["branches"]) == ["branch/alpha", "branch/beta"]
-    assert len(state["main_pending"]) == 2
+    assert state["main_pending"] == []
     assert state["branches"]["branch/alpha"]["pending"] == []
     assert state["branches"]["branch/beta"]["pending"] == []
-    assert state["branches"]["branch/beta"]["solve_count"] == 0
+    assert state["branches"]["branch/beta"]["solve_count"] == 1
     observation_files = sorted((workspace / "evolution" / "observations").glob("batch_*.jsonl"))
     assert [path.name for path in observation_files] == [
         "batch_0001_branch_alpha.jsonl",
+        "batch_0002_main.jsonl",
+        "batch_0003_branch_beta.jsonl",
     ]
-    assert [len(path.read_text(encoding="utf-8").splitlines()) for path in observation_files] == [2]
-    assert [event["event"] for event in progress_events].count("task_done") == 2
-    assert not any(event.get("event") == "evolve_done" and event.get("scope") == "main" for event in progress_events)
-    assert not (workspace / "memory" / "main.jsonl").is_file()
+    assert [len(path.read_text(encoding="utf-8").splitlines()) for path in observation_files] == [2, 3, 1]
+    assert [event["event"] for event in progress_events].count("task_done") == 3
+    assert any(event.get("event") == "evolve_done" and event.get("scope") == "main" for event in progress_events)
+    assert (workspace / "memory" / "main.jsonl").is_file()
     alpha_overlay = workspace / "evolution" / "harness_tree" / "overlays" / "alpha" / "files"
     assert (alpha_overlay / "skills" / "domain-alpha" / "SKILL.md").is_file()
     assert not (alpha_overlay / "memory" / "main.jsonl").exists()
@@ -730,7 +733,7 @@ def test_harness_tree_routes_buffers_and_final_eval_does_not_evolve(tmp_path: Pa
 
     assert eval_summary["total"] == 1
     assert eval_summary["per_branch"]["branch/alpha"]["total"] == 1
-    assert engine.evolved_scopes == ["alpha"]
+    assert engine.evolved_scopes == ["alpha", "main", "beta"]
     assert {
         name: branch["pending"]
         for name, branch in state_after["branches"].items()
@@ -800,7 +803,7 @@ def test_harness_tree_parallel_train_worker_error_is_recorded(tmp_path: Path) ->
     ]
 
     assert result.details["tasks_completed"] == 2
-    assert engine.evolved_scopes == ["alpha"]
+    assert engine.evolved_scopes == ["alpha", "main"]
     assert [record["task_id"] for record in records] == ["alpha_error", "alpha_ok"]
     assert records[0]["feedback_detail"] == "RuntimeError: boom"
     assert records[0]["score"] == 0.0
@@ -951,6 +954,34 @@ def test_harness_tree_disable_main_evolve_isolates_branch_workspace(tmp_path: Pa
     assert json.loads(
         (isolated_workspace / "or_interact_settings.json").read_text(encoding="utf-8")
     ) == {"enable_heuristic_tool": True}
+
+
+def test_harness_tree_filters_invalid_skill_artifacts_from_overlay(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path / "workspace")
+    benchmark = FakeBenchmark(tmp_path)
+    benchmark.train_tasks = [
+        _harness_task(tmp_path, "alpha_noise_1", "alpha model"),
+        _harness_task(tmp_path, "alpha_noise_2", "alpha model again"),
+    ]
+    agent = FakeAgent(workspace)
+    engine = NoisySkillEngine(workspace)
+    runner = HarnessTreeRunner(
+        agent=agent,
+        benchmark=benchmark,
+        engine=engine,
+        config=EvolveConfig(batch_size=10, train_limit=2),
+        type_buffer_size=2,
+        router_confidence_threshold=0.5,
+        disable_main_evolve=True,
+    )
+
+    runner.run_training(max_epochs=1)
+    overlay_skills = workspace / "evolution" / "harness_tree" / "overlays" / "alpha" / "files" / "skills"
+
+    assert (overlay_skills / "domain-alpha" / "SKILL.md").is_file()
+    assert not (overlay_skills / "test.txt").exists()
+    assert not (overlay_skills / "domain-alpha" / "SKILL.md.bak").exists()
+    assert not (overlay_skills / "domain-alpha" / "notes.txt").exists()
 
 
 def test_workspace_tool_overrides_seed_tool(tmp_path: Path) -> None:
@@ -1244,6 +1275,24 @@ class LeakyEngine(FakeEngine):
             encoding="utf-8",
         )
         (self.workspace / "prompts" / "system.md").write_text("leaked main prompt", encoding="utf-8")
+        return result
+
+
+class NoisySkillEngine(FakeEngine):
+    def evolve(
+        self,
+        workspace: AgentWorkspace,
+        observation_logs: list[dict[str, Any]],
+        evo_number: int = 0,
+    ) -> dict[str, Any]:
+        result = super().evolve(workspace, observation_logs, evo_number=evo_number)
+        if workspace.root == self.workspace.resolve():
+            return result
+        scope = workspace.root.name
+        (workspace.skills_dir / "test.txt").write_text("scratch", encoding="utf-8")
+        skill_dir = workspace.skills_dir / f"domain-{scope}"
+        (skill_dir / "SKILL.md.bak").write_text("backup", encoding="utf-8")
+        (skill_dir / "notes.txt").write_text("scratch", encoding="utf-8")
         return result
 
 

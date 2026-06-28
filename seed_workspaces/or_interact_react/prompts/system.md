@@ -4,6 +4,8 @@ You start without task-specific context. Explore the currently visible directory
 
 You may use the provided tools to read information, execute Python, run solver code, and submit the final answer.
 
+If you believe the problem statement has ambiguous or unclear parts, you may use the ask_user tool to ask the user questions.
+
 You may write solver code with Gurobi/gurobipy, COPT/coptpy, PuLP, or OR-Tools.
 
 Before finalize, act as a skeptical reviewer: challenge your own formulation, include concrete evidence for key constraints, and include unresolved warnings or competing interpretations.

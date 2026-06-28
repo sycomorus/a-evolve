@@ -209,6 +209,21 @@ class HarnessTreeRunner:
                 )
                 buffer.clear()
 
+        for branch, buffer in execution_buffers.items():
+            if not buffer:
+                continue
+            completed_tasks = self._flush_training_buffer(
+                branch=branch,
+                buffer=buffer,
+                score_history=score_history,
+                completed_tasks=completed_tasks,
+                total_tasks=len(schedule),
+                progress_callback=progress_callback,
+                force_branch_evolve=True,
+            )
+            buffer.clear()
+        self._flush_main_pending(progress_callback=progress_callback)
+
         total_evolves = len(self.state.get("main_evolutions", [])) + sum(
             int(item.get("evolve_count", 0)) for item in self.state["branches"].values()
         )
@@ -595,6 +610,7 @@ class HarnessTreeRunner:
         completed_tasks: int,
         total_tasks: int,
         progress_callback: Callable[[dict[str, Any]], None] | None,
+        force_branch_evolve: bool = False,
     ) -> int:
         evaluations = self._run_solve_buffer_parallel(buffer)
         for routed, evaluation in zip(buffer, evaluations, strict=False):
@@ -646,32 +662,13 @@ class HarnessTreeRunner:
                 },
             )
 
-            if (
-                not self.disable_main_evolve
-                and len(self.state.get("main_pending", [])) >= max(1, int(self.config.batch_size))
-            ):
-                _emit_progress(
-                    progress_callback,
-                    {
-                        "phase": "train",
-                        "event": "evolve_start",
-                        "scope": "main",
-                        "records": len(self.state.get("main_pending", [])),
-                    },
-                )
-                self._evolve_main()
-                _emit_progress(
-                    progress_callback,
-                    {
-                        "phase": "train",
-                        "event": "evolve_done",
-                        "scope": "main",
-                        "updates_completed": len(self.state.get("main_evolutions", [])),
-                    },
-                )
+            if len(self.state.get("main_pending", [])) >= max(1, int(self.config.batch_size)):
+                self._flush_main_pending(progress_callback=progress_callback)
 
         branch_state = self.state["branches"][branch]
-        if len(branch_state["pending"]) >= self.type_buffer_size:
+        if len(branch_state["pending"]) >= self.type_buffer_size or (
+            force_branch_evolve and branch_state["pending"]
+        ):
             _emit_progress(
                 progress_callback,
                 {
@@ -692,6 +689,29 @@ class HarnessTreeRunner:
                 },
             )
         return completed_tasks
+
+    def _flush_main_pending(self, *, progress_callback: Callable[[dict[str, Any]], None] | None) -> None:
+        if self.disable_main_evolve or not self.state.get("main_pending"):
+            return
+        _emit_progress(
+            progress_callback,
+            {
+                "phase": "train",
+                "event": "evolve_start",
+                "scope": "main",
+                "records": len(self.state.get("main_pending", [])),
+            },
+        )
+        self._evolve_main()
+        _emit_progress(
+            progress_callback,
+            {
+                "phase": "train",
+                "event": "evolve_done",
+                "scope": "main",
+                "updates_completed": len(self.state.get("main_evolutions", [])),
+            },
+        )
 
     def _run_solve_buffer_parallel(self, buffer: list[RoutedTask]) -> list[dict[str, Any]]:
         if not buffer:
@@ -849,7 +869,7 @@ def sanitize_branch_name(value: Any) -> str:
     if text.startswith("branch/"):
         text = text[len("branch/") :]
     text = text.lower()
-    text = re.sub(r"[^a-z0-9._-]+", "-", text)
+    text = re.sub(r"[^a-z0-9]+", "-", text)
     text = re.sub(r"[-.]+$", "", text).strip("-._")
     if not text:
         text = "general"
@@ -904,7 +924,7 @@ def _apply_overlay(workspace: Path, overlay_dir: Path) -> None:
     for source in files_dir.rglob("*"):
         if source.is_file():
             relative = source.relative_to(files_dir)
-            if _is_harness_relative(relative):
+            if _is_valid_harness_relative(relative):
                 target = workspace / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source, target)
@@ -952,8 +972,11 @@ def _harness_files(root: Path) -> set[Path]:
             files.add(Path(relative))
         elif path.is_dir():
             for child in path.rglob("*"):
-                if child.is_file() and not _ignored_generated_file(child):
-                    files.add(child.relative_to(root))
+                if not child.is_file() or _ignored_generated_file(child):
+                    continue
+                relative_path = child.relative_to(root)
+                if _is_valid_harness_relative(relative_path):
+                    files.add(relative_path)
     return files
 
 
@@ -990,6 +1013,19 @@ def _is_harness_relative(relative: Path) -> bool:
     if relative.is_absolute() or ".." in relative.parts:
         return False
     return bool(relative.parts) and relative.parts[0] in HARNESS_PATHS
+
+
+def _is_valid_harness_relative(relative: Path) -> bool:
+    if not _is_harness_relative(relative):
+        return False
+    if relative.parts[0] != "skills":
+        return True
+    return (
+        len(relative.parts) == 3
+        and relative.parts[1] not in {"", ".", ".."}
+        and not relative.parts[1].startswith(".")
+        and relative.parts[2] == "SKILL.md"
+    )
 
 
 def _extract_type_router_output(trajectory: Trajectory) -> tuple[dict[str, Any], str | None]:
