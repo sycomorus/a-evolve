@@ -434,6 +434,9 @@ def test_retailopt_task_can_index_and_call_read_json(
     assert "read_json" in captured["registry_tools"]
     assert "read_json" in captured["schema_names"]
     assert "read_json" in str(captured["system_prompt"])
+    assert "Code Summary For Evolution" in str(captured["system_prompt"])
+    assert "# EVOLVE_SUMMARY:" in str(captured["system_prompt"])
+    assert "# model_or_check:" in str(captured["system_prompt"])
     assert "answer_checker" not in captured["registry_tools"]
     assert "answer_checker" not in captured["schema_names"]
     assert "answer_checker" not in str(captured["system_prompt"])
@@ -704,6 +707,9 @@ def test_harness_tree_routes_buffers_and_final_eval_does_not_evolve(tmp_path: Pa
     assert result.details["tasks_completed"] == 3
     assert result.details["updates_completed"] == 3
     assert engine.evolved_scopes == ["alpha", "main", "beta"]
+    assert engine.trajectory_profiles == ["branch", "main", "branch"]
+    assert engine.prompt_log_dirs == [workspace / "evolution" / "evolver_prompts"] * 3
+    assert engine.prompt_log_scopes == ["branch_alpha", "main", "branch_beta"]
     assert sorted(state["branches"]) == ["branch/alpha", "branch/beta"]
     assert state["main_pending"] == []
     assert state["branches"]["branch/alpha"]["pending"] == []
@@ -804,6 +810,9 @@ def test_harness_tree_parallel_train_worker_error_is_recorded(tmp_path: Path) ->
 
     assert result.details["tasks_completed"] == 2
     assert engine.evolved_scopes == ["alpha", "main"]
+    assert engine.trajectory_profiles == ["branch", "main"]
+    assert engine.prompt_log_dirs == [workspace / "evolution" / "evolver_prompts"] * 2
+    assert engine.prompt_log_scopes == ["branch_alpha", "main"]
     assert [record["task_id"] for record in records] == ["alpha_error", "alpha_ok"]
     assert records[0]["feedback_detail"] == "RuntimeError: boom"
     assert records[0]["score"] == 0.0
@@ -934,6 +943,9 @@ def test_harness_tree_disable_main_evolve_isolates_branch_workspace(tmp_path: Pa
     assert state["main_evolutions"] == []
     assert state["main_pending"] == []
     assert engine.evolved_scopes == ["alpha"]
+    assert engine.trajectory_profiles == ["branch"]
+    assert engine.prompt_log_dirs == [workspace / "evolution" / "evolver_prompts"]
+    assert engine.prompt_log_scopes == ["branch_alpha"]
     assert not (workspace / "skills" / "domain-alpha").exists()
     assert not (workspace / "skills" / "leaked-main").exists()
     assert (workspace / "prompts" / "system.md").read_text(encoding="utf-8") == original_prompt
@@ -1238,15 +1250,24 @@ class FakeEngine:
     def __init__(self, workspace: Path) -> None:
         self.workspace = workspace
         self.evolved_scopes: list[str] = []
+        self.trajectory_profiles: list[str] = []
+        self.prompt_log_dirs: list[Path | None] = []
+        self.prompt_log_scopes: list[str | None] = []
 
     def evolve(
         self,
         workspace: AgentWorkspace,
         observation_logs: list[dict[str, Any]],
         evo_number: int = 0,
+        trajectory_profile: str = "main",
+        prompt_log_dir: Path | None = None,
+        prompt_log_scope: str | None = None,
     ) -> dict[str, Any]:
         scope = "main" if workspace.root == self.workspace.resolve() else workspace.root.name
         self.evolved_scopes.append(scope)
+        self.trajectory_profiles.append(trajectory_profile)
+        self.prompt_log_dirs.append(prompt_log_dir)
+        self.prompt_log_scopes.append(prompt_log_scope)
         if scope == "main":
             workspace.memory_dir.mkdir(parents=True, exist_ok=True)
             (workspace.memory_dir / "main.jsonl").write_text('{"content": "main"}\n', encoding="utf-8")
@@ -1266,8 +1287,18 @@ class LeakyEngine(FakeEngine):
         workspace: AgentWorkspace,
         observation_logs: list[dict[str, Any]],
         evo_number: int = 0,
+        trajectory_profile: str = "main",
+        prompt_log_dir: Path | None = None,
+        prompt_log_scope: str | None = None,
     ) -> dict[str, Any]:
-        result = super().evolve(workspace, observation_logs, evo_number=evo_number)
+        result = super().evolve(
+            workspace,
+            observation_logs,
+            evo_number=evo_number,
+            trajectory_profile=trajectory_profile,
+            prompt_log_dir=prompt_log_dir,
+            prompt_log_scope=prompt_log_scope,
+        )
         leaked_skill = self.workspace / "skills" / "leaked-main"
         leaked_skill.mkdir(parents=True, exist_ok=True)
         (leaked_skill / "SKILL.md").write_text(
@@ -1284,8 +1315,18 @@ class NoisySkillEngine(FakeEngine):
         workspace: AgentWorkspace,
         observation_logs: list[dict[str, Any]],
         evo_number: int = 0,
+        trajectory_profile: str = "main",
+        prompt_log_dir: Path | None = None,
+        prompt_log_scope: str | None = None,
     ) -> dict[str, Any]:
-        result = super().evolve(workspace, observation_logs, evo_number=evo_number)
+        result = super().evolve(
+            workspace,
+            observation_logs,
+            evo_number=evo_number,
+            trajectory_profile=trajectory_profile,
+            prompt_log_dir=prompt_log_dir,
+            prompt_log_scope=prompt_log_scope,
+        )
         if workspace.root == self.workspace.resolve():
             return result
         scope = workspace.root.name

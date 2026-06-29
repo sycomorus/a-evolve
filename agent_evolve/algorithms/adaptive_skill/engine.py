@@ -8,6 +8,7 @@ default EvolutionEngine implementation.
 from __future__ import annotations
 
 import logging
+import re
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -71,6 +72,13 @@ class AdaptiveSkillEngine(EvolutionEngine):
             scope_instruction=self.config.extra.get("scope_instruction"),
             evolution_instruction=self.config.extra.get("evolution_instruction"),
         )
+        prompt_snapshot_dir = _write_evolver_prompt_snapshot(
+            workspace_root=workspace.root,
+            evo_number=cycle_num,
+            scope="step",
+            system_prompt=DEFAULT_EVOLVER_SYSTEM_PROMPT,
+            user_prompt=prompt,
+        )
         response = self._run_llm(prompt, workspace.root)
 
         workspace.clear_drafts()
@@ -89,6 +97,7 @@ class AdaptiveSkillEngine(EvolutionEngine):
                 "skills_before": len(skills_before),
                 "skills_after": len(skills_after),
                 "new_skills": new_skills,
+                "prompt_snapshot_dir": str(prompt_snapshot_dir),
                 "usage": response.get("usage", {}),
             },
         )
@@ -98,6 +107,9 @@ class AdaptiveSkillEngine(EvolutionEngine):
         workspace: AgentWorkspace,
         observation_logs: list[dict[str, Any]],
         evo_number: int = 0,
+        trajectory_profile: str = "main",
+        prompt_log_dir: str | Path | None = None,
+        prompt_log_scope: str | None = None,
     ) -> dict[str, Any]:
         """Run one evolution pass outside the loop (for scripts/examples)."""
         vc = VersionControl(workspace.root)
@@ -128,6 +140,15 @@ class AdaptiveSkillEngine(EvolutionEngine):
             judge_llm=self.llm if self.config.trajectory_only else None,
             scope_instruction=self.config.extra.get("scope_instruction"),
             evolution_instruction=self.config.extra.get("evolution_instruction"),
+            trajectory_profile=trajectory_profile,
+        )
+        prompt_snapshot_dir = _write_evolver_prompt_snapshot(
+            workspace_root=workspace.root,
+            evo_number=evo_number,
+            scope=prompt_log_scope or trajectory_profile,
+            system_prompt=DEFAULT_EVOLVER_SYSTEM_PROMPT,
+            user_prompt=prompt,
+            prompt_log_dir=prompt_log_dir,
         )
         response = self._run_llm(prompt, workspace.root)
 
@@ -154,6 +175,7 @@ class AdaptiveSkillEngine(EvolutionEngine):
             "skills_before": len(skills_before),
             "skills_after": len(skills_after),
             "new_skills": new_skills,
+            "prompt_snapshot_dir": str(prompt_snapshot_dir),
             "usage": response.get("usage", {}),
         }
 
@@ -199,3 +221,35 @@ def _workspace_has_mutation(workspace_root: Path) -> bool:
         logger.warning("Could not inspect workspace mutation status: %s", result.stderr.strip())
         return False
     return bool(result.stdout.strip())
+
+
+def _write_evolver_prompt_snapshot(
+    *,
+    workspace_root: Path,
+    evo_number: int,
+    scope: str,
+    system_prompt: str,
+    user_prompt: str,
+    prompt_log_dir: str | Path | None = None,
+) -> Path:
+    """Persist the exact prompt payload sent to the evolver for audit/debugging."""
+    base_dir = Path(prompt_log_dir) if prompt_log_dir is not None else workspace_root / "evolution" / "evolver_prompts"
+    snapshot_dir = base_dir / f"evo_{evo_number:04d}_{_safe_prompt_scope(scope)}"
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+
+    full_prompt = (
+        "# Evolver Prompt Snapshot\n\n"
+        "## System Prompt\n\n"
+        f"{system_prompt}\n\n"
+        "## User Prompt\n\n"
+        f"{user_prompt}"
+    )
+    (snapshot_dir / "prompt.md").write_text(full_prompt, encoding="utf-8")
+    return snapshot_dir
+
+
+def _safe_prompt_scope(value: str) -> str:
+    text = str(value or "evolve").strip().lower()
+    text = re.sub(r"[^a-z0-9._-]+", "_", text)
+    text = re.sub(r"_+", "_", text).strip("._-")
+    return text or "evolve"

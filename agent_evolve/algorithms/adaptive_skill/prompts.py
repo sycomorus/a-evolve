@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any
 
 from ...contract.workspace import AgentWorkspace
@@ -11,6 +12,11 @@ from ...contract.workspace import AgentWorkspace
 logger = logging.getLogger(__name__)
 
 STANDARD_FEEDBACK_CHAR_LIMIT = 9000
+MAIN_CODE_SUMMARY_LIMIT = 500
+BRANCH_CODE_SUMMARY_LIMIT = 1400
+MAIN_OUTPUT_LIMIT = 500
+BRANCH_OUTPUT_LIMIT = 1200
+ARG_SUMMARY_LIMIT = 500
 
 DEFAULT_EVOLVER_SYSTEM_PROMPT = """\
 You are a meta-learning agent that improves another agent by modifying its workspace files.
@@ -155,6 +161,14 @@ def _jsonish(value: Any) -> str:
         return str(value)
 
 
+def _shorten_text(value: Any, limit: int) -> str:
+    text = _jsonish(value)
+    if len(text) <= limit:
+        return text
+    omitted = len(text) - limit
+    return f"{text[:limit]}...[truncated {omitted} chars]"
+
+
 def _parse_arguments(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
@@ -165,6 +179,290 @@ def _parse_arguments(value: Any) -> dict[str, Any]:
         except Exception:
             return {}
     return {}
+
+
+def _canonical_tool_events(conversation: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    events = [msg for msg in conversation if msg.get("type") in {"tool_call", "tool_output"}]
+    if events:
+        return events
+
+    # Backward compatibility for older observations that only stored chat-shaped
+    # assistant/tool turns. Canonical traces skip this branch and avoid double
+    # counting assistant_message.tool_calls.
+    converted: list[dict[str, Any]] = []
+    for msg in conversation:
+        role = msg.get("role", "")
+        if role == "assistant":
+            for tc in msg.get("tool_calls", []):
+                name, args = _tool_call_name_args(tc)
+                converted.append({
+                    "type": "tool_call",
+                    "id": str(tc.get("id", "")),
+                    "name": name,
+                    "arguments": args,
+                })
+        elif role == "tool":
+            converted.append({
+                "type": "tool_output",
+                "tool_call_id": str(msg.get("tool_call_id", "")),
+                "name": str(msg.get("name", "")),
+                "output": msg.get("content", ""),
+            })
+    return converted
+
+
+def _code_arg_name(tool_name: str, args: dict[str, Any]) -> str | None:
+    preferred = {
+        "run_solver": ("solver_code", "code"),
+        "execute_python": ("python_code", "code"),
+    }.get(tool_name, ())
+    for key in preferred:
+        if isinstance(args.get(key), str):
+            return key
+    return None
+
+
+def _summarize_args(tool_name: str, args: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    summarized: dict[str, Any] = {}
+    code_summary = None
+    code_key = _code_arg_name(tool_name, args)
+    for key, value in args.items():
+        if key == code_key and isinstance(value, str):
+            code_summary = _summarize_code(value, profile="main")
+            summarized[key] = f"<omitted {len(value)} chars; see code_summary>"
+            continue
+        if isinstance(value, (dict, list)):
+            summarized[key] = _shorten_text(value, ARG_SUMMARY_LIMIT)
+        elif isinstance(value, str):
+            summarized[key] = _shorten_text(value, ARG_SUMMARY_LIMIT)
+        else:
+            summarized[key] = value
+    return summarized, code_summary
+
+
+def _extract_evolve_summary(code: str, *, limit: int) -> dict[str, Any] | None:
+    marker = "# EVOLVE_SUMMARY:"
+    index = code.rfind(marker)
+    if index < 0:
+        return None
+
+    fields: dict[str, str] = {}
+    lines: list[str] = []
+    for raw_line in code[index:].splitlines()[1:]:
+        stripped = raw_line.strip()
+        if not stripped.startswith("#"):
+            if stripped:
+                break
+            continue
+        text = stripped[1:].strip()
+        if not text:
+            continue
+        lines.append(text)
+        if ":" in text:
+            key, value = text.split(":", 1)
+            normalized_key = key.strip().lower().replace(" ", "_")
+            if normalized_key in {"purpose", "data_inputs", "model_or_check", "objective_or_output"}:
+                fields[normalized_key] = value.strip()
+
+    summary_text = "\n".join(lines)
+    return {
+        "source": "EVOLVE_SUMMARY",
+        "chars": len(code),
+        "fields": fields,
+        "text": _shorten_text(summary_text, limit),
+    }
+
+
+def _summarize_code(code: str, *, profile: str) -> dict[str, Any]:
+    limit = BRANCH_CODE_SUMMARY_LIMIT if profile == "branch" else MAIN_CODE_SUMMARY_LIMIT
+    explicit = _extract_evolve_summary(code, limit=limit)
+    if explicit is not None:
+        return explicit
+
+    lines = code.splitlines()
+    imports = [
+        line.strip()
+        for line in lines
+        if line.lstrip().startswith(("import ", "from "))
+    ][: 12 if profile == "branch" else 5]
+    context_reads = _regex_unique(
+        r"['\"]((?:docs|data)/[^'\"]+)['\"]",
+        code,
+        limit=12 if profile == "branch" else 5,
+    )
+    modeling_patterns = (
+        "LpVariable",
+        "LpProblem",
+        "addVar",
+        "addVars",
+        "Model(",
+        ".addConstr",
+        ".add_constraint",
+        "constraint",
+        "objective",
+        "minimize",
+        "maximize",
+        ".optimize",
+        ".solve",
+    )
+    modeling = [
+        line.strip()
+        for line in lines
+        if any(pattern in line for pattern in modeling_patterns)
+    ][: 12 if profile == "branch" else 5]
+    outputs = [
+        line.strip()
+        for line in lines
+        if "print(" in line or "finalize" in line or "submitted_answer" in line
+    ][: 10 if profile == "branch" else 4]
+    return {
+        "source": "fallback_static",
+        "chars": len(code),
+        "imports": [_shorten_text(line, 160) for line in imports],
+        "context_reads": context_reads,
+        "modeling": [_shorten_text(line, 220) for line in modeling],
+        "outputs": [_shorten_text(line, 220) for line in outputs],
+    }
+
+
+def _regex_unique(pattern: str, text: str, *, limit: int) -> list[str]:
+    seen: set[str] = set()
+    items: list[str] = []
+    for match in re.findall(pattern, text):
+        value = str(match)
+        if value in seen:
+            continue
+        seen.add(value)
+        items.append(value)
+        if len(items) >= limit:
+            break
+    return items
+
+
+def _is_error_output(output: Any) -> bool:
+    text = _jsonish(output)
+    lowered = text.lower()
+    if any(marker in lowered[:1000] for marker in ("traceback", "error", "exception", "timed out", "timeout")):
+        return True
+    if isinstance(output, dict):
+        for key in ("solver_run", "python_run"):
+            run = output.get(key)
+            if isinstance(run, dict) and int(run.get("exit_code") or 0) != 0:
+                return True
+    return False
+
+
+def _output_status(output: Any) -> dict[str, Any]:
+    if not isinstance(output, dict):
+        return {}
+    status: dict[str, Any] = {}
+    for key in ("solver_run", "python_run"):
+        run = output.get(key)
+        if isinstance(run, dict):
+            if "exit_code" in run:
+                status["exit_code"] = run.get("exit_code")
+            if "status" in run:
+                status["status"] = run.get("status")
+            if isinstance(run.get("files_written"), list):
+                status["files_written"] = run.get("files_written")[:20]
+    for key in ("status", "exit_code", "files_written"):
+        if key in output and key not in status:
+            status[key] = output[key]
+    return status
+
+
+def _summarize_output(output: Any, *, profile: str) -> tuple[Any, str]:
+    limit = BRANCH_OUTPUT_LIMIT if profile == "branch" else MAIN_OUTPUT_LIMIT
+    if _is_error_output(output):
+        return _output_status(output), _shorten_text(output, limit)
+
+    status = _output_status(output)
+    if isinstance(output, dict):
+        snippets: dict[str, str] = {}
+        for run_key in ("solver_run", "python_run"):
+            run = output.get(run_key)
+            if not isinstance(run, dict):
+                continue
+            for stream in ("stdout", "stderr"):
+                text = str(run.get(stream) or "")
+                if text:
+                    snippets[f"{run_key}.{stream}_tail"] = _shorten_text(text[-limit:], limit)
+        if snippets:
+            return {**status, **snippets}, ""
+        if status:
+            return status, ""
+    text = _shorten_text(output, limit)
+    return text, ""
+
+
+def build_tool_trace(conversation: list[dict[str, Any]], profile: str = "main") -> list[dict[str, Any]]:
+    """Build a structured, bounded trace from canonical tool_call/tool_output events."""
+    if profile not in {"main", "branch"}:
+        profile = "main"
+
+    trace: list[dict[str, Any]] = []
+    pending_by_id: dict[str, dict[str, Any]] = {}
+    pending_without_id: list[dict[str, Any]] = []
+
+    for event in _canonical_tool_events(conversation):
+        event_type = event.get("type")
+        if event_type == "tool_call":
+            name = str(event.get("name", ""))
+            arguments = event.get("arguments", {})
+            args = arguments if isinstance(arguments, dict) else _parse_arguments(arguments)
+            summarized_args, code_summary = _summarize_args(name, args)
+            if code_summary is not None and profile == "branch":
+                code_key = _code_arg_name(name, args)
+                if code_key and isinstance(args.get(code_key), str):
+                    code_summary = _summarize_code(args[code_key], profile="branch")
+            entry: dict[str, Any] = {
+                "step": len(trace) + 1,
+                "tool": name,
+                "args": summarized_args,
+                "output": None,
+                "error": "",
+            }
+            if code_summary is not None:
+                entry["code_summary"] = code_summary
+            trace.append(entry)
+            event_id = str(event.get("id") or event.get("tool_call_id") or "")
+            if event_id:
+                pending_by_id[event_id] = entry
+            pending_without_id.append(entry)
+            continue
+
+        if event_type != "tool_output":
+            continue
+        output = event.get("output", event.get("content", ""))
+        entry = _matching_tool_entry(event, pending_by_id, pending_without_id)
+        if entry is None:
+            continue
+        entry["output"], entry["error"] = _summarize_output(output, profile=profile)
+
+    return trace
+
+
+def _matching_tool_entry(
+    event: dict[str, Any],
+    pending_by_id: dict[str, dict[str, Any]],
+    pending_without_id: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    tool_call_id = str(event.get("tool_call_id") or event.get("id") or "")
+    if tool_call_id and tool_call_id in pending_by_id:
+        entry = pending_by_id.pop(tool_call_id)
+        if entry in pending_without_id:
+            pending_without_id.remove(entry)
+        return entry
+
+    name = str(event.get("name", ""))
+    if name:
+        for entry in list(pending_without_id):
+            if entry.get("tool") == name:
+                pending_without_id.remove(entry)
+                return entry
+    if pending_without_id:
+        return pending_without_id.pop(0)
+    return None
 
 
 def _tool_call_name_args(tool_call: dict[str, Any]) -> tuple[str, dict[str, Any]]:
@@ -393,6 +691,7 @@ def build_evolution_prompt(
     judge_llm: Any | None = None,
     scope_instruction: str | None = None,
     evolution_instruction: str | None = None,
+    trajectory_profile: str = "main",
 ) -> str:
     """Build the user-message prompt for one evolution cycle.
 
@@ -420,7 +719,7 @@ def build_evolution_prompt(
             entry: dict[str, Any] = {
                 "task_id": log.get("task_id", ""),
                 "signals": signals,
-                "compressed_trajectory": _compress_trajectory(conversation),
+                "tool_trace": build_tool_trace(conversation, trajectory_profile),
             }
             if i < len(verdicts) and verdicts[i].get("score", -1) >= 0:
                 entry["judge_verdict"] = verdicts[i]
@@ -433,7 +732,7 @@ def build_evolution_prompt(
                 "score": log.get("score", 0.0),
                 "feedback": log.get("feedback_detail", "")[:STANDARD_FEEDBACK_CHAR_LIMIT],
                 "signals": _extract_trajectory_signals(conversation),
-                "compressed_trajectory": _compress_trajectory(conversation)[:2500],
+                "tool_trace": build_tool_trace(conversation, trajectory_profile),
             })
 
     skills = workspace.list_skills()
@@ -517,7 +816,8 @@ You can ONLY see the agent's actions. You do NOT have access to actual test resu
 
 Each task includes:
 - `signals`: automated behavioral metrics (turns, errors, timeouts, submission status, loops)
-- `compressed_trajectory`: failure-focused summary (approach, errors, loops, final actions)
+- `tool_trace`: structured tool calls and bounded outputs. Code tools include compact summaries
+  instead of full source.
 - `judge_verdict`: An LLM judge's assessment of whether the agent likely succeeded. Includes:
   - `score` (0-10): 0=complete failure, 5=partial, 10=likely solved
   - `category`: task type (build, debug, data-science, security, etc.)
@@ -539,7 +839,8 @@ def _build_standard_heading() -> str:
 Each task includes:
 - `success`, `score`, and `feedback`: real benchmark feedback from evaluation.
 - `signals`: automated behavior metrics extracted from the trajectory.
-- `compressed_trajectory`: failure-focused summary of approach, tool calls, errors, repeated actions, and final submission.
+- `tool_trace`: structured tool calls and bounded outputs. Code tools include compact summaries
+  instead of full source.
 
 If `feedback` includes `Reference solution code`, it is private oracle information shown only to you, the evolver, to diagnose the correct modeling approach. The execution agent cannot see oracle files or reference_solution.py. Do NOT write evolved prompts, skills, memory, tools, or summaries that tell the agent to consult oracle/reference_solution.py or otherwise rely on hidden oracle files.
 

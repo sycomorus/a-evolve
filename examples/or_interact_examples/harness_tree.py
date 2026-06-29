@@ -799,6 +799,9 @@ class HarnessTreeRunner:
                 self.agent.workspace,
                 observation_logs=buffer,
                 evo_number=self.evolve_number,
+                trajectory_profile="main",
+                prompt_log_dir=self.workspace_root / "evolution" / "evolver_prompts",
+                prompt_log_scope="main",
             )
         self.state["main_pending"] = []
         self.state.setdefault("main_evolutions", []).append(result)
@@ -826,6 +829,9 @@ class HarnessTreeRunner:
                     phase_agent.workspace,
                     observation_logs=buffer,
                     evo_number=self.evolve_number,
+                    trajectory_profile="branch",
+                    prompt_log_dir=self.workspace_root / "evolution" / "evolver_prompts",
+                    prompt_log_scope=f"branch_{_branch_slug(branch)}",
                 )
         finally:
             self._restore_base_harness_snapshot()

@@ -5,7 +5,7 @@ from copy import deepcopy
 from pathlib import Path
 
 from agent_evolve.algorithms.adaptive_skill.engine import AdaptiveSkillEngine
-from agent_evolve.algorithms.adaptive_skill.prompts import build_evolution_prompt
+from agent_evolve.algorithms.adaptive_skill.prompts import build_evolution_prompt, build_tool_trace
 from agent_evolve.algorithms.adaptive_skill.tools import (
     WORKSPACE_BASH_OUTPUT_CHAR_LIMIT,
     create_default_llm,
@@ -50,7 +50,13 @@ def _openai_compat_provider(responses) -> OpenAICompatProvider:
     return provider
 
 
-def test_standard_prompt_includes_real_feedback_and_compressed_trajectory(tmp_path: Path) -> None:
+def _prompt_summaries(prompt: str) -> list[dict]:
+    start = prompt.index("```json") + len("```json")
+    end = prompt.index("```", start)
+    return json.loads(prompt[start:end])
+
+
+def test_standard_prompt_includes_real_feedback_and_tool_trace(tmp_path: Path) -> None:
     workspace = AgentWorkspace(tmp_path)
     conversation = [
         {
@@ -66,7 +72,18 @@ def test_standard_prompt_includes_real_feedback_and_compressed_trajectory(tmp_pa
         {
             "type": "tool_call",
             "name": "run_solver",
-            "arguments": {"code": "raise ValueError('bad model')"},
+            "arguments": {
+                "solver_code": (
+                    "import pulp\n"
+                    "print('start')\n"
+                    "raise ValueError('bad model')\n"
+                    "# EVOLVE_SUMMARY:\n"
+                    "# purpose: reproduce bad model\n"
+                    "# data_inputs: docs/business_requirement.md\n"
+                    "# model_or_check: infeasible LP smoke test\n"
+                    "# objective_or_output: exception before objective\n"
+                )
+            },
         },
         {
             "type": "tool_output",
@@ -101,13 +118,70 @@ def test_standard_prompt_includes_real_feedback_and_compressed_trajectory(tmp_pa
     assert "Failure reason: outside relative tolerance" in prompt
     assert "private oracle information shown only to you" in prompt
     assert "Do NOT write evolved prompts, skills, memory, tools, or summaries" in prompt
-    assert "compressed_trajectory" in prompt
+    assert "tool_trace" in prompt
+    assert "compressed_trajectory" not in prompt
     assert "signals" in prompt
     assert "read_csv" in prompt
     assert "run_solver" in prompt
     assert "Traceback: bad model" in prompt
+    assert "reproduce bad model" in prompt
+    assert "raise ValueError" not in prompt
     assert '"submitted": true' in prompt
-    assert "[submitted] 123" in prompt
+    summaries = _prompt_summaries(prompt)
+    trace = summaries[0]["tool_trace"]
+    assert [step["tool"] for step in trace] == ["read_csv", "run_solver", "finalize"]
+    assert trace[1]["code_summary"]["source"] == "EVOLVE_SUMMARY"
+    assert trace[2]["args"]["objective_value"] == 123
+
+
+def test_tool_trace_uses_canonical_events_without_assistant_double_count() -> None:
+    trace = build_tool_trace(
+        [
+            {
+                "type": "assistant_message",
+                "content": "call tool",
+                "tool_calls": [
+                    {"function": {"name": "read_csv", "arguments": json.dumps({"relative_file": "data/a.csv"})}}
+                ],
+            },
+            {"type": "tool_call", "name": "read_csv", "arguments": {"relative_file": "data/a.csv"}},
+            {"type": "tool_output", "name": "read_csv", "output": {"rows": 2}},
+        ]
+    )
+
+    assert len(trace) == 1
+    assert trace[0]["tool"] == "read_csv"
+
+
+def test_tool_trace_redacts_code_and_uses_branch_summary_detail() -> None:
+    large_code = "\n".join(
+        [
+            "import pulp",
+            "from pathlib import Path",
+            "raw = Path('docs/business_requirement.md').read_text()",
+            "model = pulp.LpProblem('x')",
+            "x = pulp.LpVariable('x', lowBound=0)",
+            "model += x",
+            "model.solve()",
+            "print(pulp.value(x))",
+        ]
+        + [f"print('line {i}')" for i in range(100)]
+    )
+    conversation = [
+        {"type": "tool_call", "name": "run_solver", "arguments": {"solver_code": large_code}},
+        {"type": "tool_output", "name": "run_solver", "output": {"solver_run": {"exit_code": 0, "stdout": "x" * 5000}}},
+    ]
+
+    main_trace = build_tool_trace(conversation, profile="main")
+    branch_trace = build_tool_trace(conversation, profile="branch")
+
+    assert large_code not in json.dumps(main_trace)
+    assert large_code not in json.dumps(branch_trace)
+    assert main_trace[0]["args"]["solver_code"].startswith("<omitted")
+    assert branch_trace[0]["code_summary"]["source"] == "fallback_static"
+    assert "docs/business_requirement.md" in branch_trace[0]["code_summary"]["context_reads"]
+    assert len(json.dumps(branch_trace[0]["code_summary"])) > len(json.dumps(main_trace[0]["code_summary"]))
+    assert "x" * 5000 not in json.dumps(main_trace)
 
 
 def test_standard_prompt_keeps_reference_solution_feedback(tmp_path: Path) -> None:
@@ -317,3 +391,9 @@ def test_adaptive_skill_step_marks_prompt_diff_as_mutation(tmp_path: Path) -> No
     )
 
     assert result.mutated is True
+    prompt_dir = Path(result.metadata["prompt_snapshot_dir"])
+    assert prompt_dir == tmp_path / "evolution" / "evolver_prompts" / "evo_0001_step"
+    assert (prompt_dir / "prompt.md").is_file()
+    assert {path.name for path in prompt_dir.iterdir()} == {"prompt.md"}
+    assert "## System Prompt" in (prompt_dir / "prompt.md").read_text(encoding="utf-8")
+    assert "## User Prompt" in (prompt_dir / "prompt.md").read_text(encoding="utf-8")
