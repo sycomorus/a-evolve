@@ -43,7 +43,7 @@ FORBIDDEN_TOOL_STRINGS = (
 )
 TASK_CATEGORY_ENV = "OR_INTERACT_TASK_CATEGORY"
 OR_INTERACT_SETTINGS_FILE = "or_interact_settings.json"
-RESERVED_DYNAMIC_TOOL_NAMES = {"ask_user", "run_heuristic"}
+RESERVED_DYNAMIC_TOOL_NAMES = {"ask_user", "list_skills", "read_skill", "run_heuristic"}
 HEURISTIC_PROMPT_EXTENSION = """\
 ## Heuristic Algorithm Evolution
 
@@ -88,7 +88,12 @@ class ORReactAgent(BaseAgent):
     def solve(self, task: Task) -> Trajectory:
         runtime_dir, trace = self.start_task_run(task)
         start = time.monotonic()
-        result = self.run_phase(task, runtime_dir=runtime_dir, trace=trace)
+        result = self.run_phase(
+            task,
+            runtime_dir=runtime_dir,
+            trace=trace,
+            enable_skill_tools=True,
+        )
         elapsed = time.monotonic() - start
         return self.finish_task_run(
             task,
@@ -115,11 +120,13 @@ class ORReactAgent(BaseAgent):
         system_prompt: str | None = None,
         max_turns: int | None = None,
         stop_after_tools: set[str] | None = None,
+        enable_skill_tools: bool = False,
     ) -> AgentResult:
         task_dir = Path(task.metadata["task_dir"]).resolve()
         configure_environment(context_dir=task_dir, runtime_dir=runtime_dir)
         registry = self._build_registry(
             include_type_router=phase.endswith(":route"),
+            include_skill_tools=enable_skill_tools,
             task_dir=task_dir,
         )
         self.registry = registry
@@ -130,7 +137,8 @@ class ORReactAgent(BaseAgent):
                         config=self.config,
                         trace=trace,
                         registry=registry,
-                        system_prompt=system_prompt or self._build_system_prompt(),
+                        system_prompt=system_prompt
+                        or self._build_system_prompt(enable_skill_tools=enable_skill_tools),
                     ).run(
                         initial_messages=initial_messages,
                         user_message=user_message,
@@ -238,7 +246,7 @@ class ORReactAgent(BaseAgent):
             user_simulator=base.user_simulator,
         )
 
-    def _build_system_prompt(self) -> str:
+    def _build_system_prompt(self, *, enable_skill_tools: bool = False) -> str:
         hook = self.harness_hook("build_system_prompt")
         if hook:
             return hook(self.system_prompt, self.skills, self.memories, self.registry)
@@ -251,6 +259,11 @@ class ORReactAgent(BaseAgent):
         skill_catalog = self._skill_catalog()
         if skill_catalog:
             sections.append("## Evolved Skill Catalog\n" + skill_catalog)
+            if enable_skill_tools:
+                sections.append(
+                    "Use `list_skills` to inspect available skills and `read_skill(name)` "
+                    "to load a skill's full SKILL.md content when it is relevant."
+                )
 
         memory_catalog = self._memory_catalog()
         if memory_catalog:
@@ -288,6 +301,7 @@ class ORReactAgent(BaseAgent):
         self,
         *,
         include_type_router: bool = False,
+        include_skill_tools: bool = False,
         task_dir: str | Path | None = None,
     ) -> ToolRegistry:
         user_config = (
@@ -306,6 +320,24 @@ class ORReactAgent(BaseAgent):
                 description=RUN_HEURISTIC_DESCRIPTION,
                 metadata={"source": "or_interact_settings"},
             )
+        if include_skill_tools and self.skills:
+            registry.add_tool(
+                name="list_skills",
+                function=self._tool_list_skills,
+                description=(
+                    "List evolved workspace skills available for this run. "
+                    "Returns skill names, workspace-relative paths, and descriptions."
+                ),
+                metadata={"source": "workspace_skills"},
+            )
+            registry.add_tool(
+                name="read_skill",
+                function=self._tool_read_skill,
+                description=(
+                    "Read the full SKILL.md content for one evolved workspace skill by name."
+                ),
+                metadata={"source": "workspace_skills"},
+            )
         for entry in self.workspace.read_tool_registry():
             if entry.get("kind") == "seed":
                 continue
@@ -321,6 +353,38 @@ class ORReactAgent(BaseAgent):
             spec = self._load_evolved_tool(entry)
             registry.register(spec, overwrite=True)
         return registry
+
+    def _tool_list_skills(self) -> dict[str, Any]:
+        skills = []
+        for skill in self.skills:
+            path = skill.path or f"skills/{skill.name}"
+            name = Path(path).name
+            skills.append(
+                {
+                    "name": name,
+                    "path": path,
+                    "description": skill.description,
+                }
+            )
+        return {"skills": skills, "count": len(skills)}
+
+    def _tool_read_skill(self, name: str) -> dict[str, Any]:
+        available = [entry["name"] for entry in self._tool_list_skills()["skills"]]
+        if name not in available:
+            return {
+                "error": "skill_not_found",
+                "name": name,
+                "available_skills": available,
+            }
+
+        path = self.workspace.skills_dir / name / "SKILL.md"
+        if not path.is_file():
+            return {
+                "error": "skill_not_found",
+                "name": name,
+                "available_skills": available,
+            }
+        return {"name": name, "content": path.read_text(encoding="utf-8")}
 
     def _load_or_interact_settings(self) -> dict[str, Any]:
         path = self.workspace.root / OR_INTERACT_SETTINGS_FILE

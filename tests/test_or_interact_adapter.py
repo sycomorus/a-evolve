@@ -187,6 +187,7 @@ def test_agent_prompt_uses_catalog_without_harness_tree_router(tmp_path: Path, m
         def __init__(self, *, config, trace, registry, system_prompt):
             captured["system_prompt"] = system_prompt
             captured["tools"] = registry.list_tools()
+            captured["read_skill"] = registry.call("read_skill", name="modeling")
 
         def run(self, **kwargs):
             from baseline.react.agent import AgentResult
@@ -204,8 +205,15 @@ def test_agent_prompt_uses_catalog_without_harness_tree_router(tmp_path: Path, m
     assert "answer_checker" not in prompt
     assert "Prefer explicit variable bounds." not in prompt
     assert "modeling; description=Test skill" in prompt
+    assert "Use `list_skills` to inspect available skills" in prompt
     assert "memory:1 category=memories; content=Check objective direction before finalizing." in prompt
     assert "diagnose" in captured["tools"]
+    assert "list_skills" in captured["tools"]
+    assert "read_skill" in captured["tools"]
+    read_skill = captured["read_skill"]
+    assert isinstance(read_skill, dict)
+    assert read_skill["name"] == "modeling"
+    assert "Prefer explicit variable bounds." in read_skill["content"]
     assert "type_router" not in captured["tools"]
     assert "answer_checker" not in captured["tools"]
     assert "run_heuristic" not in captured["tools"]
@@ -365,6 +373,46 @@ def test_type_router_is_available_only_for_route_phase(monkeypatch: pytest.Monke
     schemas = {schema["function"]["name"]: schema for schema in tool_schemas(route_registry)}
     router_parameters = schemas["type_router"]["function"]["parameters"]["properties"]
     assert router_parameters["existing_branches"]["type"] == "array"
+
+
+def test_skill_tools_are_disabled_for_direct_phases_by_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = _workspace(tmp_path / "workspace")
+    _write_skill(workspace, "modeling", "Prefer explicit variable bounds.")
+    _copy_harness_tool(workspace, "type_router")
+    _write_registry(workspace, [{"name": "type_router", "file": "type_router.py", "function": "type_router"}])
+    captured: dict[str, object] = {}
+
+    class FakeReActAgent:
+        def __init__(self, *, config, trace, registry, system_prompt):
+            captured["tools"] = registry.list_tools()
+            captured["system_prompt"] = system_prompt
+
+        def run(self, **kwargs):
+            return AgentResult(status="success", turns=1, objective_value=1)
+
+    monkeypatch.setattr("agent_evolve.agents.or_interact.react_agent.ReActAgent", FakeReActAgent)
+    agent = ORReactAgent(workspace)
+    task = Task(id="task_x", input="", metadata={"task_dir": str(_visible_task(tmp_path)), "dataset": "IndustryOR"})
+
+    agent.run_phase(
+        task,
+        runtime_dir=tmp_path / "runs",
+        trace=TraceWriter(tmp_path / "runs"),
+        phase="train:route",
+    )
+
+    assert "type_router" in captured["tools"]
+    assert "list_skills" not in captured["tools"]
+    assert "read_skill" not in captured["tools"]
+    assert "Use `list_skills` to inspect available skills" not in str(captured["system_prompt"])
+
+    direct_registry = agent._build_registry(include_skill_tools=True)
+    assert "type_router" not in direct_registry.list_tools()
+    assert "list_skills" in direct_registry.list_tools()
+    assert "read_skill" in direct_registry.list_tools()
 
 
 def test_answer_checker_is_not_registered_even_when_env_is_set(monkeypatch: pytest.MonkeyPatch) -> None:
