@@ -57,19 +57,6 @@ algorithms, while still requiring final answers to be submitted with
 `run_heuristic` is a built-in runtime tool supplied by the harness. Do not
 create, modify, or register workspace files named `tools/run_heuristic.py`.
 """
-EVOLVE_SUMMARY_PROMPT_EXTENSION = """\
-## Code Summary For Evolution
-
-When calling `run_solver` or `execute_python`, append this short comment block
-at the end of the submitted code. Keep it factual and compact; it helps later
-evolution summarize task observations without storing full code in prompts.
-
-# EVOLVE_SUMMARY:
-# purpose: ...
-# data_inputs: ...
-# model_or_check: ...
-# objective_or_output: ...
-"""
 
 
 class ORReactAgent(BaseAgent):
@@ -252,7 +239,6 @@ class ORReactAgent(BaseAgent):
             return hook(self.system_prompt, self.skills, self.memories, self.registry)
 
         sections = [self.system_prompt.strip()]
-        sections.append(EVOLVE_SUMMARY_PROMPT_EXTENSION.strip())
         if self._heuristic_enabled():
             sections.append(HEURISTIC_PROMPT_EXTENSION.strip())
 

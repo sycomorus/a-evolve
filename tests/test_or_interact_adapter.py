@@ -482,9 +482,6 @@ def test_retailopt_task_can_index_and_call_read_json(
     assert "read_json" in captured["registry_tools"]
     assert "read_json" in captured["schema_names"]
     assert "read_json" in str(captured["system_prompt"])
-    assert "Code Summary For Evolution" in str(captured["system_prompt"])
-    assert "# EVOLVE_SUMMARY:" in str(captured["system_prompt"])
-    assert "# model_or_check:" in str(captured["system_prompt"])
     assert "answer_checker" not in captured["registry_tools"]
     assert "answer_checker" not in captured["schema_names"]
     assert "answer_checker" not in str(captured["system_prompt"])
