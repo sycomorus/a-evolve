@@ -247,8 +247,10 @@ class ORReactAgent(BaseAgent):
             sections.append("## Evolved Skill Catalog\n" + skill_catalog)
             if enable_skill_tools:
                 sections.append(
-                    "Use `list_skills` to inspect available skills and `read_skill(name)` "
-                    "to load a skill's full SKILL.md content when it is relevant."
+                    "Skills live in the evolved workspace, not in the benchmark task "
+                    "context. Use `list_skills` to inspect available skills and "
+                    "`read_skill(name)` to load a skill's full SKILL.md content when "
+                    "it is relevant."
                 )
 
         memory_catalog = self._memory_catalog()
@@ -278,9 +280,7 @@ class ORReactAgent(BaseAgent):
         lines = []
         for skill in self.skills:
             description = " ".join(skill.description.split())
-            lines.append(
-                f"- {skill.path or skill.name}: {skill.name}; description={description}"
-            )
+            lines.append(f"- {skill.name}; description={description}")
         return "\n".join(lines)
 
     def _build_registry(
@@ -355,6 +355,7 @@ class ORReactAgent(BaseAgent):
         return {"skills": skills, "count": len(skills)}
 
     def _tool_read_skill(self, name: str) -> dict[str, Any]:
+        name = _normalize_skill_name(name)
         available = [entry["name"] for entry in self._tool_list_skills()["skills"]]
         if name not in available:
             return {
@@ -442,6 +443,28 @@ class ORReactAgent(BaseAgent):
 
 def _is_evolved_tool_entry(entry: dict[str, Any]) -> bool:
     return bool(entry.get("name")) and (bool(entry.get("file")) or bool(entry.get("module")))
+
+
+def _normalize_skill_name(name: str | Path) -> str:
+    text = str(name).strip()
+    path = Path(text)
+    if path.parts and path.parts[0] == "skills":
+        return _workspace_skill_name_from_path(path) or path.name
+    if path.name == "SKILL.md" and path.parent.name:
+        return path.parent.name
+    return text
+
+
+def _workspace_skill_name_from_path(file: str | Path) -> str | None:
+    path = Path(str(file).strip())
+    if path.is_absolute() or ".." in path.parts:
+        return None
+    parts = path.parts
+    if len(parts) == 3 and parts[0] == "skills" and parts[2] == "SKILL.md":
+        name = parts[1]
+        if name and not name.startswith("."):
+            return name
+    return None
 
 
 @contextmanager

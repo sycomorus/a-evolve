@@ -188,6 +188,8 @@ def test_agent_prompt_uses_catalog_without_harness_tree_router(tmp_path: Path, m
             captured["system_prompt"] = system_prompt
             captured["tools"] = registry.list_tools()
             captured["read_skill"] = registry.call("read_skill", name="modeling")
+            captured["read_skill_by_path"] = registry.call("read_skill", name="skills/modeling/SKILL.md")
+            captured["read_md_task"] = registry.call("read_md", file="docs/business_requirement.md")
 
         def run(self, **kwargs):
             from baseline.react.agent import AgentResult
@@ -204,8 +206,10 @@ def test_agent_prompt_uses_catalog_without_harness_tree_router(tmp_path: Path, m
     assert "type_router" not in prompt
     assert "answer_checker" not in prompt
     assert "Prefer explicit variable bounds." not in prompt
+    assert "skills/modeling" not in prompt
     assert "modeling; description=Test skill" in prompt
     assert "Use `list_skills` to inspect available skills" in prompt
+    assert "Skills live in the evolved workspace" in prompt
     assert "memory:1 category=memories; content=Check objective direction before finalizing." in prompt
     assert "diagnose" in captured["tools"]
     assert "list_skills" in captured["tools"]
@@ -214,6 +218,13 @@ def test_agent_prompt_uses_catalog_without_harness_tree_router(tmp_path: Path, m
     assert isinstance(read_skill, dict)
     assert read_skill["name"] == "modeling"
     assert "Prefer explicit variable bounds." in read_skill["content"]
+    read_skill_by_path = captured["read_skill_by_path"]
+    assert isinstance(read_skill_by_path, dict)
+    assert read_skill_by_path["name"] == "modeling"
+    assert "Prefer explicit variable bounds." in read_skill_by_path["content"]
+    read_md_task = captured["read_md_task"]
+    assert isinstance(read_md_task, dict)
+    assert read_md_task["markdown"]["content"] == "Task"
     assert "type_router" not in captured["tools"]
     assert "answer_checker" not in captured["tools"]
     assert "run_heuristic" not in captured["tools"]
@@ -775,6 +786,21 @@ def test_harness_tree_routes_buffers_and_final_eval_does_not_evolve(tmp_path: Pa
         "batch_0003_branch_beta.jsonl",
     ]
     assert [len(path.read_text(encoding="utf-8").splitlines()) for path in observation_files] == [2, 3, 1]
+    observation_records = [
+        json.loads(line)
+        for path in observation_files
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    phase_skill_tool_flags = [
+        (step.get("phase"), step.get("enable_skill_tools"))
+        for record in observation_records
+        for step in record["conversation"]
+        if step.get("type") == "assistant_message"
+    ]
+    assert any(phase.endswith(":route") and enabled is False for phase, enabled in phase_skill_tool_flags)
+    assert not any(phase.endswith(":route") and enabled is True for phase, enabled in phase_skill_tool_flags)
+    assert any(phase.endswith(":solve") and enabled is True for phase, enabled in phase_skill_tool_flags)
     assert [event["event"] for event in progress_events].count("task_done") == 3
     assert any(event.get("event") == "evolve_done" and event.get("scope") == "main" for event in progress_events)
     assert (workspace / "memory" / "main.jsonl").is_file()
@@ -1336,6 +1362,7 @@ class FakeAgent:
         system_prompt: str | None = None,
         max_turns: int | None = None,
         stop_after_tools: set[str] | None = None,
+        enable_skill_tools: bool = False,
     ) -> AgentResult:
         self.phases.append(phase)
         messages = list(initial_messages or [{"role": "system", "content": "fake"}])
@@ -1364,7 +1391,15 @@ class FakeAgent:
                 branch_name = f"branch/{label}"
                 confidence = 0.95
                 rationale = f"{label} evidence"
-            trace.event("assistant_message", {"phase": phase, "content": "routing", "tool_calls": []})
+            trace.event(
+                "assistant_message",
+                {
+                    "phase": phase,
+                    "content": "routing",
+                    "tool_calls": [],
+                    "enable_skill_tools": enable_skill_tools,
+                },
+            )
             trace.event(
                 "tool_output",
                 {
@@ -1393,7 +1428,15 @@ class FakeAgent:
             raise RuntimeError("boom")
         assert initial_messages, "solve phase should inherit route messages"
         time.sleep(0.05)
-        trace.event("assistant_message", {"phase": phase, "content": "solving", "tool_calls": []})
+        trace.event(
+            "assistant_message",
+            {
+                "phase": phase,
+                "content": "solving",
+                "tool_calls": [],
+                "enable_skill_tools": enable_skill_tools,
+            },
+        )
         return AgentResult(status="success", turns=1, objective_value=1, messages=messages)
 
     def finish_task_run(

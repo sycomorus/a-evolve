@@ -647,6 +647,7 @@ class HarnessTreeRunner:
                     confidence=decision.confidence,
                     rationale=decision.rationale or "n/a",
                 ),
+                enable_skill_tools=True,
             )
             elapsed = (datetime.now() - started_at).total_seconds()
             trajectory = phase_agent.finish_task_run(
@@ -1741,6 +1742,7 @@ def _run_solve_worker(
                 confidence=decision.confidence,
                 rationale=decision.rationale or "n/a",
             ),
+            enable_skill_tools=True,
         )
         elapsed = (datetime.now() - started_at).total_seconds()
         trajectory = phase_agent.finish_task_run(
