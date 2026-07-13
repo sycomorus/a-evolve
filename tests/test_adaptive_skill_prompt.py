@@ -116,8 +116,7 @@ def test_standard_prompt_includes_real_feedback_and_tool_trace(tmp_path: Path) -
 
     assert "real benchmark feedback" in prompt
     assert "Failure reason: outside relative tolerance" in prompt
-    assert "private oracle information shown only to you" in prompt
-    assert "Do NOT write evolved prompts, skills, memory, tools, or summaries" in prompt
+    assert "Oracle/reference values, reference paths, and reference code are not available" in prompt
     assert "tool_trace" in prompt
     assert "compressed_trajectory" not in prompt
     assert "signals" in prompt
@@ -184,7 +183,7 @@ def test_tool_trace_redacts_code_and_uses_branch_summary_detail() -> None:
     assert "x" * 5000 not in json.dumps(main_trace)
 
 
-def test_standard_prompt_keeps_reference_solution_feedback(tmp_path: Path) -> None:
+def test_standard_prompt_redacts_reference_solution_feedback(tmp_path: Path) -> None:
     workspace = AgentWorkspace(tmp_path)
     reference_tail = "REFERENCE_SOLVER_MODEL_FORMULATION"
     logs = [
@@ -212,7 +211,59 @@ def test_standard_prompt_keeps_reference_solution_feedback(tmp_path: Path) -> No
         trajectory_only=False,
     )
 
-    assert reference_tail in prompt
+    assert reference_tail not in prompt
+    assert "Reference solution code" not in prompt
+    assert "Failure reason: outside relative tolerance" in prompt
+
+
+def test_standard_prompt_includes_redacted_step_opsd_signal(tmp_path: Path) -> None:
+    workspace = AgentWorkspace(tmp_path)
+    logs = [
+        {
+            "task_id": "task_001",
+            "success": False,
+            "score": 0.0,
+            "feedback_detail": "Expected objective: 123\nFailure reason: outside relative tolerance",
+            "conversation": [],
+            "trace_views": {
+                "evolve_compressed": {
+                    "key_tool_sequence": ["read_csv", "run_solver", "finalize"],
+                    "failure_summary": "Failure reason: outside relative tolerance",
+                    "teacher_marked_steps": [],
+                }
+            },
+            "step_opsd": {
+                "redaction_status": "passed",
+                "teacher_review": {
+                    "overall_diagnosis": "The submitted quantity uses the wrong unit.",
+                    "step_reviews": [
+                        {
+                            "step_id": "t002",
+                            "phase": "solver_execution",
+                            "credit": "negative",
+                            "error_type": "wrong_quantity",
+                            "reason": "The solver proxy objective was submitted directly.",
+                            "better_next_action": "Compute the requested final quantity before finalizing.",
+                        }
+                    ],
+                    "missed_steps": [],
+                },
+            },
+        }
+    ]
+
+    prompt = build_evolution_prompt(
+        workspace=workspace,
+        logs=logs,
+        drafts=[],
+        evo_number=1,
+        trajectory_only=False,
+    )
+
+    assert "Step-OPSD Batch Summary" in prompt
+    assert "wrong_quantity" in prompt
+    assert "Expected objective: <redacted>" in prompt
+    assert "Expected objective: 123" not in prompt
 
 
 def test_evolution_prompt_includes_run_specific_instruction_only_when_given(

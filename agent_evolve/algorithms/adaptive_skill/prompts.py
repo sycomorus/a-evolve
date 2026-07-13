@@ -8,6 +8,11 @@ import re
 from typing import Any
 
 from ...contract.workspace import AgentWorkspace
+from ..step_opsd import (
+    redacted_step_opsd_for_evolver,
+    sanitize_feedback_detail,
+    summarize_step_opsd_batch,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -726,14 +731,28 @@ def build_evolution_prompt(
             summaries.append(entry)
         else:
             conversation = log.get("conversation", [])
-            summaries.append({
+            entry = {
                 "task_id": log.get("task_id", ""),
                 "success": log.get("success", False),
                 "score": log.get("score", 0.0),
-                "feedback": log.get("feedback_detail", "")[:STANDARD_FEEDBACK_CHAR_LIMIT],
+                "feedback": sanitize_feedback_detail(
+                    log.get("feedback_detail", "")
+                )[:STANDARD_FEEDBACK_CHAR_LIMIT],
                 "signals": _extract_trajectory_signals(conversation),
                 "tool_trace": build_tool_trace(conversation, trajectory_profile),
-            })
+            }
+            trace_views = log.get("trace_views", {})
+            compressed = (
+                trace_views.get("evolve_compressed")
+                if isinstance(trace_views, dict)
+                else None
+            )
+            if isinstance(compressed, dict):
+                entry["evolve_compressed"] = compressed
+            step_opsd = redacted_step_opsd_for_evolver(log)
+            if step_opsd is not None:
+                entry["step_opsd"] = step_opsd
+            summaries.append(entry)
 
     skills = workspace.list_skills()
     skill_names = [s.name for s in skills]
@@ -781,6 +800,17 @@ def build_evolution_prompt(
         evolution_instruction_section = (
             f"\n\n### Run-Specific Evolution Guidance\n{evolution_instruction}"
         )
+    step_opsd_batch = summarize_step_opsd_batch(recent_logs)
+    step_opsd_section = ""
+    if step_opsd_batch is not None:
+        step_opsd_section = (
+            "\n\n### Step-OPSD Batch Summary\n"
+            "This section contains only redacted teacher-derived signals. "
+            "Do not infer or write task-specific oracle/reference content.\n"
+            "```json\n"
+            f"{json.dumps(step_opsd_batch, indent=2, ensure_ascii=False)}\n"
+            "```"
+        )
 
     return f"""\
 ## Evolution Cycle #{evo_number}
@@ -794,6 +824,7 @@ def build_evolution_prompt(
 ```json
 {json.dumps(summaries, indent=2)}
 ```
+{step_opsd_section}
 
 ### Draft Skills
 {draft_section}
@@ -841,10 +872,12 @@ Each task includes:
 - `signals`: automated behavior metrics extracted from the trajectory.
 - `tool_trace`: structured tool calls and bounded outputs. Code tools include compact summaries
   instead of full source.
+- When Step-OPSD is enabled, `evolve_compressed`, `step_opsd`, and the batch summary contain
+  redacted teacher-derived diagnosis for reusable harness evolution.
 
-If `feedback` includes `Reference solution code`, it is private oracle information shown only to you, the evolver, to diagnose the correct modeling approach. The execution agent cannot see oracle files or reference_solution.py. Do NOT write evolved prompts, skills, memory, tools, or summaries that tell the agent to consult oracle/reference_solution.py or otherwise rely on hidden oracle files.
-
-Use the real feedback to identify which tasks failed, then use the trajectory fields and any private reference solution to diagnose why they failed before changing prompts, skills, memory, or tools."""
+Oracle/reference values, reference paths, and reference code are not available to you. Use only
+the redacted feedback, trajectory fields, and redacted Teacher output to identify reusable
+patterns before changing prompts, skills, memory, or tools."""
 
 
 def _build_trajectory_only_instructions(current_skill_count: int, max_skills: int = 5, protect_skills: bool = False) -> str:

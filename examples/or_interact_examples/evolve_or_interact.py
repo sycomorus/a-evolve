@@ -80,6 +80,7 @@ def main() -> int:
             "evolver_base_url": evolver_base_url,
             "evolver_api_key": evolver_api_key,
             "evolver_temperature": evolver_temperature,
+            "step_opsd_enabled": args.step_opsd,
             "evolution_instruction": HEURISTIC_EVOLUTION_INSTRUCTION
             if args.enable_heuristic_tool
             else None,
@@ -335,6 +336,7 @@ def main() -> int:
         "train_limit": args.limit_train,
         "batch_size": args.batch_size,
         "harness_tree": args.harness_tree,
+        "step_opsd": args.step_opsd,
         "offline": args.offline if args.harness_tree else None,
         "disable_main_evolve": args.disable_main_evolve if args.harness_tree else None,
         "type_buffer_size": (args.type_buffer_size or args.batch_size) if args.harness_tree else None,
@@ -447,9 +449,19 @@ def parse_args() -> argparse.Namespace:
             "the original tool set unchanged."
         ),
     )
+    parser.add_argument(
+        "--step-opsd",
+        action="store_true",
+        help=(
+            "Enable first-stage review-only Step-OPSD for the non-Harness-Tree "
+            "evolution loop."
+        ),
+    )
     args = parser.parse_args()
     if args.offline and not args.harness_tree:
         parser.error("--offline requires --harness-tree")
+    if args.step_opsd and args.harness_tree:
+        parser.error("--step-opsd is only supported without --harness-tree")
     return args
 
 

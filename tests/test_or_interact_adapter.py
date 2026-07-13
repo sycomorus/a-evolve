@@ -513,6 +513,7 @@ def test_or_interact_cli_has_no_check_flags(monkeypatch: pytest.MonkeyPatch) -> 
     assert not hasattr(args, "check")
     assert args.enable_heuristic_tool is False
     assert args.enable_user_tool is False
+    assert args.step_opsd is False
     assert args.offline is False
 
     monkeypatch.setattr(sys, "argv", ["evolve_or_interact.py", "--enable-heuristic-tool"])
@@ -521,10 +522,17 @@ def test_or_interact_cli_has_no_check_flags(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setattr(sys, "argv", ["evolve_or_interact.py", "--enable-user-tool"])
     assert evolve_or_interact.parse_args().enable_user_tool is True
 
+    monkeypatch.setattr(sys, "argv", ["evolve_or_interact.py", "--step-opsd"])
+    assert evolve_or_interact.parse_args().step_opsd is True
+
     monkeypatch.setattr(sys, "argv", ["evolve_or_interact.py", "--harness-tree", "--offline"])
     assert evolve_or_interact.parse_args().offline is True
 
     monkeypatch.setattr(sys, "argv", ["evolve_or_interact.py", "--offline"])
+    with pytest.raises(SystemExit):
+        evolve_or_interact.parse_args()
+
+    monkeypatch.setattr(sys, "argv", ["evolve_or_interact.py", "--harness-tree", "--step-opsd"])
     with pytest.raises(SystemExit):
         evolve_or_interact.parse_args()
 

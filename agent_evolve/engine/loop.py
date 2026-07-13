@@ -123,7 +123,31 @@ class EvolutionLoop:
                     )
 
                 self.agent.export_to_fs()
-                batch_path = self.observer.collect(observations)
+                if self.config.extra.get("step_opsd_enabled"):
+                    from ..algorithms.step_opsd import build_step_opsd_records
+
+                    base_records = [
+                        self.observer.record_from_observation(observation)
+                        for observation in observations
+                    ]
+                    records = build_step_opsd_records(
+                        observations,
+                        base_records,
+                        evolution_dir=evolution_dir,
+                        llm=getattr(self.engine, "llm", None),
+                        failures_only=bool(
+                            self.config.extra.get("step_opsd_review_failures_only", True)
+                        ),
+                        max_tokens=int(
+                            self.config.extra.get(
+                                "step_opsd_teacher_max_tokens",
+                                min(self.config.evolver_max_tokens, 4096),
+                            )
+                        ),
+                    )
+                    batch_path = self.observer.collect_records(records)
+                else:
+                    batch_path = self.observer.collect(observations)
 
                 cycle_score = (
                     sum(o.feedback.score for o in observations) / len(observations)
