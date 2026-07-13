@@ -8,7 +8,7 @@ import json
 import re
 import shutil
 import uuid
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, as_completed, wait
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -99,6 +99,7 @@ def run_harness_tree(
     final_test_limit: int | None,
     final_dir: Path,
     disable_main_evolve: bool = False,
+    offline: bool = False,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[EvolutionResult, dict[str, Any]]:
     runner = HarnessTreeRunner(
@@ -109,6 +110,7 @@ def run_harness_tree(
         type_buffer_size=type_buffer_size,
         router_confidence_threshold=router_confidence_threshold,
         disable_main_evolve=disable_main_evolve,
+        offline=offline,
     )
     result = runner.run_training(max_epochs=max_epochs, progress_callback=progress_callback)
     eval_summary = runner.run_final_evaluation(
@@ -130,6 +132,7 @@ class HarnessTreeRunner:
         type_buffer_size: int,
         router_confidence_threshold: float,
         disable_main_evolve: bool = False,
+        offline: bool = False,
     ) -> None:
         self.agent = agent
         self.benchmark = benchmark
@@ -138,6 +141,7 @@ class HarnessTreeRunner:
         self.type_buffer_size = max(1, int(type_buffer_size))
         self.router_confidence_threshold = float(router_confidence_threshold)
         self.disable_main_evolve = bool(disable_main_evolve)
+        self.offline = bool(offline)
         self.workspace_root = self.agent.workspace.root
         self.state_path = self.workspace_root / STATE_FILE
         self.observer = Observer(self.workspace_root / "evolution")
@@ -158,6 +162,11 @@ class HarnessTreeRunner:
         max_epochs: int,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> EvolutionResult:
+        if self.offline:
+            return self._run_training_offline(
+                max_epochs=max_epochs,
+                progress_callback=progress_callback,
+            )
         self._prepare_repo()
         self.state = _load_state(self.state_path)
         self._capture_base_harness_snapshot()
@@ -239,6 +248,77 @@ class HarnessTreeRunner:
                 "branches": sorted(self.state["branches"]),
                 "type_buffer_size": self.type_buffer_size,
                 "disable_main_evolve": self.disable_main_evolve,
+                "offline": self.offline,
+            },
+        )
+
+    def _run_training_offline(
+        self,
+        *,
+        max_epochs: int,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> EvolutionResult:
+        self._prepare_repo()
+        self.state = _load_state(self.state_path)
+        self._capture_base_harness_snapshot()
+        score_history: list[float] = []
+        completed_tasks = 0
+        schedule = self._training_schedule(max_epochs)
+        workers = min(resolve_agent_parallelism(self.agent), len(schedule)) if schedule else 0
+        _emit_progress(
+            progress_callback,
+            {
+                "phase": "train",
+                "event": "start",
+                "total": len(schedule),
+                "max_epochs": max_epochs,
+                "offline": True,
+                "workers": workers,
+            },
+        )
+
+        by_epoch: dict[int, list[dict[str, Any]]] = {}
+        for item in schedule:
+            by_epoch.setdefault(int(item["epoch"]), []).append(item)
+
+        for epoch in sorted(by_epoch):
+            routed = self._run_route_phase_parallel_incremental(
+                by_epoch[epoch],
+                completed_tasks=completed_tasks,
+                total_tasks=len(schedule),
+                progress_callback=progress_callback,
+            )
+            evaluations = self._run_solve_buffer_parallel(routed)
+            completed_tasks, touched_branches = self._record_offline_solve_evaluations(
+                routed,
+                evaluations,
+                score_history=score_history,
+                completed_tasks=completed_tasks,
+                total_tasks=len(schedule),
+                progress_callback=progress_callback,
+            )
+            self._flush_main_pending_chunks(progress_callback=progress_callback)
+            self._flush_branch_pending_chunks(
+                touched_branches,
+                progress_callback=progress_callback,
+            )
+
+        total_evolves = len(self.state.get("main_evolutions", [])) + sum(
+            int(item.get("evolve_count", 0)) for item in self.state["branches"].values()
+        )
+        return EvolutionResult(
+            cycles_completed=total_evolves,
+            final_score=(sum(score_history) / len(score_history)) if score_history else 0.0,
+            score_history=score_history,
+            converged=False,
+            details={
+                "tasks_completed": completed_tasks,
+                "updates_completed": total_evolves,
+                "epochs_completed": max_epochs,
+                "branches": sorted(self.state["branches"]),
+                "type_buffer_size": self.type_buffer_size,
+                "disable_main_evolve": self.disable_main_evolve,
+                "offline": self.offline,
             },
         )
 
@@ -712,6 +792,264 @@ class HarnessTreeRunner:
                 "updates_completed": len(self.state.get("main_evolutions", [])),
             },
         )
+
+    def _run_route_phase_parallel_incremental(
+        self,
+        schedule_items: list[dict[str, Any]],
+        *,
+        completed_tasks: int,
+        total_tasks: int,
+        progress_callback: Callable[[dict[str, Any]], None] | None,
+    ) -> list[RoutedTask]:
+        if not schedule_items:
+            return []
+        workers = min(resolve_agent_parallelism(self.agent), len(schedule_items))
+        if workers <= 1:
+            routed = []
+            for item in schedule_items:
+                task = item["task"]
+                _emit_progress(
+                    progress_callback,
+                    {
+                        "phase": "train",
+                        "event": "task_start",
+                        "completed": completed_tasks,
+                        "total": total_tasks,
+                        "epoch": item["epoch"],
+                        "cycle": item["cycle"],
+                        "task_id": task.id,
+                        "offline": True,
+                    },
+                )
+                routed.append(
+                    self._run_route_phase(
+                        task,
+                        phase="train",
+                        epoch=item["epoch"],
+                        cycle=item["cycle"],
+                    )
+                )
+            return routed
+
+        agent_class = _class_path(self.agent.__class__)
+        results: list[RoutedTask | None] = [None] * len(schedule_items)
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            pending = set()
+            futures: dict[Any, int] = {}
+            next_index = 0
+
+            def submit(index: int) -> None:
+                item = schedule_items[index]
+                task = item["task"]
+                _emit_progress(
+                    progress_callback,
+                    {
+                        "phase": "train",
+                        "event": "task_start",
+                        "completed": completed_tasks,
+                        "total": total_tasks,
+                        "epoch": item["epoch"],
+                        "cycle": item["cycle"],
+                        "task_id": task.id,
+                        "offline": True,
+                    },
+                )
+                future = executor.submit(
+                    _run_route_worker,
+                    agent_class,
+                    self.workspace_root,
+                    task,
+                    json.loads(json.dumps(self.state)),
+                    self.router_confidence_threshold,
+                    item["epoch"],
+                    item["cycle"],
+                )
+                futures[future] = index
+                pending.add(future)
+
+            while next_index < min(workers, len(schedule_items)):
+                submit(next_index)
+                next_index += 1
+
+            while pending:
+                done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                for future in done:
+                    index = futures.pop(future)
+                    item = schedule_items[index]
+                    task = item["task"]
+                    try:
+                        routed = future.result()
+                    except Exception as exc:
+                        runtime_dir, trace = self.agent.start_task_run(task)
+                        decision = _normalize_route_decision(
+                            {},
+                            threshold=self.router_confidence_threshold,
+                            fallback_reason=f"{type(exc).__name__}: {exc}",
+                        )
+                        routed = RoutedTask(
+                            task=task,
+                            route_messages=None,
+                            runtime_dir=runtime_dir,
+                            trace=trace,
+                            decision=decision,
+                            branch=decision.branch_name,
+                            epoch=item["epoch"],
+                            cycle=item["cycle"],
+                        )
+                    self._record_route_decision(task, routed.decision, phase="train")
+                    routed.branch = self._ensure_training_branch(routed.decision, routed.cycle)
+                    _save_state(self.state_path, self.state)
+                    results[index] = routed
+                    if next_index < len(schedule_items):
+                        submit(next_index)
+                        next_index += 1
+
+        return [result for result in results if result is not None]
+
+    def _record_offline_solve_evaluations(
+        self,
+        routed_tasks: list[RoutedTask],
+        evaluations: list[dict[str, Any]],
+        *,
+        score_history: list[float],
+        completed_tasks: int,
+        total_tasks: int,
+        progress_callback: Callable[[dict[str, Any]], None] | None,
+    ) -> tuple[int, set[str]]:
+        touched_branches: set[str] = set()
+        for routed, evaluation in zip(routed_tasks, evaluations, strict=False):
+            observation = self._observation_from_evaluation(evaluation)
+            decision = evaluation["route_decision"]
+            branch = evaluation.get("branch_name") or routed.branch
+            if branch not in self.state["branches"]:
+                branch = self._ensure_training_branch(decision, routed.cycle)
+            touched_branches.add(branch)
+            completed_tasks += 1
+            score_history.append(observation.feedback.score)
+
+            record = self._record_from_observation(observation)
+            record["harness_tree"] = {
+                "branch_name": branch,
+                "route_confidence": decision.confidence,
+                "route_rationale": decision.rationale,
+                "fallback_reason": decision.fallback_reason,
+            }
+            if self.disable_main_evolve:
+                self.state["main_pending"] = []
+            else:
+                self.state.setdefault("main_pending", []).append(record)
+            branch_state = self.state["branches"][branch]
+            branch_state["pending"].append(record)
+            branch_state["solve_count"] += 1
+            if observation.feedback.success:
+                branch_state["success_count"] += 1
+            branch_state["last_task_id"] = routed.task.id
+            _save_state(self.state_path, self.state)
+            _emit_progress(
+                progress_callback,
+                {
+                    "phase": "train",
+                    "event": "task_done",
+                    "completed": completed_tasks,
+                    "total": total_tasks,
+                    "epoch": routed.epoch,
+                    "cycle": routed.cycle,
+                    "task_id": routed.task.id,
+                    "branch_name": branch,
+                    "route_confidence": decision.confidence,
+                    "score": observation.feedback.score,
+                    "success": observation.feedback.success,
+                    "fallback_reason": decision.fallback_reason,
+                    "feedback_detail": observation.feedback.detail,
+                    "main_pending": None
+                    if self.disable_main_evolve
+                    else len(self.state.get("main_pending", [])),
+                    "branch_pending": len(branch_state["pending"]),
+                    "type_buffer_size": self.type_buffer_size,
+                    "offline": True,
+                },
+            )
+        return completed_tasks, touched_branches
+
+    def _flush_main_pending_chunks(
+        self,
+        *,
+        progress_callback: Callable[[dict[str, Any]], None] | None,
+    ) -> None:
+        if self.disable_main_evolve:
+            self.state["main_pending"] = []
+            _save_state(self.state_path, self.state)
+            return
+        chunk_size = max(1, int(self.config.batch_size))
+        while self.state.get("main_pending"):
+            pending = list(self.state["main_pending"])
+            chunk = pending[:chunk_size]
+            rest = pending[chunk_size:]
+            self.state["main_pending"] = chunk
+            _save_state(self.state_path, self.state)
+            _emit_progress(
+                progress_callback,
+                {
+                    "phase": "train",
+                    "event": "evolve_start",
+                    "scope": "main",
+                    "records": len(chunk),
+                    "offline": True,
+                },
+            )
+            self._evolve_main()
+            self.state["main_pending"] = rest
+            _save_state(self.state_path, self.state)
+            _emit_progress(
+                progress_callback,
+                {
+                    "phase": "train",
+                    "event": "evolve_done",
+                    "scope": "main",
+                    "updates_completed": len(self.state.get("main_evolutions", [])),
+                    "offline": True,
+                },
+            )
+
+    def _flush_branch_pending_chunks(
+        self,
+        branches: set[str],
+        *,
+        progress_callback: Callable[[dict[str, Any]], None] | None,
+    ) -> None:
+        for branch in sorted(branches):
+            if branch not in self.state["branches"]:
+                continue
+            while self.state["branches"][branch].get("pending"):
+                branch_state = self.state["branches"][branch]
+                pending = list(branch_state["pending"])
+                chunk = pending[: self.type_buffer_size]
+                rest = pending[self.type_buffer_size :]
+                branch_state["pending"] = chunk
+                _save_state(self.state_path, self.state)
+                _emit_progress(
+                    progress_callback,
+                    {
+                        "phase": "train",
+                        "event": "evolve_start",
+                        "scope": branch,
+                        "records": len(chunk),
+                        "offline": True,
+                    },
+                )
+                self._evolve_branch(branch)
+                self.state["branches"][branch]["pending"] = rest
+                _save_state(self.state_path, self.state)
+                _emit_progress(
+                    progress_callback,
+                    {
+                        "phase": "train",
+                        "event": "evolve_done",
+                        "scope": branch,
+                        "updates_completed": self.state["branches"][branch]["evolve_count"],
+                        "offline": True,
+                    },
+                )
 
     def _run_solve_buffer_parallel(self, buffer: list[RoutedTask]) -> list[dict[str, Any]]:
         if not buffer:
@@ -1314,6 +1652,65 @@ def _run_final_two_phase_worker(
             error=f"{type(exc).__name__}: {exc}",
             branch=branch or fallback_decision.branch_name,
             runtime_dir=runtime_dir,
+        )
+
+
+def _run_route_worker(
+    agent_class: str,
+    workspace_root: Path,
+    task: Task,
+    state: dict[str, Any],
+    router_confidence_threshold: float,
+    epoch: int,
+    cycle: int,
+) -> RoutedTask:
+    cls = _import_class(agent_class)
+    route_agent = cls(workspace_root)
+    runtime_dir, trace = route_agent.start_task_run(task)
+    try:
+        route_result = route_agent.run_phase(
+            task,
+            runtime_dir=runtime_dir,
+            trace=trace,
+            phase="train:route",
+            user_message=ROUTE_PHASE_USER_MESSAGE.format(
+                existing_branches=json.dumps(_branch_summaries(state), ensure_ascii=False, indent=2)
+            ),
+            max_turns=ROUTE_PHASE_TURNS,
+            stop_after_tools={"type_router"},
+        )
+        route_trajectory = _trajectory_from_runtime(task, runtime_dir)
+        raw, extraction_reason = _extract_type_router_output(route_trajectory)
+        decision = _normalize_route_decision(
+            raw,
+            threshold=router_confidence_threshold,
+            fallback_reason=extraction_reason,
+        )
+        return RoutedTask(
+            task=task,
+            route_messages=route_result.messages or None,
+            runtime_dir=runtime_dir,
+            trace=trace,
+            decision=decision,
+            branch=decision.branch_name,
+            epoch=epoch,
+            cycle=cycle,
+        )
+    except Exception as exc:
+        decision = _normalize_route_decision(
+            {},
+            threshold=router_confidence_threshold,
+            fallback_reason=f"{type(exc).__name__}: {exc}",
+        )
+        return RoutedTask(
+            task=task,
+            route_messages=None,
+            runtime_dir=runtime_dir,
+            trace=trace,
+            decision=decision,
+            branch=decision.branch_name,
+            epoch=epoch,
+            cycle=cycle,
         )
 
 

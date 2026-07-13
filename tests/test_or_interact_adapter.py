@@ -502,12 +502,20 @@ def test_or_interact_cli_has_no_check_flags(monkeypatch: pytest.MonkeyPatch) -> 
     assert not hasattr(args, "check")
     assert args.enable_heuristic_tool is False
     assert args.enable_user_tool is False
+    assert args.offline is False
 
     monkeypatch.setattr(sys, "argv", ["evolve_or_interact.py", "--enable-heuristic-tool"])
     assert evolve_or_interact.parse_args().enable_heuristic_tool is True
 
     monkeypatch.setattr(sys, "argv", ["evolve_or_interact.py", "--enable-user-tool"])
     assert evolve_or_interact.parse_args().enable_user_tool is True
+
+    monkeypatch.setattr(sys, "argv", ["evolve_or_interact.py", "--harness-tree", "--offline"])
+    assert evolve_or_interact.parse_args().offline is True
+
+    monkeypatch.setattr(sys, "argv", ["evolve_or_interact.py", "--offline"])
+    with pytest.raises(SystemExit):
+        evolve_or_interact.parse_args()
 
 
 def test_or_interact_evolve_settings_writer_records_heuristic_switch(tmp_path: Path) -> None:
@@ -893,6 +901,132 @@ def test_harness_tree_parallel_train_solve_uses_multiple_workers(tmp_path: Path)
     assert len({record["feedback"]["raw"]["evaluation"]["pid"] for record in records}) > 1
 
 
+def test_harness_tree_offline_batches_evolve_after_parallel_solve(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path / "workspace")
+    benchmark = FakeBenchmark(tmp_path)
+    benchmark.train_tasks = [
+        _harness_task(tmp_path, "alpha_off_1", "alpha model"),
+        _harness_task(tmp_path, "beta_off_1", "beta model"),
+        _harness_task(tmp_path, "alpha_off_2", "alpha model again"),
+        _harness_task(tmp_path, "beta_off_2", "beta model again"),
+        _harness_task(tmp_path, "alpha_off_3", "alpha model third"),
+    ]
+    agent = FakeAgent(workspace, parallelism=2)
+    engine = FakeEngine(workspace)
+    runner = HarnessTreeRunner(
+        agent=agent,
+        benchmark=benchmark,
+        engine=engine,
+        config=EvolveConfig(batch_size=2, train_limit=5),
+        type_buffer_size=2,
+        router_confidence_threshold=0.5,
+        offline=True,
+    )
+
+    progress_events: list[dict[str, Any]] = []
+    result = runner.run_training(max_epochs=1, progress_callback=progress_events.append)
+    state = json.loads((workspace / "evolution" / "harness_tree" / "state.json").read_text())
+    branch_records = []
+    for observation_file in sorted((workspace / "evolution" / "observations").glob("batch_*_branch_*.jsonl")):
+        branch_records.extend(
+            json.loads(line)
+            for line in observation_file.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        )
+
+    assert result.details["offline"] is True
+    assert result.details["tasks_completed"] == 5
+    assert result.details["updates_completed"] == 6
+    assert engine.evolved_scopes == ["main", "main", "main", "alpha", "alpha", "beta"]
+    assert engine.records_per_evolve == [2, 2, 1, 2, 1, 2]
+    assert engine.trajectory_profiles == ["main", "main", "main", "branch", "branch", "branch"]
+    assert state["main_pending"] == []
+    assert state["branches"]["branch/alpha"]["pending"] == []
+    assert state["branches"]["branch/beta"]["pending"] == []
+    assert len({record["feedback"]["raw"]["evaluation"]["pid"] for record in branch_records}) > 1
+    evolve_starts = [
+        event["scope"]
+        for event in progress_events
+        if event.get("event") == "evolve_start"
+    ]
+    assert evolve_starts == ["main", "main", "main", "branch/alpha", "branch/alpha", "branch/beta"]
+
+
+def test_harness_tree_offline_route_uses_incremental_branch_table(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path / "workspace")
+    benchmark = FakeBenchmark(tmp_path)
+    benchmark.train_tasks = [
+        _harness_task(tmp_path, "alpha_slow", "alpha route_sleep"),
+        _harness_task(tmp_path, "beta_slow", "beta route_sleep"),
+        _harness_task(tmp_path, "reuse", "reuse_existing model"),
+    ]
+    agent = FakeAgent(workspace, parallelism=2)
+    engine = FakeEngine(workspace)
+    runner = HarnessTreeRunner(
+        agent=agent,
+        benchmark=benchmark,
+        engine=engine,
+        config=EvolveConfig(batch_size=10, train_limit=3),
+        type_buffer_size=10,
+        router_confidence_threshold=0.5,
+        offline=True,
+    )
+
+    runner.run_training(max_epochs=1)
+    state = json.loads((workspace / "evolution" / "harness_tree" / "state.json").read_text())
+    reuse_decision = next(
+        item for item in state["router_decisions"] if item["task_id"] == "reuse"
+    )
+
+    assert reuse_decision["branch_name"] in {"branch/alpha", "branch/beta"}
+    assert "branch/reuse-new" not in state["branches"]
+
+
+def test_harness_tree_offline_disable_main_evolve_isolates_branch_workspace(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path / "workspace")
+    original_prompt = (workspace / "prompts" / "system.md").read_text(encoding="utf-8")
+    benchmark = FakeBenchmark(tmp_path)
+    benchmark.train_tasks = [
+        _harness_task(tmp_path, "alpha_iso_1", "alpha model"),
+        _harness_task(tmp_path, "alpha_iso_2", "alpha model again"),
+    ]
+    agent = FakeAgent(workspace, parallelism=2)
+    engine = LeakyEngine(workspace)
+    runner = HarnessTreeRunner(
+        agent=agent,
+        benchmark=benchmark,
+        engine=engine,
+        config=EvolveConfig(batch_size=1, train_limit=2),
+        type_buffer_size=2,
+        router_confidence_threshold=0.5,
+        disable_main_evolve=True,
+        offline=True,
+    )
+
+    result = runner.run_training(max_epochs=1)
+    state = json.loads((workspace / "evolution" / "harness_tree" / "state.json").read_text())
+
+    assert result.details["offline"] is True
+    assert state["main_evolutions"] == []
+    assert state["main_pending"] == []
+    assert engine.evolved_scopes == ["alpha"]
+    assert engine.records_per_evolve == [2]
+    assert not (workspace / "skills" / "domain-alpha").exists()
+    assert not (workspace / "skills" / "leaked-main").exists()
+    assert (workspace / "prompts" / "system.md").read_text(encoding="utf-8") == original_prompt
+    assert (
+        workspace
+        / "evolution"
+        / "harness_tree"
+        / "overlays"
+        / "alpha"
+        / "files"
+        / "skills"
+        / "domain-alpha"
+        / "SKILL.md"
+    ).is_file()
+
+
 def test_harness_tree_route_phase_uses_metadata_category_in_router(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path / "workspace")
     benchmark = FakeBenchmark(tmp_path)
@@ -1207,11 +1341,25 @@ class FakeAgent:
         messages = list(initial_messages or [{"role": "system", "content": "fake"}])
         label = "beta" if "beta" in task.input else "alpha"
         if phase.endswith(":route"):
+            if "route_sleep" in task.input:
+                time.sleep(0.15)
             category = task.metadata.get("category")
             if category:
                 branch_name = sanitize_branch_name(category)
                 confidence = 1.0
                 rationale = f"task metadata category: {category}"
+            elif "reuse_existing" in task.input and user_message and "branch/alpha" in user_message:
+                branch_name = "branch/alpha"
+                confidence = 0.9
+                rationale = "reused alpha from existing branches"
+            elif "reuse_existing" in task.input and user_message and "branch/beta" in user_message:
+                branch_name = "branch/beta"
+                confidence = 0.9
+                rationale = "reused beta from existing branches"
+            elif "reuse_existing" in task.input:
+                branch_name = "branch/reuse-new"
+                confidence = 0.9
+                rationale = "no existing branch visible"
             else:
                 branch_name = f"branch/{label}"
                 confidence = 0.95
@@ -1295,6 +1443,7 @@ class FakeEngine:
     def __init__(self, workspace: Path) -> None:
         self.workspace = workspace
         self.evolved_scopes: list[str] = []
+        self.records_per_evolve: list[int] = []
         self.trajectory_profiles: list[str] = []
         self.prompt_log_dirs: list[Path | None] = []
         self.prompt_log_scopes: list[str | None] = []
@@ -1310,6 +1459,7 @@ class FakeEngine:
     ) -> dict[str, Any]:
         scope = "main" if workspace.root == self.workspace.resolve() else workspace.root.name
         self.evolved_scopes.append(scope)
+        self.records_per_evolve.append(len(observation_logs))
         self.trajectory_profiles.append(trajectory_profile)
         self.prompt_log_dirs.append(prompt_log_dir)
         self.prompt_log_scopes.append(prompt_log_scope)

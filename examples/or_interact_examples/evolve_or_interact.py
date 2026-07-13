@@ -261,6 +261,7 @@ def main() -> int:
                 final_test_limit=test_limit,
                 final_dir=final_dir,
                 disable_main_evolve=args.disable_main_evolve,
+                offline=args.offline,
                 progress_callback=update_harness_progress,
             )
     else:
@@ -334,6 +335,7 @@ def main() -> int:
         "train_limit": args.limit_train,
         "batch_size": args.batch_size,
         "harness_tree": args.harness_tree,
+        "offline": args.offline if args.harness_tree else None,
         "disable_main_evolve": args.disable_main_evolve if args.harness_tree else None,
         "type_buffer_size": (args.type_buffer_size or args.batch_size) if args.harness_tree else None,
         "router_confidence_threshold": args.router_confidence_threshold if args.harness_tree else None,
@@ -389,6 +391,14 @@ def parse_args() -> argparse.Namespace:
         help="Enable OR-only type-router branch routing and branch-local evolution.",
     )
     parser.add_argument(
+        "--offline",
+        action="store_true",
+        help=(
+            "With --harness-tree, run each epoch as parallel route, parallel solve, "
+            "then batched main/branch evolution."
+        ),
+    )
+    parser.add_argument(
         "--type-buffer-size",
         type=int,
         default=None,
@@ -437,7 +447,10 @@ def parse_args() -> argparse.Namespace:
             "the original tool set unchanged."
         ),
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.offline and not args.harness_tree:
+        parser.error("--offline requires --harness-tree")
+    return args
 
 
 def _write_or_interact_settings(
