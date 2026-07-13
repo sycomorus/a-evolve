@@ -196,6 +196,83 @@ def summarize_step_opsd_batch(records: list[dict[str, Any]]) -> dict[str, Any] |
     }
 
 
+def review_observation_for_audit(
+    obs: Observation,
+    *,
+    output_dir: Path,
+    llm: LLMProvider,
+    max_tokens: int = 4096,
+) -> dict[str, Any]:
+    """Run one teacher review and write the exact teacher context/response."""
+    task_dir = output_dir / _safe_name(obs.task.id)
+    full_cleaned_dir = task_dir / "full_cleaned"
+    task_dir.mkdir(parents=True, exist_ok=True)
+    full_cleaned_dir.mkdir(parents=True, exist_ok=True)
+
+    full_cleaned = _clean_trace(obs.trajectory.conversation or obs.trajectory.steps)
+    steps = _segment_steps(full_cleaned)
+    full_cleaned_path = _write_full_cleaned(full_cleaned_dir, obs.task.id, full_cleaned)
+    privileged_packet = _build_privileged_packet(obs, steps)
+    prompt_payload = _teacher_prompt_payload(obs, steps, privileged_packet)
+    context_text = json.dumps(prompt_payload, ensure_ascii=False, indent=2, default=str)
+
+    raw_response = ""
+    parsed_review: dict[str, Any] | None = None
+    redaction_status = "failed"
+    leakage_reasons: list[str] = []
+    error: str | None = None
+    try:
+        response = llm.complete(
+            [
+                LLMMessage(role="system", content=TEACHER_SYSTEM_PROMPT),
+                LLMMessage(role="user", content=context_text),
+            ],
+            max_tokens=max_tokens,
+            temperature=0.0,
+        )
+        raw_response = response.content
+        parsed_review = _parse_json_response(raw_response)
+        leaked, leakage_reasons = _contains_leakage(parsed_review, privileged_packet)
+        redaction_status = "failed" if leaked else "passed"
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+
+    (task_dir / "teacher_system_prompt.txt").write_text(
+        TEACHER_SYSTEM_PROMPT,
+        encoding="utf-8",
+    )
+    (task_dir / "teacher_context.json").write_text(context_text, encoding="utf-8")
+    (task_dir / "teacher_raw_response.txt").write_text(raw_response, encoding="utf-8")
+    if parsed_review is not None:
+        (task_dir / "teacher_parsed_review.json").write_text(
+            json.dumps(parsed_review, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+
+    record = {
+        "task_id": obs.task.id,
+        "success": obs.feedback.success,
+        "score": obs.feedback.score,
+        "redaction_status": redaction_status,
+        "leakage_reasons": leakage_reasons,
+        "error": error,
+        "teacher_system_prompt_path": str(task_dir / "teacher_system_prompt.txt"),
+        "teacher_context_path": str(task_dir / "teacher_context.json"),
+        "teacher_raw_response_path": str(task_dir / "teacher_raw_response.txt"),
+        "teacher_parsed_review_path": (
+            str(task_dir / "teacher_parsed_review.json")
+            if parsed_review is not None
+            else None
+        ),
+        "teacher_full_cleaned_path": str(full_cleaned_path),
+    }
+    (task_dir / "review_record.json").write_text(
+        json.dumps(record, ensure_ascii=False, indent=2, default=str),
+        encoding="utf-8",
+    )
+    return record
+
+
 def _run_teacher_review(
     *,
     llm: LLMProvider,
@@ -205,15 +282,7 @@ def _run_teacher_review(
     max_tokens: int,
 ) -> tuple[dict[str, Any], str]:
     prompt = json.dumps(
-        {
-            "visible_task_summary": {
-                "task_id": obs.task.id,
-                "task_input": obs.task.input,
-                "metadata": _visible_metadata(obs.task.metadata),
-            },
-            "teacher_full_cleaned_steps": steps,
-            "privileged_feedback_packet": privileged_packet,
-        },
+        _teacher_prompt_payload(obs, steps, privileged_packet),
         ensure_ascii=False,
         indent=2,
         default=str,
@@ -256,6 +325,22 @@ def _run_teacher_review(
     review.setdefault("missed_steps", [])
     review.setdefault("leakage_check", {})
     return review, "passed"
+
+
+def _teacher_prompt_payload(
+    obs: Observation,
+    steps: list[dict[str, Any]],
+    privileged_packet: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "visible_task_summary": {
+            "task_id": obs.task.id,
+            "task_input": obs.task.input,
+            "metadata": _visible_metadata(obs.task.metadata),
+        },
+        "teacher_full_cleaned_steps": steps,
+        "privileged_feedback_packet": privileged_packet,
+    }
 
 
 def _build_privileged_packet(obs: Observation, steps: list[dict[str, Any]]) -> dict[str, Any]:

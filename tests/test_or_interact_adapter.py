@@ -503,7 +503,11 @@ def test_retailopt_task_can_index_and_call_read_json(
 
 
 def test_or_interact_cli_has_no_check_flags(monkeypatch: pytest.MonkeyPatch) -> None:
-    from examples.or_interact_examples import evaluate_or_interact, evolve_or_interact
+    from examples.or_interact_examples import (
+        evaluate_or_interact,
+        evolve_or_interact,
+        review_step_opsd_failures,
+    )
 
     monkeypatch.setattr(sys, "argv", ["evaluate_or_interact.py"])
     assert not hasattr(evaluate_or_interact.parse_args(), "check")
@@ -535,6 +539,24 @@ def test_or_interact_cli_has_no_check_flags(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setattr(sys, "argv", ["evolve_or_interact.py", "--harness-tree", "--step-opsd"])
     with pytest.raises(SystemExit):
         evolve_or_interact.parse_args()
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "review_step_opsd_failures.py",
+            "--dataset",
+            "IndustryOR",
+            "--limit",
+            "2",
+            "--output-dir",
+            "/tmp/reviews",
+        ],
+    )
+    review_args = review_step_opsd_failures.parse_args()
+    assert review_args.dataset == "IndustryOR"
+    assert review_args.limit == 2
+    assert review_args.output_dir == "/tmp/reviews"
 
 
 def test_or_interact_evolve_settings_writer_records_heuristic_switch(tmp_path: Path) -> None:

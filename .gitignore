@@ -72,6 +72,7 @@ evolution_workdir_or_interact/*
 evolution_workdir_or_interact/runs/*
 !evolution_workdir_or_interact/runs/manual/
 !evolution_workdir_or_interact/runs/manual/**
+step_opsd_review_workdir/*
 
 logs/
 swe_results*/
@@ -153,4 +154,3 @@ examples/tb_examples/skipped/
 agent_evolve/benchmarks/tb2/challenges/
 examples/run_skillbench_solve_all_ablate.sh
 examples/skillbench_evolve_one.py
-
