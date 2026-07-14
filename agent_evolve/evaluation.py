@@ -18,6 +18,7 @@ from rich.progress import (
 )
 
 from .benchmarks.base import BenchmarkAdapter
+from .algorithms.step_opsd import summarize_interaction_metrics
 from .protocol.base_agent import BaseAgent
 from .task_runner import TaskEvaluation, resolve_agent_parallelism, run_task_evaluations
 
@@ -93,6 +94,15 @@ def run_evaluation(
         "avg_score": (score_sum / total) if total else 0.0,
         "results_csv": str(destination / "results.csv"),
     }
+    if any("has_grounded" in row for row in rows):
+        interaction_metrics = summarize_interaction_metrics(rows)
+        interaction_metrics_path = destination / "interaction_metrics.json"
+        interaction_metrics_path.write_text(
+            json.dumps(interaction_metrics, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        summary["interaction_metrics"] = interaction_metrics
+        summary["interaction_metrics_path"] = str(interaction_metrics_path)
 
     (destination / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2),
@@ -120,6 +130,9 @@ def _row_from_evaluation(result: TaskEvaluation) -> dict[str, Any]:
     evaluation = feedback.raw.get("evaluation") if isinstance(feedback.raw, dict) else None
     if isinstance(evaluation, dict):
         row.update(evaluation)
+    if isinstance(feedback.raw, dict):
+        row["runtime_dir"] = feedback.raw.get("runtime_dir")
+        row["task_dir"] = feedback.raw.get("task_dir")
     return row
 
 

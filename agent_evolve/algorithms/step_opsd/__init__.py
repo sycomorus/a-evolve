@@ -7,6 +7,7 @@ from .review import (
     sanitize_feedback_detail,
     summarize_step_opsd_batch,
 )
+from .metrics import summarize_interaction_metrics
 
 __all__ = [
     "build_step_opsd_records",
@@ -14,4 +15,5 @@ __all__ = [
     "review_observation_for_audit",
     "sanitize_feedback_detail",
     "summarize_step_opsd_batch",
+    "summarize_interaction_metrics",
 ]

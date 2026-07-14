@@ -442,9 +442,23 @@ def build_tool_trace(conversation: list[dict[str, Any]], profile: str = "main") 
         entry = _matching_tool_entry(event, pending_by_id, pending_without_id)
         if entry is None:
             continue
+        if entry.get("tool") == "ask_user":
+            entry["output"] = _summarize_ask_user_output(output)
+            entry["error"] = ""
+            continue
         entry["output"], entry["error"] = _summarize_output(output, profile=profile)
 
     return trace
+
+
+def _summarize_ask_user_output(output: Any) -> dict[str, Any]:
+    if isinstance(output, str):
+        try:
+            output = json.loads(output)
+        except Exception:
+            output = {}
+    response = output.get("user_response", {}) if isinstance(output, dict) else {}
+    return {"answered": bool(response.get("answered"))}
 
 
 def _matching_tool_entry(
@@ -874,6 +888,11 @@ Each task includes:
   instead of full source.
 - When Step-OPSD is enabled, `evolve_compressed`, `step_opsd`, and the batch summary contain
   redacted teacher-derived diagnosis for reusable harness evolution.
+- Interaction reviews describe when clarification was required, whether the question was useful,
+  and whether the answer was applied. They never contain the grounded answer. Improve reusable
+  prompt/skill policy: ask only for material information unavailable from docs/data, ask one
+  concise evidence-based question, never request the oracle/final objective, apply an answer to
+  the formulation, and do not repeat a refused synonymous question.
 
 Oracle/reference values, reference paths, and reference code are not available to you. Use only
 the redacted feedback, trajectory fields, and redacted Teacher output to identify reusable

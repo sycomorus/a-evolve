@@ -23,7 +23,8 @@ from agent_evolve.benchmarks.or_interact import (
     train_size_from_limit,
 )
 from agent_evolve.engine.versioning import VersionControl
-from agent_evolve.types import Feedback, Task, Trajectory
+from agent_evolve.engine.observer import Observer
+from agent_evolve.types import Feedback, Observation, Task, Trajectory
 from examples.or_interact_examples.harness_tree import (
     HarnessTreeRunner,
     sanitize_branch_name,
@@ -122,6 +123,68 @@ def test_evaluate_correct_objective(tmp_path: Path) -> None:
     assert feedback.success is True
     assert feedback.score == 1.0
     assert feedback.raw["evaluation"]["predicted"] == expected
+
+
+def test_evaluate_records_grounded_ask_diagnostics(tmp_path: Path) -> None:
+    benchmark = ORInteractBenchmark(benchmark_dir=BENCHMARK_DIR, dataset="IndustryOR")
+    task = _task_by_id(benchmark, "task_001")
+    expected = _oracle_value(task)
+    _write_answer(tmp_path, expected)
+    events = [
+        {"type": "tool_call", "name": "ask_user", "arguments": {"question": "How should training work?"}},
+        {
+            "type": "tool_output",
+            "name": "ask_user",
+            "output": {"user_response": {"answered": True, "answer": "private"}},
+        },
+        {"type": "run_summary", "runtime_dir": str(tmp_path), "status": "success"},
+    ]
+    trajectory = Trajectory(
+        task_id=task.id,
+        output="",
+        steps=events,
+        conversation=events,
+    )
+
+    feedback = benchmark.evaluate(task, trajectory)
+
+    evaluation = feedback.raw["evaluation"]
+    assert evaluation["has_grounded"] is True
+    assert evaluation["ask_count"] == 1
+    assert evaluation["answered_ask_count"] == 1
+    assert evaluation["refused_ask_count"] == 0
+
+
+def test_observer_redacts_grounded_answer_from_persisted_trajectory(tmp_path: Path) -> None:
+    task = Task(id="task_x", input="", metadata={})
+    events = [
+        {"type": "tool_call", "name": "ask_user", "arguments": {"question": "Which rule?"}},
+        {
+            "type": "tool_output",
+            "name": "ask_user",
+            "output": {
+                "user_response": {
+                    "answered": True,
+                    "answer": "PRIVATE GROUNDED ANSWER",
+                    "matched_file": "private.md",
+                }
+            },
+        },
+    ]
+    observation = Observation(
+        task=task,
+        trajectory=Trajectory(task_id=task.id, output="", steps=events, conversation=events),
+        feedback=Feedback(success=False, score=0.0, detail="failed"),
+    )
+
+    record = Observer(tmp_path / "evolution").record_from_observation(observation)
+
+    serialized = json.dumps(record)
+    assert "PRIVATE GROUNDED ANSWER" not in serialized
+    assert "private.md" not in serialized
+    assert record["conversation"][1]["output"] == {
+        "user_response": {"answered": True}
+    }
 
 
 def test_evaluate_wrong_objective(tmp_path: Path) -> None:
@@ -566,6 +629,20 @@ def test_or_interact_evolve_settings_writer_records_heuristic_switch(tmp_path: P
 
     settings = json.loads((tmp_path / "or_interact_settings.json").read_text(encoding="utf-8"))
     assert settings == {"enable_heuristic_tool": True, "enable_user_tool": False}
+
+
+def test_interaction_evolution_instruction_is_composed_without_fixed_ask_limit() -> None:
+    from examples.or_interact_examples.evolve_or_interact import _evolution_instruction
+
+    instruction = _evolution_instruction(
+        enable_heuristic_tool=True,
+        interaction_training=True,
+    )
+
+    assert instruction is not None
+    assert "run_heuristic" in instruction
+    assert "interaction-aware Step-OPSD" in instruction
+    assert "fixed per-task question limit" in instruction
 
 
 def test_evaluate_and_evolve_use_matching_or_interact_splits(monkeypatch: pytest.MonkeyPatch) -> None:

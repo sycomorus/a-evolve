@@ -11,6 +11,8 @@ from agent_evolve.algorithms.adaptive_skill.tools import (
     create_default_llm,
     make_workspace_bash,
 )
+from agent_evolve.algorithms.step_opsd import summarize_interaction_metrics
+from agent_evolve.algorithms.step_opsd.review import _contains_leakage
 from agent_evolve.algorithms.unified.openai_compat import OpenAICompatProvider
 from agent_evolve.config import EvolveConfig
 from agent_evolve.contract.workspace import AgentWorkspace
@@ -152,6 +154,94 @@ def test_tool_trace_uses_canonical_events_without_assistant_double_count() -> No
     assert trace[0]["tool"] == "read_csv"
 
 
+def test_tool_trace_redacts_ask_user_answer_and_match_file() -> None:
+    trace = build_tool_trace(
+        [
+            {
+                "type": "tool_call",
+                "name": "ask_user",
+                "arguments": {"question": "Which interpretation should I use?"},
+            },
+            {
+                "type": "tool_output",
+                "name": "ask_user",
+                "output": {
+                    "user_response": {
+                        "answered": True,
+                        "answer": "PRIVATE GROUNDED ANSWER",
+                        "matched_file": "private-grounded.md",
+                    }
+                },
+            },
+        ]
+    )
+
+    assert trace[0]["args"]["question"] == "Which interpretation should I use?"
+    assert trace[0]["output"] == {"answered": True}
+    assert "PRIVATE GROUNDED ANSWER" not in json.dumps(trace)
+    assert "private-grounded.md" not in json.dumps(trace)
+
+
+def test_step_opsd_leakage_check_covers_oracle_and_grounded_content() -> None:
+    packet = {
+        "oracle_feedback": {"expected_objective": 42.0},
+        "grounded_clarifications": [
+            {
+                "path": "/task/grounded/private-grounded.md",
+                "content": (
+                    "## Question\nWhich convention applies?\n\n"
+                    "## Answer\nUse the private grounded convention.\n"
+                ),
+            }
+        ],
+    }
+
+    leaked, reasons = _contains_leakage(
+        {"overall_diagnosis": "Use the private grounded convention."},
+        packet,
+    )
+
+    assert leaked is True
+    assert "grounded_content" in reasons
+
+    task_id_only, _ = _contains_leakage(
+        {"task_id": "task_042", "overall_diagnosis": "No privileged value exposed."},
+        packet,
+    )
+    assert task_id_only is False
+
+
+def test_interaction_metrics_cover_recall_abstention_and_answer_use() -> None:
+    rows = [
+        {"success": True, "has_grounded": True, "ask_count": 1, "answered_ask_count": 1},
+        {"success": False, "has_grounded": True, "ask_count": 0, "answered_ask_count": 0},
+        {"success": True, "has_grounded": False, "ask_count": 0, "answered_ask_count": 0},
+        {
+            "success": False,
+            "has_grounded": False,
+            "ask_count": 1,
+            "answered_ask_count": 0,
+            "refused_ask_count": 1,
+        },
+    ]
+    reviews = [{
+        "step_opsd": {
+            "redaction_status": "passed",
+            "teacher_review": {
+                "interaction_review": {"answer_use": "used_correctly"}
+            },
+        }
+    }]
+
+    metrics = summarize_interaction_metrics(rows, reviews)
+
+    assert metrics["ask_precision"] == 0.5
+    assert metrics["ask_recall"] == 0.5
+    assert metrics["grounded_match_rate"] == 0.5
+    assert metrics["correct_abstention_rate"] == 0.5
+    assert metrics["answer_utilization_rate"] == 1.0
+
+
 def test_tool_trace_redacts_code_and_uses_branch_summary_detail() -> None:
     large_code = "\n".join(
         [
@@ -247,6 +337,12 @@ def test_standard_prompt_includes_redacted_step_opsd_signal(tmp_path: Path) -> N
                         }
                     ],
                     "missed_steps": [],
+                    "interaction_review": {
+                        "requirement": "required",
+                        "observed_behavior": "no_ask",
+                        "decision": "missed_ask",
+                        "answer_use": "unavailable",
+                    },
                 },
             },
         }
@@ -262,6 +358,7 @@ def test_standard_prompt_includes_redacted_step_opsd_signal(tmp_path: Path) -> N
 
     assert "Step-OPSD Batch Summary" in prompt
     assert "wrong_quantity" in prompt
+    assert "missed_ask" in prompt
     assert "Expected objective: <redacted>" in prompt
     assert "Expected objective: 123" not in prompt
 

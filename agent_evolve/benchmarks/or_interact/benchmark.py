@@ -67,12 +67,14 @@ class ORInteractBenchmark(BenchmarkAdapter):
             evaluation = evaluate_task_objective(task.id, task_dir, runtime_dir)
 
         detail = _feedback_detail(evaluation, trajectory, task_dir)
+        evaluation_record = asdict(evaluation)
+        evaluation_record.update(_interaction_diagnostics(task_dir, trajectory))
         return Feedback(
             success=evaluation.correct,
             score=1.0 if evaluation.correct else 0.0,
             detail=detail,
             raw={
-                "evaluation": asdict(evaluation),
+                "evaluation": evaluation_record,
                 "runtime_dir": str(runtime_dir) if runtime_dir else None,
                 "task_dir": str(task_dir),
             },
@@ -204,6 +206,60 @@ def _runtime_dir_from_trajectory(trajectory: Trajectory) -> Path | None:
         if runtime_dir:
             return Path(str(runtime_dir))
     return None
+
+
+def _interaction_diagnostics(
+    task_dir: Path,
+    trajectory: Trajectory,
+) -> dict[str, Any]:
+    grounded_dir = task_dir / "grounded"
+    has_grounded = grounded_dir.is_dir() and any(
+        path.is_file() and path.suffix == ".md" and not path.name.startswith(".")
+        for path in grounded_dir.iterdir()
+    )
+    ask_count = 0
+    answered_count = 0
+    pending_ids: set[str] = set()
+    pending_without_id = 0
+    events = trajectory.conversation or trajectory.steps
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        event_type = event.get("type")
+        if event_type == "tool_call" and event.get("name") == "ask_user":
+            ask_count += 1
+            call_id = str(event.get("tool_call_id") or event.get("id") or "")
+            if call_id:
+                pending_ids.add(call_id)
+            else:
+                pending_without_id += 1
+            continue
+        if event_type != "tool_output" or event.get("name") != "ask_user":
+            continue
+        call_id = str(event.get("tool_call_id") or event.get("id") or "")
+        if call_id and call_id in pending_ids:
+            pending_ids.remove(call_id)
+        elif pending_without_id:
+            pending_without_id -= 1
+        output = event.get("output", event.get("content", {}))
+        if _ask_user_answered(output):
+            answered_count += 1
+    return {
+        "has_grounded": has_grounded,
+        "ask_count": ask_count,
+        "answered_ask_count": answered_count,
+        "refused_ask_count": max(0, ask_count - answered_count),
+    }
+
+
+def _ask_user_answered(output: Any) -> bool:
+    if isinstance(output, str):
+        try:
+            output = json.loads(output)
+        except Exception:
+            return False
+    response = output.get("user_response", {}) if isinstance(output, dict) else {}
+    return bool(response.get("answered"))
 
 
 def _feedback_detail(evaluation: ObjectiveEvaluation, trajectory: Trajectory, task_dir: Path) -> str:

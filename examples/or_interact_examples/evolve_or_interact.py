@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import sys
@@ -30,6 +31,10 @@ if str(REPO_ROOT) not in sys.path:
 
 from agent_evolve.api import Evolver  # noqa: E402
 from agent_evolve.algorithms.adaptive_skill import AdaptiveSkillEngine  # noqa: E402
+from agent_evolve.algorithms.step_opsd import (  # noqa: E402
+    build_step_opsd_records,
+    summarize_interaction_metrics,
+)
 from agent_evolve.agents.or_interact.react_agent import ORReactAgent  # noqa: E402
 from agent_evolve.benchmarks.or_interact import (  # noqa: E402
     ORInteractBenchmark,
@@ -40,6 +45,7 @@ from agent_evolve.config import EvolveConfig  # noqa: E402
 from agent_evolve.display import print_evolve_summary, print_run_header  # noqa: E402
 from agent_evolve.evaluation import run_evaluation  # noqa: E402
 from agent_evolve.runs import create_run_workspace, update_run_metadata  # noqa: E402
+from agent_evolve.types import Observation, Trajectory  # noqa: E402
 from examples.or_interact_examples.harness_tree import run_harness_tree  # noqa: E402
 
 OR_INTERACT_SETTINGS_FILE = "or_interact_settings.json"
@@ -53,11 +59,20 @@ HEURISTIC_EVOLUTION_INSTRUCTION = (
     "already provided by the harness; do not create, modify, or register "
     "`tools/run_heuristic.py`."
 )
+USER_INTERACTION_EVOLUTION_INSTRUCTION = (
+    "This run enables interaction-aware Step-OPSD. Use the redacted interaction reviews "
+    "to improve reusable prompt, skill, or memory policy for deciding when clarification "
+    "is materially necessary, asking one concise evidence-based question, and applying "
+    "the answer to the formulation. Do not reconstruct grounded answers, memorize "
+    "task-specific questions, request oracle values, create an ask_user tool, or impose "
+    "a fixed per-task question limit."
+)
 
 
 def main() -> int:
     args = parse_args()
     console = Console()
+    interaction_training = bool(args.step_opsd and args.enable_user_tool)
     evolver_model, evolver_base_url, evolver_api_key, evolver_temperature = resolve_evolver_llm()
     benchmark = ORInteractBenchmark(
         benchmark_dir=args.benchmark_dir,
@@ -81,9 +96,12 @@ def main() -> int:
             "evolver_api_key": evolver_api_key,
             "evolver_temperature": evolver_temperature,
             "step_opsd_enabled": args.step_opsd,
-            "evolution_instruction": HEURISTIC_EVOLUTION_INSTRUCTION
-            if args.enable_heuristic_tool
-            else None,
+            "step_opsd_interaction_enabled": interaction_training,
+            "step_opsd_review_failures_only": not interaction_training,
+            "evolution_instruction": _evolution_instruction(
+                enable_heuristic_tool=args.enable_heuristic_tool,
+                interaction_training=interaction_training,
+            ),
         },
     )
     engine = AdaptiveSkillEngine(config)
@@ -323,6 +341,23 @@ def main() -> int:
             show_progress=True,
             console=console,
         )
+    if interaction_training:
+        interaction_metrics = _run_final_interaction_audit(
+            benchmark=benchmark,
+            split="test",
+            limit=test_limit,
+            results_csv=Path(str(eval_summary["results_csv"])),
+            output_dir=final_dir / "interaction_audit",
+            llm=engine.llm,
+            max_tokens=min(config.evolver_max_tokens, 4096),
+        )
+        metrics_path = final_dir / "interaction_metrics.json"
+        metrics_path.write_text(
+            json.dumps(interaction_metrics, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        eval_summary["interaction_metrics"] = interaction_metrics
+        eval_summary["interaction_metrics_path"] = str(metrics_path)
     summary = {
         "run_id": run.run_id,
         "run_dir": str(run.run_dir),
@@ -337,6 +372,7 @@ def main() -> int:
         "batch_size": args.batch_size,
         "harness_tree": args.harness_tree,
         "step_opsd": args.step_opsd,
+        "step_opsd_interaction": interaction_training,
         "offline": args.offline if args.harness_tree else None,
         "disable_main_evolve": args.disable_main_evolve if args.harness_tree else None,
         "type_buffer_size": (args.type_buffer_size or args.batch_size) if args.harness_tree else None,
@@ -347,6 +383,8 @@ def main() -> int:
         "test_accuracy": eval_summary["accuracy"],
         "test_per_branch": eval_summary.get("per_branch"),
         "test_results_csv": eval_summary.get("results_csv"),
+        "test_interaction_metrics": eval_summary.get("interaction_metrics"),
+        "test_interaction_metrics_path": eval_summary.get("interaction_metrics_path"),
     }
     (final_dir / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2),
@@ -454,7 +492,8 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Enable first-stage review-only Step-OPSD for the non-Harness-Tree "
-            "evolution loop."
+            "evolution loop. When combined with --enable-user-tool, review all "
+            "trajectories with interaction-aware teacher supervision."
         ),
     )
     args = parser.parse_args()
@@ -479,6 +518,102 @@ def _write_or_interact_settings(
         json.dumps(settings, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+
+
+def _evolution_instruction(
+    *,
+    enable_heuristic_tool: bool,
+    interaction_training: bool,
+) -> str | None:
+    sections = []
+    if enable_heuristic_tool:
+        sections.append(HEURISTIC_EVOLUTION_INSTRUCTION)
+    if interaction_training:
+        sections.append(USER_INTERACTION_EVOLUTION_INSTRUCTION)
+    return "\n\n".join(sections) or None
+
+
+def _run_final_interaction_audit(
+    *,
+    benchmark: ORInteractBenchmark,
+    split: str,
+    limit: int | None,
+    results_csv: Path,
+    output_dir: Path,
+    llm: Any,
+    max_tokens: int,
+) -> dict[str, Any]:
+    with results_csv.open("r", encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    task_by_id = {
+        task.id: task for task in benchmark.get_tasks(split=split, limit=limit)
+    }
+    observations = []
+    base_records = []
+    for row in rows:
+        task = task_by_id.get(str(row.get("task_id") or ""))
+        runtime_dir = Path(str(row.get("runtime_dir") or ""))
+        trace_path = runtime_dir / "trace.jsonl"
+        if task is None or not runtime_dir.is_dir() or not trace_path.is_file():
+            continue
+        events = [
+            json.loads(line)
+            for line in trace_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        events.append({"type": "run_summary", "runtime_dir": str(runtime_dir)})
+        trajectory = Trajectory(
+            task_id=task.id,
+            output=_read_run_output(runtime_dir),
+            steps=events,
+            conversation=events,
+        )
+        feedback = benchmark.evaluate(task, trajectory)
+        observations.append(
+            Observation(task=task, trajectory=trajectory, feedback=feedback)
+        )
+        evaluation = feedback.raw.get("evaluation", {})
+        base_records.append({
+            "task_id": task.id,
+            "success": feedback.success,
+            **{
+                key: evaluation.get(key)
+                for key in (
+                    "has_grounded",
+                    "ask_count",
+                    "answered_ask_count",
+                    "refused_ask_count",
+                )
+            },
+        })
+
+    records = build_step_opsd_records(
+        observations,
+        base_records,
+        evolution_dir=output_dir,
+        llm=llm,
+        failures_only=False,
+        max_tokens=max_tokens,
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    records_path = output_dir / "teacher_review_records.jsonl"
+    records_path.write_text(
+        "".join(
+            json.dumps(record, ensure_ascii=False, default=str) + "\n"
+            for record in records
+        ),
+        encoding="utf-8",
+    )
+    metrics = summarize_interaction_metrics(rows, records)
+    metrics["teacher_review_records"] = str(records_path)
+    return metrics
+
+
+def _read_run_output(runtime_dir: Path) -> str:
+    path = runtime_dir / "run_summary.json"
+    if not path.is_file():
+        return ""
+    return path.read_text(encoding="utf-8")
 
 
 def _total_updates(

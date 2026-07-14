@@ -22,6 +22,10 @@ You may use privileged oracle/reference information to diagnose the student traj
 Do not solve the task again.
 Do not reveal oracle/reference content in your output, including oracle objective values,
 reference solution code, reference formulation code, paths, or task-specific answer parameters.
+Grounded clarifications are also privileged. Do not repeat or paraphrase a grounded answer,
+the original grounded question, its file name, or task-specific values from it. Describe only
+the abstract information need, the visible evidence that should trigger a question, a reusable
+question template, and how the answer should affect the formulation.
 Most steps are expected to be acceptable. Do not review every step. In step_reviews,
 include only the earliest causally wrong step, or at most 1-2 steps with the largest
 impact on the final failure. Omit correct or minor steps. Keep each field concise.
@@ -33,6 +37,12 @@ Return JSON only with:
   better_next_action, harness_update_hint}
 - missed_steps: list of {after_step_id, phase, expected_action, why_it_matters,
   harness_update_hint}
+- interaction_review: {requirement, observed_behavior, decision, evidence_before_decision,
+  recommended_timing, information_need, question_template, answer_use,
+  expected_answer_use, harness_update_hint}. Use requirement required|unnecessary;
+  observed_behavior answered_ask|refused_ask|no_ask; decision correct_ask|missed_ask|
+  unnecessary_ask|poor_question|correct_abstention; answer_use used_correctly|ignored|
+  misused|unavailable. Keep reusable fields abstract and answer-free.
 - leakage_check: {contains_oracle_value, contains_reference_code}
 """
 
@@ -52,13 +62,13 @@ def build_step_opsd_records(
 
     enriched: list[dict[str, Any]] = []
     for obs, base_record in zip(observations, base_records):
-        record = dict(base_record)
+        record = _redact_record_for_evolver(base_record)
         full_cleaned = _clean_trace(obs.trajectory.conversation or obs.trajectory.steps)
         steps = _segment_steps(full_cleaned)
         full_cleaned_path = _write_full_cleaned(
             full_cleaned_dir,
             obs.task.id,
-            full_cleaned,
+            _redact_user_answers(full_cleaned),
         )
         privileged_packet = _build_privileged_packet(obs, steps)
 
@@ -81,6 +91,7 @@ def build_step_opsd_records(
                 "overall_diagnosis": "Teacher review skipped.",
                 "step_reviews": [],
                 "missed_steps": [],
+                "interaction_review": {},
             }
 
         record["trace_views"] = {
@@ -149,6 +160,7 @@ def redacted_step_opsd_for_evolver(record: dict[str, Any]) -> dict[str, Any] | N
                 "overall_diagnosis": "Teacher review unavailable or withheld.",
                 "step_reviews": [],
                 "missed_steps": [],
+                "interaction_review": {},
             },
         }
     return {
@@ -157,6 +169,9 @@ def redacted_step_opsd_for_evolver(record: dict[str, Any]) -> dict[str, Any] | N
             "overall_diagnosis": review.get("overall_diagnosis", ""),
             "step_reviews": _redacted_step_reviews(review.get("step_reviews")),
             "missed_steps": _redacted_missed_steps(review.get("missed_steps")),
+            "interaction_review": _redacted_interaction_review(
+                review.get("interaction_review")
+            ),
         },
     }
 
@@ -171,6 +186,8 @@ def summarize_step_opsd_batch(records: list[dict[str, Any]]) -> dict[str, Any] |
     negative = Counter()
     missed = Counter()
     positive = Counter()
+    interaction = Counter()
+    answer_use = Counter()
     for record in step_records:
         review = record.get("teacher_review", {})
         if not isinstance(review, dict):
@@ -189,6 +206,14 @@ def summarize_step_opsd_batch(records: list[dict[str, Any]]) -> dict[str, Any] |
                 continue
             key = (str(item.get("phase", "")), str(item.get("expected_action", "")))
             missed[key] += 1
+        interaction_review = review.get("interaction_review", {})
+        if isinstance(interaction_review, dict):
+            decision = str(interaction_review.get("decision", ""))
+            if decision:
+                interaction[decision] += 1
+            use = str(interaction_review.get("answer_use", ""))
+            if use:
+                answer_use[use] += 1
 
     return {
         "records": len(records),
@@ -196,6 +221,8 @@ def summarize_step_opsd_batch(records: list[dict[str, Any]]) -> dict[str, Any] |
         "top_negative_patterns": _counter_items(negative),
         "top_missed_steps": _counter_items(missed),
         "positive_patterns": _counter_items(positive),
+        "interaction_decisions": _label_counter_items(interaction),
+        "answer_use_patterns": _label_counter_items(answer_use),
     }
 
 
@@ -243,7 +270,8 @@ def review_observation_for_audit(
         raw_response = response.content
         response_metadata = _response_metadata(response, max_tokens=max_tokens)
         parsed_review = _parse_json_response(raw_response)
-        redaction_status = "passed"
+        leaked, leakage_reasons = _contains_leakage(parsed_review, privileged_packet)
+        redaction_status = "withheld" if leaked else "passed"
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
 
@@ -319,6 +347,7 @@ def _run_teacher_review(
                 "overall_diagnosis": f"Teacher review failed: {type(exc).__name__}: {exc}",
                 "step_reviews": [],
                 "missed_steps": [],
+                "interaction_review": {},
             },
             "failed",
         )
@@ -326,7 +355,21 @@ def _run_teacher_review(
     review.setdefault("task_id", obs.task.id)
     review.setdefault("step_reviews", [])
     review.setdefault("missed_steps", [])
+    review.setdefault("interaction_review", {})
     review.setdefault("leakage_check", {})
+    leaked, reasons = _contains_leakage(review, privileged_packet)
+    if leaked:
+        return (
+            {
+                "task_id": obs.task.id,
+                "overall_diagnosis": "Teacher review withheld because privileged content leaked.",
+                "step_reviews": [],
+                "missed_steps": [],
+                "interaction_review": {},
+                "leakage_check": {"reasons": reasons},
+            },
+            "withheld",
+        )
     return review, "passed"
 
 
@@ -399,6 +442,11 @@ def _compress_for_evolver(
             if isinstance(safe_review, dict)
             else []
         ),
+        "teacher_interaction_review": (
+            safe_review.get("teacher_review", {}).get("interaction_review", {})
+            if isinstance(safe_review, dict)
+            else {}
+        ),
     }
 
 
@@ -422,8 +470,12 @@ def _clean_trace(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def _segment_steps(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     steps: list[dict[str, Any]] = []
     pending: list[dict[str, Any]] = []
+    recent_assistant = ""
     for event in events:
         event_type = event.get("type")
+        if event_type == "assistant_message":
+            recent_assistant = _short_json(event.get("content", ""), MAX_OUTPUT_CHARS)
+            continue
         if event_type in {"tool_call", "assistant_tool_call"} or "name" in event and "arguments" in event:
             tool = str(event.get("name") or event.get("tool") or "")
             args = event.get("arguments", {})
@@ -432,7 +484,7 @@ def _segment_steps(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
             step = {
                 "step_id": f"t{len(steps) + 1:03d}",
                 "phase": _phase_for_tool(tool),
-                "history_summary": "",
+                "history_summary": recent_assistant,
                 "action": {
                     "tool": tool,
                     "arguments_summary": _short_json(args, MAX_ARG_CHARS),
@@ -446,10 +498,10 @@ def _segment_steps(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
             output = event.get("output", event.get("content", ""))
             step = _match_pending_step(event, pending)
             if step is not None:
-                step["observation"] = {
-                    "status": _status_from_output(output),
-                    "summary": _short_json(output, MAX_OUTPUT_CHARS),
-                }
+                step["observation"] = _step_observation(
+                    str(step.get("action", {}).get("tool") or ""),
+                    output,
+                )
     if steps:
         return steps
     for event in events:
@@ -475,7 +527,13 @@ def _contains_leakage(
     review: dict[str, Any],
     privileged_packet: dict[str, Any],
 ) -> tuple[bool, list[str]]:
-    text = json.dumps(review, ensure_ascii=False, default=str)
+    review_for_check = {
+        key: value
+        for key, value in review.items()
+        if key not in {"task_id", "leakage_check"}
+    }
+    text = json.dumps(review_for_check, ensure_ascii=False, default=str)
+    folded_text = text.casefold()
     reasons: list[str] = []
     oracle = privileged_packet.get("oracle_feedback", {})
     if isinstance(oracle, dict):
@@ -483,7 +541,10 @@ def _contains_leakage(
             value = oracle.get(key)
             if value is not None:
                 for variant in _number_variants(value):
-                    if variant and variant in text:
+                    if variant and re.search(
+                        rf"(?<![A-Za-z0-9_]){re.escape(variant)}(?![A-Za-z0-9_])",
+                        text,
+                    ):
                         reasons.append(key)
                         break
     forbidden = (
@@ -494,8 +555,22 @@ def _contains_leakage(
         "/oracle",
     )
     for item in forbidden:
-        if item in text:
+        if item.casefold() in folded_text:
             reasons.append(item)
+    for grounded in privileged_packet.get("grounded_clarifications", []) or []:
+        if not isinstance(grounded, dict):
+            continue
+        path = str(grounded.get("path") or "")
+        if path and (
+            path.casefold() in folded_text
+            or Path(path).name.casefold() in folded_text
+        ):
+            reasons.append("grounded_path")
+        content = str(grounded.get("content") or "")
+        for secret in _grounded_secrets(content):
+            if secret.casefold() in folded_text:
+                reasons.append("grounded_content")
+                break
     return bool(reasons), reasons
 
 
@@ -534,6 +609,24 @@ def _redacted_missed_steps(value: Any) -> list[dict[str, Any]]:
         for item in value
         if isinstance(item, dict)
     ]
+
+
+def _redacted_interaction_review(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    allowed = {
+        "requirement",
+        "observed_behavior",
+        "decision",
+        "evidence_before_decision",
+        "recommended_timing",
+        "information_need",
+        "question_template",
+        "answer_use",
+        "expected_answer_use",
+        "harness_update_hint",
+    }
+    return {key: value.get(key) for key in allowed if key in value}
 
 
 def _extract_solver_feedback(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -625,6 +718,93 @@ def _compact_event(event: dict[str, Any]) -> dict[str, Any]:
     return compact
 
 
+def _redact_user_answers(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    redacted: list[dict[str, Any]] = []
+    for event in events:
+        compact = dict(event)
+        if compact.get("type") == "tool_output" and compact.get("name") == "ask_user":
+            output = compact.get("output", compact.get("content", {}))
+            compact["output"] = _safe_user_response(output)
+            compact.pop("content", None)
+        redacted.append(compact)
+    return redacted
+
+
+def _redact_record_for_evolver(record: dict[str, Any]) -> dict[str, Any]:
+    redacted = dict(record)
+    if "feedback_detail" in redacted:
+        redacted["feedback_detail"] = sanitize_feedback_detail(
+            redacted.get("feedback_detail")
+        )
+    for key in ("conversation", "steps"):
+        value = redacted.get(key)
+        if isinstance(value, list):
+            redacted[key] = _redact_user_answers(value)
+    trajectory = redacted.get("trajectory")
+    if isinstance(trajectory, dict):
+        safe_trajectory = dict(trajectory)
+        steps = safe_trajectory.get("steps")
+        if isinstance(steps, list):
+            safe_trajectory["steps"] = _redact_user_answers(steps)
+        redacted["trajectory"] = safe_trajectory
+    task = redacted.get("task")
+    if isinstance(task, dict):
+        safe_task = dict(task)
+        metadata = safe_task.get("metadata")
+        if isinstance(metadata, dict):
+            safe_task["metadata"] = _visible_metadata(metadata)
+        redacted["task"] = safe_task
+    feedback = redacted.get("feedback")
+    if isinstance(feedback, dict):
+        safe_feedback = dict(feedback)
+        safe_feedback["detail"] = sanitize_feedback_detail(
+            safe_feedback.get("detail")
+        )
+        safe_feedback.pop("raw", None)
+        redacted["feedback"] = safe_feedback
+    return redacted
+
+
+def _safe_user_response(output: Any) -> dict[str, Any]:
+    if isinstance(output, str):
+        output = _parse_jsonish(output)
+    response = output.get("user_response", {}) if isinstance(output, dict) else {}
+    return {
+        "user_response": {
+            "answered": bool(response.get("answered")),
+        }
+    }
+
+
+def _step_observation(tool: str, output: Any) -> dict[str, Any]:
+    if tool == "ask_user":
+        safe = _safe_user_response(output)
+        answered = bool(safe["user_response"]["answered"])
+        return {
+            "status": "answered" if answered else "refused",
+            "summary": safe,
+        }
+    return {
+        "status": _status_from_output(output),
+        "summary": _short_json(output, MAX_OUTPUT_CHARS),
+    }
+
+
+def _grounded_secrets(content: str) -> list[str]:
+    secrets: list[str] = []
+    for heading in ("Question", "Answer"):
+        match = re.search(
+            rf"^##\s+{heading}\s*$\n(?P<body>.*?)(?=^##\s+|\Z)",
+            content,
+            flags=re.IGNORECASE | re.MULTILINE | re.DOTALL,
+        )
+        if match:
+            body = match.group("body").strip()
+            if len(body) >= 8:
+                secrets.append(body)
+    return secrets
+
+
 def _is_noise_event(event: dict[str, Any]) -> bool:
     text = _jsonish(event)
     lowered = text.lower()
@@ -655,6 +835,8 @@ def _phase_for_tool(tool: str) -> str:
         return "context_reading"
     if tool in {"run_solver", "execute_python", "run_heuristic"}:
         return "solver_execution"
+    if tool == "ask_user":
+        return "user_interaction"
     if tool == "finalize":
         return "finalization"
     return "model_formulation"
@@ -755,6 +937,13 @@ def _counter_items(counter: Counter[tuple[str, str]], limit: int = 10) -> list[d
     return [
         {"phase": phase, "pattern": pattern, "count": count}
         for (phase, pattern), count in counter.most_common(limit)
+    ]
+
+
+def _label_counter_items(counter: Counter[str], limit: int = 10) -> list[dict[str, Any]]:
+    return [
+        {"pattern": pattern, "count": count}
+        for pattern, count in counter.most_common(limit)
     ]
 
 

@@ -61,13 +61,15 @@ class Observer:
                 })
 
         # Save in nested format for stratified engine
+        safe_steps = _redact_ask_user_outputs(obs.trajectory.steps)
+        safe_conversation = _redact_ask_user_outputs(obs.trajectory.conversation)
         return {
             # Keep flat fields for backward compatibility
             "task_id": obs.task.id,
             "task_input": obs.task.input,
             "agent_output": obs.trajectory.output,
-            "steps": obs.trajectory.steps,
-            "conversation": obs.trajectory.conversation,
+            "steps": safe_steps,
+            "conversation": safe_conversation,
             "success": obs.feedback.success,
             "score": obs.feedback.score,
             "feedback_detail": obs.feedback.detail,
@@ -81,7 +83,7 @@ class Observer:
             },
             "trajectory": {
                 "output": obs.trajectory.output,
-                "steps": obs.trajectory.steps,
+                "steps": safe_steps,
             },
             "feedback": {
                 "success": obs.feedback.success,
@@ -135,3 +137,23 @@ def _safe_suffix(value: str | None) -> str:
     text = re.sub(r"[^a-z0-9._-]+", "_", text)
     text = re.sub(r"_+", "_", text).strip("._-")
     return text or "extra"
+
+
+def _redact_ask_user_outputs(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    redacted = []
+    for event in events:
+        safe_event = dict(event)
+        if safe_event.get("type") == "tool_output" and safe_event.get("name") == "ask_user":
+            output = safe_event.get("output", safe_event.get("content", {}))
+            if isinstance(output, str):
+                try:
+                    output = json.loads(output)
+                except Exception:
+                    output = {}
+            response = output.get("user_response", {}) if isinstance(output, dict) else {}
+            safe_event["output"] = {
+                "user_response": {"answered": bool(response.get("answered"))}
+            }
+            safe_event.pop("content", None)
+        redacted.append(safe_event)
+    return redacted

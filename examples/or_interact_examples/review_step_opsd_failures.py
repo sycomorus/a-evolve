@@ -166,7 +166,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Directory for teacher contexts and responses. Defaults under the run workspace.",
     )
-    parser.add_argument("--teacher-max-tokens", type=int, default=4096)
+    parser.add_argument("--teacher-max-tokens", type=int, default=8192)
     parser.add_argument("--enable-heuristic-tool", action="store_true")
     parser.add_argument("--enable-user-tool", action="store_true")
     return parser.parse_args()
