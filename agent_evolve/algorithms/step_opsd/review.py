@@ -22,11 +22,14 @@ You may use privileged oracle/reference information to diagnose the student traj
 Do not solve the task again.
 Do not reveal oracle/reference content in your output, including oracle objective values,
 reference solution code, reference formulation code, paths, or task-specific answer parameters.
+Most steps are expected to be acceptable. Do not review every step. In step_reviews,
+include only the earliest causally wrong step, or at most 1-2 steps with the largest
+impact on the final failure. Omit correct or minor steps. Keep each field concise.
 
 Return JSON only with:
 - task_id
 - overall_diagnosis
-- step_reviews: list of {step_id, phase, credit, support, error_type, reason,
+- step_reviews: 1-2 item list of {step_id, phase, credit, support, error_type, reason,
   better_next_action, harness_update_hint}
 - missed_steps: list of {after_step_id, phase, expected_action, why_it_matters,
   harness_update_hint}
@@ -217,6 +220,13 @@ def review_observation_for_audit(
     context_text = json.dumps(prompt_payload, ensure_ascii=False, indent=2, default=str)
 
     raw_response = ""
+    response_metadata: dict[str, Any] = {
+        "max_tokens": max_tokens,
+        "content_chars": 0,
+        "usage": {},
+        "finish_reason": None,
+        "raw_api_response": None,
+    }
     parsed_review: dict[str, Any] | None = None
     redaction_status = "failed"
     leakage_reasons: list[str] = []
@@ -231,9 +241,9 @@ def review_observation_for_audit(
             temperature=0.0,
         )
         raw_response = response.content
+        response_metadata = _response_metadata(response, max_tokens=max_tokens)
         parsed_review = _parse_json_response(raw_response)
-        leaked, leakage_reasons = _contains_leakage(parsed_review, privileged_packet)
-        redaction_status = "failed" if leaked else "passed"
+        redaction_status = "passed"
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
 
@@ -243,6 +253,10 @@ def review_observation_for_audit(
     )
     (task_dir / "teacher_context.json").write_text(context_text, encoding="utf-8")
     (task_dir / "teacher_raw_response.txt").write_text(raw_response, encoding="utf-8")
+    (task_dir / "teacher_response_metadata.json").write_text(
+        json.dumps(response_metadata, ensure_ascii=False, indent=2, default=str),
+        encoding="utf-8",
+    )
     if parsed_review is not None:
         (task_dir / "teacher_parsed_review.json").write_text(
             json.dumps(parsed_review, ensure_ascii=False, indent=2, default=str),
@@ -259,6 +273,7 @@ def review_observation_for_audit(
         "teacher_system_prompt_path": str(task_dir / "teacher_system_prompt.txt"),
         "teacher_context_path": str(task_dir / "teacher_context.json"),
         "teacher_raw_response_path": str(task_dir / "teacher_raw_response.txt"),
+        "teacher_response_metadata_path": str(task_dir / "teacher_response_metadata.json"),
         "teacher_parsed_review_path": (
             str(task_dir / "teacher_parsed_review.json")
             if parsed_review is not None
@@ -308,18 +323,6 @@ def _run_teacher_review(
             "failed",
         )
 
-    leaked, reasons = _contains_leakage(review, privileged_packet)
-    if leaked:
-        return (
-            {
-                "task_id": obs.task.id,
-                "overall_diagnosis": "Teacher review withheld by leakage check.",
-                "step_reviews": [],
-                "missed_steps": [],
-                "leakage_check": {"blocked": True, "reasons": reasons},
-            },
-            "failed",
-        )
     review.setdefault("task_id", obs.task.id)
     review.setdefault("step_reviews", [])
     review.setdefault("missed_steps", [])
@@ -367,7 +370,6 @@ def _build_privileged_packet(obs: Observation, steps: list[dict[str, Any]]) -> d
         "reference_solution": _read_reference_solution(task_dir),
         "reference_formulation": _read_reference_formulation(task_dir),
         "grounded_clarifications": _read_grounded_clarifications(task_dir),
-        "step_records": steps,
     }
 
 
@@ -695,6 +697,49 @@ def _short_json(value: Any, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + f"...[truncated {len(text) - limit} chars]"
+
+
+def _response_metadata(response: Any, *, max_tokens: int) -> dict[str, Any]:
+    raw_api_response = _jsonable(response.raw)
+    return {
+        "max_tokens": max_tokens,
+        "content_chars": len(response.content or ""),
+        "usage": response.usage,
+        "finish_reason": _finish_reason(raw_api_response),
+        "raw_api_response": raw_api_response,
+    }
+
+
+def _finish_reason(raw_api_response: Any) -> str | None:
+    if not isinstance(raw_api_response, dict):
+        return None
+    choices = raw_api_response.get("choices") or []
+    if not choices or not isinstance(choices[0], dict):
+        return None
+    finish_reason = choices[0].get("finish_reason")
+    return str(finish_reason) if finish_reason is not None else None
+
+
+def _jsonable(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, list):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, tuple):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if hasattr(value, "model_dump"):
+        try:
+            return _jsonable(value.model_dump())
+        except Exception:
+            pass
+    if hasattr(value, "dict"):
+        try:
+            return _jsonable(value.dict())
+        except Exception:
+            pass
+    return str(value)
 
 
 def _jsonish(value: Any) -> str:

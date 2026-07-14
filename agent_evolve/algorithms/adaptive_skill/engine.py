@@ -48,7 +48,7 @@ class AdaptiveSkillEngine(EvolutionEngine):
         trial: Any,
     ) -> StepResult:
         """Analyze observations and mutate the workspace via LLM."""
-        recent_logs = history.get_observations(last_n_cycles=2)
+        recent_logs = history.get_observations(last_n_cycles=1)
         cycle_num = history.latest_cycle + 1
 
         skills_before = [s.name for s in workspace.list_skills()]
