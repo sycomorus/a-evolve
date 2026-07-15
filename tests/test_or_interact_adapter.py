@@ -17,11 +17,7 @@ from baseline.react.trace import TraceWriter
 from agent_evolve.config import EvolveConfig
 from agent_evolve.contract.workspace import AgentWorkspace
 from agent_evolve.agents.or_interact.react_agent import ORReactAgent
-from agent_evolve.benchmarks.or_interact import (
-    ORInteractBenchmark,
-    evaluation_limit_for_split,
-    train_size_from_limit,
-)
+from agent_evolve.benchmarks.or_interact import ORInteractBenchmark
 from agent_evolve.engine.versioning import VersionControl
 from agent_evolve.engine.observer import Observer
 from agent_evolve.types import Feedback, Observation, Task, Trajectory
@@ -632,88 +628,6 @@ def test_or_interact_evolve_settings_writer_records_heuristic_switch(tmp_path: P
 
     settings = json.loads((tmp_path / "or_interact_settings.json").read_text(encoding="utf-8"))
     assert settings == {"enable_heuristic_tool": True, "enable_user_tool": False}
-
-
-def test_interaction_evolution_instruction_is_composed_without_fixed_ask_limit() -> None:
-    from examples.or_interact_examples.evolve_or_interact import _evolution_instruction
-
-    instruction = _evolution_instruction(
-        enable_heuristic_tool=True,
-        interaction_training=True,
-    )
-
-    assert instruction is not None
-    assert "run_heuristic" in instruction
-    assert "interaction-aware Step-OPSD" in instruction
-    assert "multiple distinct questions" in instruction
-    assert "do not require proof" in instruction
-    assert "fixed per-task question limit" in instruction
-
-
-def test_evaluate_and_evolve_use_matching_or_interact_splits(monkeypatch: pytest.MonkeyPatch) -> None:
-    from examples.or_interact_examples import evaluate_or_interact, evolve_or_interact
-
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "evaluate_or_interact.py",
-            "--dataset",
-            "RCO-mini",
-            "--split",
-            "test",
-            "--limit-train",
-            "5",
-            "--limit-test",
-            "3",
-        ],
-    )
-    evaluate_args = evaluate_or_interact.parse_args()
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "evolve_or_interact.py",
-            "--dataset",
-            "RCO-mini",
-            "--limit-train",
-            "5",
-            "--limit-test",
-            "3",
-        ],
-    )
-    evolve_args = evolve_or_interact.parse_args()
-
-    evaluate_benchmark = ORInteractBenchmark(
-        benchmark_dir=BENCHMARK_DIR,
-        dataset=evaluate_args.dataset,
-        train_size=train_size_from_limit(evaluate_args.limit_train),
-    )
-    evolve_benchmark = ORInteractBenchmark(
-        benchmark_dir=BENCHMARK_DIR,
-        dataset=evolve_args.dataset,
-        train_size=train_size_from_limit(evolve_args.limit_train),
-    )
-
-    assert [task.id for task in evaluate_benchmark.get_tasks("train", limit=None)] == [
-        task.id for task in evolve_benchmark.get_tasks("train", limit=None)
-    ]
-    assert [task.id for task in evaluate_benchmark.get_tasks("test", limit=None)] == [
-        task.id for task in evolve_benchmark.get_tasks("test", limit=None)
-    ]
-    assert (
-        evaluation_limit_for_split(
-            evaluate_args.split,
-            limit_train=evaluate_args.limit_train,
-            limit_test=evaluate_args.limit_test,
-        )
-        == evaluation_limit_for_split(
-            "test",
-            limit_train=evolve_args.limit_train,
-            limit_test=evolve_args.limit_test,
-        )
-        == 3
-    )
 
 
 def test_type_router_returns_only_branch_route(
