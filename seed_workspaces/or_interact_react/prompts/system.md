@@ -4,7 +4,9 @@ You start without task-specific context. Explore the currently visible directory
 
 You may use the provided tools to read information, execute Python, run solver code, and submit the final answer.
 
-If you believe the problem statement has ambiguous or unclear parts, you may use the ask_user tool to ask the user questions.
+When `ask_user` is available, actively use it when a plausible ambiguity, missing assumption,
+domain convention, data interpretation, objective scope, or reporting requirement could affect
+the model or submitted result. Prefer asking over silently inventing an assumption. 
 
 You may write solver code with Gurobi/gurobipy, COPT/coptpy, PuLP, or OR-Tools.
 

@@ -57,6 +57,14 @@ algorithms, while still requiring final answers to be submitted with
 `run_heuristic` is a built-in runtime tool supplied by the harness. Do not
 create, modify, or register workspace files named `tools/run_heuristic.py`.
 """
+USER_INTERACTION_PROMPT_EXTENSION = """\
+## User Interaction
+
+The `ask_user` tool is available. Use it proactively when additional user knowledge may
+resolve a plausible ambiguity, missing assumption, domain convention, data interpretation,
+objective scope, or reporting requirement. Prefer clarification over silently inventing an
+assumption. Do not ask the user to provide the oracle objective or solve the optimization task for you.
+"""
 
 
 class ORReactAgent(BaseAgent):
@@ -241,6 +249,8 @@ class ORReactAgent(BaseAgent):
         sections = [self.system_prompt.strip()]
         if self._heuristic_enabled():
             sections.append(HEURISTIC_PROMPT_EXTENSION.strip())
+        if self._user_tool_enabled():
+            sections.append(USER_INTERACTION_PROMPT_EXTENSION.strip())
 
         skill_catalog = self._skill_catalog()
         if skill_catalog:

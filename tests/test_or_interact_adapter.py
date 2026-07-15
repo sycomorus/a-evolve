@@ -371,6 +371,9 @@ def test_or_interact_user_tool_is_enabled_only_by_workspace_setting(
     prompt = str(captured["system_prompt"])
     assert "ask_user" in captured["tools"]
     assert "ask_user" in prompt
+    assert "Use it proactively" in prompt
+    assert "multiple distinct questions" in prompt
+    assert "rephrase a refused question" in prompt
     assert "run_heuristic" not in captured["tools"]
 
 
@@ -642,6 +645,8 @@ def test_interaction_evolution_instruction_is_composed_without_fixed_ask_limit()
     assert instruction is not None
     assert "run_heuristic" in instruction
     assert "interaction-aware Step-OPSD" in instruction
+    assert "multiple distinct questions" in instruction
+    assert "do not require proof" in instruction
     assert "fixed per-task question limit" in instruction
 
 

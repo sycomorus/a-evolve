@@ -890,9 +890,9 @@ Each task includes:
   redacted teacher-derived diagnosis for reusable harness evolution.
 - Interaction reviews describe when clarification was required, whether the question was useful,
   and whether the answer was applied. They never contain the grounded answer. Improve reusable
-  prompt/skill policy: ask only for material information unavailable from docs/data, ask one
-  concise evidence-based question, never request the oracle/final objective, apply an answer to
-  the formulation, and do not repeat a refused synonymous question.
+  prompt/skill policy that encourages clarification when plausible missing user knowledge
+  could reduce modeling risk. Still never request the oracle/final objective, and apply
+  useful answers to the formulation.
 
 Oracle/reference values, reference paths, and reference code are not available to you. Use only
 the redacted feedback, trajectory fields, and redacted Teacher output to identify reusable

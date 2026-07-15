@@ -61,11 +61,11 @@ HEURISTIC_EVOLUTION_INSTRUCTION = (
 )
 USER_INTERACTION_EVOLUTION_INSTRUCTION = (
     "This run enables interaction-aware Step-OPSD. Use the redacted interaction reviews "
-    "to improve reusable prompt, skill, or memory policy for deciding when clarification "
-    "is materially necessary, asking one concise evidence-based question, and applying "
-    "the answer to the formulation. Do not reconstruct grounded answers, memorize "
-    "task-specific questions, request oracle values, create an ask_user tool, or impose "
-    "a fixed per-task question limit."
+    "to improve reusable prompt, skill, or memory policy that proactively asks when "
+    "plausible missing user knowledge could reduce modeling risk. "
+    "Apply useful answers to the formulation. Do not reconstruct grounded answers, memorize "
+    "task-specific questions, request oracle values, create an ask_user tool, or impose a "
+    "fixed per-task question limit."
 )
 
 

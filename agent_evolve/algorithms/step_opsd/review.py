@@ -39,7 +39,7 @@ Return JSON only with:
   harness_update_hint}
 - interaction_review: {requirement, observed_behavior, decision, evidence_before_decision,
   recommended_timing, information_need, question_template, answer_use,
-  expected_answer_use, harness_update_hint}. Use requirement required|unnecessary;
+  expected_answer_use, harness_update_hint}. Use requirement required|helpful|unnecessary;
   observed_behavior answered_ask|refused_ask|no_ask; decision correct_ask|missed_ask|
   unnecessary_ask|poor_question|correct_abstention; answer_use used_correctly|ignored|
   misused|unavailable. Keep reusable fields abstract and answer-free.
