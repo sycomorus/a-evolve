@@ -47,6 +47,108 @@ def test_split_is_reproducible_and_disjoint() -> None:
     assert first_test == second_test
 
 
+def test_validation_split_preserves_original_test_boundary() -> None:
+    original = ORInteractBenchmark(
+        benchmark_dir=BENCHMARK_DIR,
+        seed=42,
+        train_size=50,
+        val_size=0,
+    )
+    gated = ORInteractBenchmark(
+        benchmark_dir=BENCHMARK_DIR,
+        seed=42,
+        train_size=40,
+        val_size=10,
+    )
+
+    original_train = [task.id for task in original.get_tasks("train", limit=50)]
+    original_test = [task.id for task in original.get_tasks("test", limit=50)]
+    gated_train = [task.id for task in gated.get_tasks("train", limit=40)]
+    gated_val = [task.id for task in gated.get_tasks("validation", limit=10)]
+    gated_test = [task.id for task in gated.get_tasks("test", limit=50)]
+
+    assert gated_train == original_train[:40]
+    assert gated_val == original_train[40:50]
+    assert gated_test == original_test
+    assert [task.id for task in gated.get_tasks("holdout", limit=10)] == gated_val
+    assert set(gated_train).isdisjoint(gated_val)
+    assert set(gated_train).isdisjoint(gated_test)
+    assert set(gated_val).isdisjoint(gated_test)
+
+
+def test_default_holdout_remains_test_alias() -> None:
+    benchmark = ORInteractBenchmark(benchmark_dir=BENCHMARK_DIR)
+
+    assert [task.id for task in benchmark.get_tasks("holdout", limit=50)] == [
+        task.id for task in benchmark.get_tasks("test", limit=50)
+    ]
+
+
+def test_validation_split_errors_when_requested_size_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    benchmark_dir = tmp_path / "OR-Interact-Bench"
+    for index in range(3):
+        _minimal_visible_task(benchmark_dir / "Tiny" / f"task_{index:03d}")
+
+    with pytest.raises(ValueError, match="validation split cannot be satisfied"):
+        ORInteractBenchmark(
+            benchmark_dir=benchmark_dir,
+            dataset="Tiny",
+            train_size=2,
+            val_size=2,
+        )
+
+
+def test_or_interact_clis_parse_validation_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from examples.or_interact_examples import evaluate_or_interact, evolve_or_interact
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "evolve_or_interact.py",
+            "--limit-train",
+            "40",
+            "--limit-val",
+            "10",
+            "--limit-test",
+            "50",
+        ],
+    )
+    evolve_args = evolve_or_interact.parse_args()
+    assert (evolve_args.limit_train, evolve_args.limit_val, evolve_args.limit_test) == (
+        40,
+        10,
+        50,
+    )
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "evaluate_or_interact.py",
+            "--split",
+            "val",
+            "--limit-train",
+            "40",
+            "--limit-val",
+            "10",
+            "--limit-test",
+            "50",
+        ],
+    )
+    evaluate_args = evaluate_or_interact.parse_args()
+    assert evaluate_args.split == "val"
+    assert (evaluate_args.limit_train, evaluate_args.limit_val, evaluate_args.limit_test) == (
+        40,
+        10,
+        50,
+    )
+
+
 def test_loads_dataset_directory_when_index_lacks_dataset(tmp_path: Path) -> None:
     benchmark_dir = tmp_path / "OR-Interact-Bench"
     benchmark_dir.mkdir()

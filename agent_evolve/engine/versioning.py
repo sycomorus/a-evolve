@@ -49,6 +49,18 @@ class VersionControl:
             self._git("tag", "-f", tag)
             logger.debug("Tagged: %s", tag)
 
+    def exclude_path(self, path: str) -> None:
+        """Keep generated runtime artifacts outside workspace snapshots."""
+        exclude_file = self.root / ".git" / "info" / "exclude"
+        exclude_file.parent.mkdir(parents=True, exist_ok=True)
+        normalized = path.strip()
+        existing = exclude_file.read_text(encoding="utf-8") if exclude_file.exists() else ""
+        if normalized and normalized not in existing.splitlines():
+            with exclude_file.open("a", encoding="utf-8") as handle:
+                if existing and not existing.endswith("\n"):
+                    handle.write("\n")
+                handle.write(f"{normalized}\n")
+
     def rollback(self, ref: str = "HEAD~1") -> None:
         """Restore workspace content from *ref* as a NEW commit.
 

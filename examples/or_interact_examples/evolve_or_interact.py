@@ -79,10 +79,12 @@ def main() -> int:
         dataset=args.dataset,
         seed=42,
         train_size=train_size_from_limit(args.limit_train),
+        val_size=args.limit_val,
     )
     config = EvolveConfig(
         batch_size=args.batch_size,
         train_limit=args.limit_train,
+        validation_limit=args.limit_val or None,
         max_cycles=args.max_cycles,
         evolver_model=evolver_model,
         evolve_prompts=True,
@@ -298,7 +300,8 @@ def main() -> int:
             MofNCompleteColumn(),
             TextColumn(
                 "[dim]epoch={task.fields[epoch]} batch={task.fields[batch]} "
-                "score={task.fields[score]} mutated={task.fields[mutated]}"
+                "score={task.fields[score]} mutated={task.fields[mutated]} "
+                "gate={task.fields[gate]}"
             ),
             TimeElapsedColumn(),
             console=console,
@@ -310,6 +313,7 @@ def main() -> int:
                 batch="n/a",
                 score="n/a",
                 mutated="n/a",
+                gate="n/a",
             )
 
             def update_progress(event: dict[str, object]) -> None:
@@ -320,6 +324,11 @@ def main() -> int:
                     batch=str(event.get("batch_index", "n/a")),
                     score=f"{float(event['score']):.3f}",
                     mutated="yes" if event["mutated"] else "no",
+                    gate=(
+                        ("accept" if event.get("accepted") else "reject")
+                        if args.limit_val
+                        else "n/a"
+                    ),
                 )
 
             result = evolver.run(cycles=args.max_cycles, progress_callback=update_progress)
@@ -369,6 +378,7 @@ def main() -> int:
         "updates_completed": result.details.get("updates_completed"),
         "max_epochs": args.max_cycles,
         "train_limit": args.limit_train,
+        "validation_limit": args.limit_val,
         "batch_size": args.batch_size,
         "harness_tree": args.harness_tree,
         "step_opsd": args.step_opsd,
@@ -378,6 +388,10 @@ def main() -> int:
         "type_buffer_size": (args.type_buffer_size or args.batch_size) if args.harness_tree else None,
         "router_confidence_threshold": args.router_confidence_threshold if args.harness_tree else None,
         "score_history": result.score_history,
+        "initial_validation_accuracy": result.initial_validation_accuracy,
+        "validation_accuracy_history": result.validation_accuracy_history,
+        "validation_accepted_history": result.validation_accepted_history,
+        "final_validation_accuracy": result.final_validation_accuracy,
         "test_total": eval_summary["total"],
         "test_success": eval_summary["success"],
         "test_accuracy": eval_summary["accuracy"],
@@ -468,6 +482,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-skills", type=int, default=8)
     parser.add_argument("--limit-train", type=int, help="Total number of train tasks for this run.")
+    parser.add_argument(
+        "--limit-val",
+        type=_non_negative_int,
+        default=0,
+        help="Validation tasks used to gate each non-Harness-Tree harness update.",
+    )
     parser.add_argument("--limit-test", type=int)
     parser.add_argument(
         "--enable-heuristic-tool",
@@ -501,7 +521,16 @@ def parse_args() -> argparse.Namespace:
         parser.error("--offline requires --harness-tree")
     if args.step_opsd and args.harness_tree:
         parser.error("--step-opsd is only supported without --harness-tree")
+    if args.limit_val and args.harness_tree:
+        parser.error("--limit-val is only supported without --harness-tree")
     return args
+
+
+def _non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be a non-negative integer")
+    return parsed
 
 
 def _write_or_interact_settings(

@@ -47,22 +47,30 @@ class ORInteractBenchmark(BenchmarkAdapter):
         dataset: str = "IndustryOR",
         seed: int = 42,
         train_size: int = 50,
+        val_size: int = 0,
     ) -> None:
         self.benchmark_dir = _default_benchmark_dir() if benchmark_dir is None else Path(benchmark_dir).resolve()
         self.dataset = dataset
         self.seed = seed
         self.train_size = train_size
+        self.val_size = val_size
         self._tasks = self._load_tasks()
-        self._train, self._test = self._split_tasks()
+        self._train, self._val, self._test = self._split_tasks()
 
     def get_tasks(self, split: str = "train", limit: int = 10) -> list[Task]:
         split_key = split.lower()
         if split_key == "train":
             tasks = self._train
-        elif split_key in {"holdout", "test"}:
+        elif split_key in {"val", "validation"}:
+            tasks = self._val
+        elif split_key == "holdout":
+            tasks = self._val if self.val_size else self._test
+        elif split_key == "test":
             tasks = self._test
         else:
-            raise ValueError(f"unknown split {split!r}; expected train, holdout, or test")
+            raise ValueError(
+                f"unknown split {split!r}; expected train, val, validation, holdout, or test"
+            )
         return tasks[:limit] if limit is not None else list(tasks)
 
     def evaluate(self, task: Task, trajectory: Trajectory) -> Feedback:
@@ -129,12 +137,22 @@ class ORInteractBenchmark(BenchmarkAdapter):
             tasks.append(self._task_from_index_item(item, task_dir.resolve()))
         return tasks
 
-    def _split_tasks(self) -> tuple[list[Task], list[Task]]:
+    def _split_tasks(self) -> tuple[list[Task], list[Task], list[Task]]:
+        if self.train_size < 0 or self.val_size < 0:
+            raise ValueError("train_size and val_size must be non-negative")
         tasks = list(self._tasks)
         random.Random(self.seed).shuffle(tasks)
+        test_start = self.train_size + self.val_size
+        if self.val_size and test_start > len(tasks):
+            raise ValueError(
+                "requested validation split cannot be satisfied: "
+                f"train_size={self.train_size}, val_size={self.val_size}, "
+                f"available_tasks={len(tasks)}"
+            )
         train = tasks[: self.train_size]
-        test = tasks[self.train_size :]
-        return train, test
+        val = tasks[self.train_size : test_start]
+        test = tasks[test_start:]
+        return train, val, test
 
     def _task_from_index_item(self, item: dict[str, Any], task_dir: Path) -> Task:
         task_id = str(item["task_id"])

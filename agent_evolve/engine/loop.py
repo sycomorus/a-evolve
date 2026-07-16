@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 from ..config import EvolveConfig
+from ..evaluation import run_evaluation
 from ..types import CycleRecord, EvolutionResult, Observation
 from .history import EvolutionHistory
 from .observer import Observer
@@ -78,6 +79,44 @@ class EvolutionLoop:
         self.versioning.init()
 
         score_history: list[float] = []
+        validation_accuracy_history: list[float] = []
+        validation_accepted_history: list[bool] = []
+        validation_tasks = []
+        initial_validation_accuracy: float | None = None
+        accepted_validation_accuracy: float | None = None
+        validation_limit = int(self.config.validation_limit or 0)
+        if validation_limit > 0:
+            if self.engine.manages_own_evaluation:
+                raise ValueError("validation gating is not supported for self-managing engines")
+            self.versioning.exclude_path("evolution/validation/")
+            validation_tasks = self.benchmark.get_tasks(
+                split="val",
+                limit=validation_limit,
+            )
+            if len(validation_tasks) != validation_limit:
+                raise ValueError(
+                    "requested validation tasks cannot be satisfied: "
+                    f"requested={validation_limit}, available={len(validation_tasks)}"
+                )
+            baseline_summary = run_evaluation(
+                self.agent,
+                self.benchmark,
+                split="val",
+                limit=validation_limit,
+                tasks=validation_tasks,
+                output_dir=evolution_dir / "validation" / "baseline",
+            )
+            baseline_summary["version_tag"] = "evo-0"
+            (evolution_dir / "validation" / "baseline" / "summary.json").write_text(
+                json.dumps(baseline_summary, indent=2),
+                encoding="utf-8",
+            )
+            initial_validation_accuracy = float(baseline_summary["accuracy"])
+            accepted_validation_accuracy = initial_validation_accuracy
+            logger.info(
+                "Initial validation accuracy: %.3f",
+                initial_validation_accuracy,
+            )
         completed_updates = 0
         completed_epochs = 0
         schedule = self._build_training_schedule(max_epochs)
@@ -173,15 +212,84 @@ class EvolutionLoop:
                 trial=self.trial,
             )
 
-            # 5. POST-EVOLVE SNAPSHOT
-            if step_result.mutated:
+            # 5. POST-EVOLVE SNAPSHOT + OPTIONAL VALIDATION GATE
+            if validation_tasks and step_result.mutated:
                 self.versioning.commit(
-                    message=f"evo-{cycle_num}: {step_result.summary}",
+                    message=f"candidate-evo-{cycle_num}: {step_result.summary}",
+                    tag=f"candidate-evo-{cycle_num}",
+                )
+
+            accepted = step_result.mutated
+            rolled_back = False
+            validation_metadata: dict[str, Any] = {}
+            if validation_tasks:
+                self.agent.reload_from_fs()
+                comparison_baseline = float(accepted_validation_accuracy)
+                validation_cycle_dir = (
+                    evolution_dir / "validation" / f"cycle_{cycle_num:04d}"
+                )
+                validation_summary = run_evaluation(
+                    self.agent,
+                    self.benchmark,
+                    split="val",
+                    limit=validation_limit,
+                    tasks=validation_tasks,
+                    output_dir=validation_cycle_dir,
+                )
+                candidate_accuracy = float(validation_summary["accuracy"])
+                accepted = candidate_accuracy >= comparison_baseline
+                validation_accuracy_history.append(candidate_accuracy)
+                validation_accepted_history.append(accepted)
+
+                if step_result.mutated and not accepted:
+                    self.versioning.commit(
+                        message=(
+                            f"rejected-evo-{cycle_num}: validation="
+                            f"{candidate_accuracy:.3f} < {comparison_baseline:.3f}"
+                        ),
+                        tag=f"rejected-evo-{cycle_num}",
+                    )
+                    self.versioning.rollback_to_tag(f"pre-evo-{cycle_num}")
+                    self.agent.reload_from_fs()
+                    rolled_back = True
+                elif accepted:
+                    accepted_validation_accuracy = candidate_accuracy
+
+                self.versioning.commit(
+                    message=(
+                        f"evo-{cycle_num}: accepted={accepted}, "
+                        f"validation={candidate_accuracy:.3f}"
+                    ),
                     tag=f"evo-{cycle_num}",
+                )
+                validation_metadata = {
+                    "candidate_accuracy": candidate_accuracy,
+                    "comparison_baseline": comparison_baseline,
+                    "accepted": accepted,
+                    "rolled_back": rolled_back,
+                    "candidate_tag": (
+                        f"candidate-evo-{cycle_num}" if step_result.mutated else None
+                    ),
+                    "rejected_tag": (
+                        f"rejected-evo-{cycle_num}" if rolled_back else None
+                    ),
+                    "effective_tag": f"evo-{cycle_num}",
+                }
+                validation_summary.update(validation_metadata)
+                validation_summary["accepted_accuracy_after_cycle"] = float(
+                    accepted_validation_accuracy
+                )
+                (validation_cycle_dir / "summary.json").write_text(
+                    json.dumps(validation_summary, indent=2),
+                    encoding="utf-8",
                 )
             else:
                 self.versioning.commit(
-                    message=f"evo-{cycle_num}: no mutation",
+                    message=(
+                        f"evo-{cycle_num}: {step_result.summary}"
+                        if step_result.mutated
+                        else f"evo-{cycle_num}: no mutation"
+                    ),
                     tag=f"evo-{cycle_num}",
                 )
 
@@ -193,19 +301,34 @@ class EvolutionLoop:
                 engine_name=self.engine.__class__.__name__,
                 summary=step_result.summary,
                 observation_batch=batch_path.name,
-                metadata=step_result.metadata,
+                metadata={**step_result.metadata, "validation": validation_metadata},
             )
             self.history.record_cycle(record)
 
             # 7. RELOAD
-            self.agent.reload_from_fs()
-            self.engine.on_cycle_end(accepted=step_result.mutated, score=cycle_score)
+            if not validation_tasks:
+                self.agent.reload_from_fs()
+            self.engine.on_cycle_end(accepted=accepted, score=cycle_score)
 
             # 7b. STOP CHECK
             if step_result.stop:
                 logger.info("Engine requested early stop after cycle %d.", cycle_num)
-                self._append_history(evolution_dir, cycle_num, cycle_score, step_result.mutated)
-                self._write_metrics(evolution_dir, score_history)
+                self._append_history(
+                    evolution_dir,
+                    cycle_num,
+                    cycle_score,
+                    step_result.mutated,
+                    accepted=accepted,
+                    validation=validation_metadata,
+                )
+                self._write_metrics(
+                    evolution_dir,
+                    score_history,
+                    initial_validation_accuracy=initial_validation_accuracy,
+                    validation_accuracy_history=validation_accuracy_history,
+                    validation_accepted_history=validation_accepted_history,
+                    final_validation_accuracy=accepted_validation_accuracy,
+                )
                 self._notify_progress(
                     progress_callback,
                     cycle_num,
@@ -213,6 +336,7 @@ class EvolutionLoop:
                     cycle_score,
                     step_result.mutated,
                     step_result.summary,
+                    accepted=accepted,
                     stopped=True,
                     converged=True,
                     epoch=int(item["epoch"]),
@@ -223,17 +347,39 @@ class EvolutionLoop:
                     cycles_completed=completed_updates,
                     final_score=cycle_score,
                     score_history=score_history,
+                    initial_validation_accuracy=initial_validation_accuracy,
+                    validation_accuracy_history=validation_accuracy_history,
+                    validation_accepted_history=validation_accepted_history,
+                    final_validation_accuracy=accepted_validation_accuracy,
                     converged=True,
-                    details={
-                        "epochs_completed": completed_epochs,
-                        "updates_completed": completed_updates,
-                        "total_updates": total_updates,
-                    },
+                    details=self._result_details(
+                        completed_epochs,
+                        completed_updates,
+                        total_updates,
+                        initial_validation_accuracy,
+                        validation_accuracy_history,
+                        validation_accepted_history,
+                        accepted_validation_accuracy,
+                    ),
                 )
 
             # 8. LOGGING
-            self._append_history(evolution_dir, cycle_num, cycle_score, step_result.mutated)
-            self._write_metrics(evolution_dir, score_history)
+            self._append_history(
+                evolution_dir,
+                cycle_num,
+                cycle_score,
+                step_result.mutated,
+                accepted=accepted,
+                validation=validation_metadata,
+            )
+            self._write_metrics(
+                evolution_dir,
+                score_history,
+                initial_validation_accuracy=initial_validation_accuracy,
+                validation_accuracy_history=validation_accuracy_history,
+                validation_accepted_history=validation_accepted_history,
+                final_validation_accuracy=accepted_validation_accuracy,
+            )
             self._notify_progress(
                 progress_callback,
                 cycle_num,
@@ -241,6 +387,7 @@ class EvolutionLoop:
                 cycle_score,
                 step_result.mutated,
                 step_result.summary,
+                accepted=accepted,
                 epoch=int(item["epoch"]),
                 batch_index=int(item["batch_index"]),
                 batch_count=int(item["batch_count"]),
@@ -253,24 +400,40 @@ class EvolutionLoop:
                     cycles_completed=completed_updates,
                     final_score=cycle_score,
                     score_history=score_history,
+                    initial_validation_accuracy=initial_validation_accuracy,
+                    validation_accuracy_history=validation_accuracy_history,
+                    validation_accepted_history=validation_accepted_history,
+                    final_validation_accuracy=accepted_validation_accuracy,
                     converged=True,
-                    details={
-                        "epochs_completed": completed_epochs,
-                        "updates_completed": completed_updates,
-                        "total_updates": total_updates,
-                    },
+                    details=self._result_details(
+                        completed_epochs,
+                        completed_updates,
+                        total_updates,
+                        initial_validation_accuracy,
+                        validation_accuracy_history,
+                        validation_accepted_history,
+                        accepted_validation_accuracy,
+                    ),
                 )
 
         return EvolutionResult(
             cycles_completed=completed_updates,
             final_score=score_history[-1] if score_history else 0.0,
             score_history=score_history,
+            initial_validation_accuracy=initial_validation_accuracy,
+            validation_accuracy_history=validation_accuracy_history,
+            validation_accepted_history=validation_accepted_history,
+            final_validation_accuracy=accepted_validation_accuracy,
             converged=False,
-            details={
-                "epochs_completed": completed_epochs,
-                "updates_completed": completed_updates,
-                "total_updates": total_updates,
-            },
+            details=self._result_details(
+                completed_epochs,
+                completed_updates,
+                total_updates,
+                initial_validation_accuracy,
+                validation_accuracy_history,
+                validation_accepted_history,
+                accepted_validation_accuracy,
+            ),
         )
 
     # ── Internal helpers ──────────────────────────────────────
@@ -284,6 +447,7 @@ class EvolutionLoop:
         mutated: bool,
         summary: str,
         *,
+        accepted: bool | None = None,
         stopped: bool = False,
         converged: bool = False,
         epoch: int | None = None,
@@ -297,6 +461,7 @@ class EvolutionLoop:
             "total_cycles": total_cycles,
             "score": score,
             "mutated": mutated,
+            "accepted": mutated if accepted is None else accepted,
             "summary": summary,
             "stopped": stopped,
             "converged": converged,
@@ -342,24 +507,66 @@ class EvolutionLoop:
         ]
 
     def _append_history(
-        self, evolution_dir: Path, cycle: int, score: float, mutated: bool
+        self,
+        evolution_dir: Path,
+        cycle: int,
+        score: float,
+        mutated: bool,
+        *,
+        accepted: bool,
+        validation: dict[str, Any],
     ) -> None:
         history_file = evolution_dir / "history.jsonl"
         entry = {
             "cycle": cycle,
             "score": score,
             "mutated": mutated,
+            "accepted": accepted,
+            "validation": validation,
             "timestamp": datetime.now().isoformat(),
         }
         with open(history_file, "a") as f:
             f.write(json.dumps(entry) + "\n")
 
-    def _write_metrics(self, evolution_dir: Path, scores: list[float]) -> None:
+    def _write_metrics(
+        self,
+        evolution_dir: Path,
+        scores: list[float],
+        *,
+        initial_validation_accuracy: float | None,
+        validation_accuracy_history: list[float],
+        validation_accepted_history: list[bool],
+        final_validation_accuracy: float | None,
+    ) -> None:
         metrics_file = evolution_dir / "metrics.json"
         metrics = {
             "cycles_completed": len(scores),
             "latest_score": scores[-1] if scores else 0.0,
             "best_score": max(scores) if scores else 0.0,
             "avg_score": sum(scores) / len(scores) if scores else 0.0,
+            "initial_validation_accuracy": initial_validation_accuracy,
+            "validation_accuracy_history": validation_accuracy_history,
+            "validation_accepted_history": validation_accepted_history,
+            "final_validation_accuracy": final_validation_accuracy,
         }
         metrics_file.write_text(json.dumps(metrics, indent=2))
+
+    @staticmethod
+    def _result_details(
+        epochs_completed: int,
+        updates_completed: int,
+        total_updates: int,
+        initial_validation_accuracy: float | None,
+        validation_accuracy_history: list[float],
+        validation_accepted_history: list[bool],
+        final_validation_accuracy: float | None,
+    ) -> dict[str, Any]:
+        return {
+            "epochs_completed": epochs_completed,
+            "updates_completed": updates_completed,
+            "total_updates": total_updates,
+            "initial_validation_accuracy": initial_validation_accuracy,
+            "validation_accuracy_history": list(validation_accuracy_history),
+            "validation_accepted_history": list(validation_accepted_history),
+            "final_validation_accuracy": final_validation_accuracy,
+        }

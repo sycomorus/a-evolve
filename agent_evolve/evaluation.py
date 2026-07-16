@@ -21,6 +21,7 @@ from .benchmarks.base import BenchmarkAdapter
 from .algorithms.step_opsd import summarize_interaction_metrics
 from .protocol.base_agent import BaseAgent
 from .task_runner import TaskEvaluation, resolve_agent_parallelism, run_task_evaluations
+from .types import Task
 
 
 def run_evaluation(
@@ -32,6 +33,7 @@ def run_evaluation(
     output_dir: str | Path,
     show_progress: bool = False,
     console: Console | None = None,
+    tasks: list[Task] | None = None,
 ) -> dict[str, Any]:
     """Run ``agent.solve`` and ``benchmark.evaluate`` on one split.
 
@@ -41,8 +43,14 @@ def run_evaluation(
     destination = Path(output_dir)
     destination.mkdir(parents=True, exist_ok=True)
 
-    tasks = benchmark.get_tasks(split=split, limit=limit)
-    workers = min(resolve_agent_parallelism(agent), len(tasks)) if tasks else 0
+    selected_tasks = (
+        benchmark.get_tasks(split=split, limit=limit) if tasks is None else list(tasks)
+    )
+    workers = (
+        min(resolve_agent_parallelism(agent), len(selected_tasks))
+        if selected_tasks
+        else 0
+    )
 
     if show_progress:
         active_console = console or Console()
@@ -58,7 +66,7 @@ def run_evaluation(
         ) as progress:
             task_id = progress.add_task(
                 "evaluate",
-                total=len(tasks),
+                total=len(selected_tasks),
                 current_task="starting",
                 workers=workers,
             )
@@ -73,11 +81,11 @@ def run_evaluation(
             evaluations = run_task_evaluations(
                 agent,
                 benchmark,
-                tasks,
+                selected_tasks,
                 on_complete=update_progress,
             )
     else:
-        evaluations = run_task_evaluations(agent, benchmark, tasks)
+        evaluations = run_task_evaluations(agent, benchmark, selected_tasks)
 
     rows = [_row_from_evaluation(result) for result in evaluations]
 

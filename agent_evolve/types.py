@@ -83,5 +83,9 @@ class EvolutionResult:
     cycles_completed: int
     final_score: float
     score_history: list[float] = field(default_factory=list)
+    initial_validation_accuracy: float | None = None
+    validation_accuracy_history: list[float] = field(default_factory=list)
+    validation_accepted_history: list[bool] = field(default_factory=list)
+    final_validation_accuracy: float | None = None
     converged: bool = False
     details: dict[str, Any] = field(default_factory=dict)

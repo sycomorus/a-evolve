@@ -54,10 +54,12 @@ def main() -> int:
         dataset=args.dataset,
         seed=42,
         train_size=train_size_from_limit(args.limit_train),
+        val_size=args.limit_val,
     )
     evaluation_limit = evaluation_limit_for_split(
         args.split,
         limit_train=args.limit_train,
+        limit_val=args.limit_val,
         limit_test=args.limit_test,
         legacy_limit=args.limit,
     )
@@ -82,6 +84,7 @@ def main() -> int:
     summary["source_type"] = source_type
     summary["dataset"] = args.dataset
     summary["limit_train"] = args.limit_train
+    summary["limit_val"] = args.limit_val
     summary["limit_test"] = args.limit_test
     summary["check"] = False
     (output_dir / "summary.json").write_text(
@@ -127,6 +130,14 @@ def parse_args() -> argparse.Namespace:
         help="Train split size and evaluation limit when --split train.",
     )
     parser.add_argument(
+        "--limit-val",
+        "--limit_val",
+        dest="limit_val",
+        type=_non_negative_int,
+        default=0,
+        help="Validation split size and evaluation limit when --split val.",
+    )
+    parser.add_argument(
         "--limit-test",
         "--limit_test",
         dest="limit_test",
@@ -135,6 +146,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir")
     return parser.parse_args()
+
+
+def _non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be a non-negative integer")
+    return parsed
 
 
 def _default_output_dir(work_dir: str | Path, _workspace: Path, split: str) -> Path:

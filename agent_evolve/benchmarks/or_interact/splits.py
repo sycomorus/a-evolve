@@ -14,17 +14,22 @@ def train_size_from_limit(limit_train: int | None) -> int:
 def evaluation_limit_for_split(
     split: str,
     *,
-    limit_train: int | None,
-    limit_test: int | None,
+    limit_train: int | None = None,
+    limit_val: int | None = None,
+    limit_test: int | None = None,
     legacy_limit: int | None = None,
 ) -> int:
     split_key = split.lower()
     if split_key == "train":
         limit = limit_train
+    elif split_key in {"val", "validation"}:
+        limit = limit_val
     elif split_key in {"holdout", "test"}:
-        limit = limit_test
+        limit = limit_val if split_key == "holdout" and limit_val else limit_test
     else:
-        raise ValueError(f"unknown split {split!r}; expected train, holdout, or test")
+        raise ValueError(
+            f"unknown split {split!r}; expected train, val, validation, holdout, or test"
+        )
 
     if limit is not None:
         return limit

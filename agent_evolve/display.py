@@ -51,6 +51,20 @@ def print_evolve_summary(summary: dict[str, Any], *, console: Console | None = N
         score_text = " -> ".join(_format_float(score) for score in score_history)
         active_console.print(Panel(score_text, title="Train Score History", expand=False))
 
+    validation_history = summary.get("validation_accuracy_history") or []
+    accepted_history = summary.get("validation_accepted_history") or []
+    if validation_history:
+        entries = [
+            f"{_format_float(score)} ({'accept' if accepted else 'reject'})"
+            for score, accepted in zip(validation_history, accepted_history)
+        ]
+        initial = summary.get("initial_validation_accuracy")
+        if initial is not None:
+            entries.insert(0, f"baseline {_format_float(initial)}")
+        active_console.print(
+            Panel(" -> ".join(entries), title="Validation History", expand=False)
+        )
+
 
 def print_run_header(
     *,
