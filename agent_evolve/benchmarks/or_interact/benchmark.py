@@ -10,12 +10,19 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from user.simulator import (
+    USER_RESPONSE_REASONS,
+    load_grounded_records,
+    safe_user_response_summary,
+)
+
 from ..base import BenchmarkAdapter
 from ...types import Feedback, Task, Trajectory
 
 
 ANSWER_FILENAME = "submitted_answer.csv"
 REFERENCE_SOLUTION_FILENAME = "reference_solution.py"
+REFUSAL_CODES = tuple(code for code in USER_RESPONSE_REASONS if code != "answered")
 
 
 @dataclass(frozen=True)
@@ -217,8 +224,10 @@ def _interaction_diagnostics(
         path.is_file() and path.suffix == ".md" and not path.name.startswith(".")
         for path in grounded_dir.iterdir()
     )
+    grounded_record_count = len(load_grounded_records(task_dir))
     ask_count = 0
     answered_count = 0
+    refusal_counts = {code: 0 for code in REFUSAL_CODES}
     pending_ids: set[str] = set()
     pending_without_id = 0
     events = trajectory.conversation or trajectory.steps
@@ -242,24 +251,24 @@ def _interaction_diagnostics(
         elif pending_without_id:
             pending_without_id -= 1
         output = event.get("output", event.get("content", {}))
-        if _ask_user_answered(output):
+        response = safe_user_response_summary(output)
+        if response["answered"]:
             answered_count += 1
-    return {
+        code = response.get("code")
+        if code in refusal_counts:
+            refusal_counts[code] += 1
+    diagnostics = {
         "has_grounded": has_grounded,
+        "grounded_record_count": grounded_record_count,
+        "has_answerable_grounded": grounded_record_count > 0,
         "ask_count": ask_count,
         "answered_ask_count": answered_count,
         "refused_ask_count": max(0, ask_count - answered_count),
     }
-
-
-def _ask_user_answered(output: Any) -> bool:
-    if isinstance(output, str):
-        try:
-            output = json.loads(output)
-        except Exception:
-            return False
-    response = output.get("user_response", {}) if isinstance(output, dict) else {}
-    return bool(response.get("answered"))
+    diagnostics.update(
+        {f"{code}_ask_count": count for code, count in refusal_counts.items()}
+    )
+    return diagnostics
 
 
 def _feedback_detail(evaluation: ObjectiveEvaluation, trajectory: Trajectory, task_dir: Path) -> str:

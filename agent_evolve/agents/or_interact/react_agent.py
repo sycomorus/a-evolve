@@ -64,6 +64,9 @@ The `ask_user` tool is available. Use it proactively when additional user knowle
 resolve a plausible ambiguity, missing assumption, domain convention, data interpretation,
 objective scope, or reporting requirement. Prefer clarification over silently inventing an
 assumption. Do not ask the user to provide the oracle objective or solve the optimization task for you.
+After `no_match` or `no_grounded_records`, do not probe by
+rephrasing or enumerating possible hidden clarifications; continue from visible evidence
+and state any unresolved limitation.
 """
 
 

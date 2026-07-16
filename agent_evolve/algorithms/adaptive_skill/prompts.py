@@ -7,6 +7,8 @@ import logging
 import re
 from typing import Any
 
+from user.simulator import safe_user_response_summary
+
 from ...contract.workspace import AgentWorkspace
 from ..step_opsd import (
     redacted_step_opsd_for_evolver,
@@ -228,6 +230,8 @@ def _code_arg_name(tool_name: str, args: dict[str, Any]) -> str | None:
 
 
 def _summarize_args(tool_name: str, args: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    if tool_name == "ask_user":
+        return {}, None
     summarized: dict[str, Any] = {}
     code_summary = None
     code_key = _code_arg_name(tool_name, args)
@@ -452,13 +456,7 @@ def build_tool_trace(conversation: list[dict[str, Any]], profile: str = "main") 
 
 
 def _summarize_ask_user_output(output: Any) -> dict[str, Any]:
-    if isinstance(output, str):
-        try:
-            output = json.loads(output)
-        except Exception:
-            output = {}
-    response = output.get("user_response", {}) if isinstance(output, dict) else {}
-    return {"answered": bool(response.get("answered"))}
+    return safe_user_response_summary(output)
 
 
 def _matching_tool_entry(

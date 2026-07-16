@@ -154,32 +154,41 @@ def test_tool_trace_uses_canonical_events_without_assistant_double_count() -> No
     assert trace[0]["tool"] == "read_csv"
 
 
-def test_tool_trace_redacts_ask_user_answer_and_match_file() -> None:
+def test_tool_trace_redacts_ask_user_question_answer_and_match_file() -> None:
     trace = build_tool_trace(
         [
             {
                 "type": "tool_call",
                 "name": "ask_user",
-                "arguments": {"question": "Which interpretation should I use?"},
+                "arguments": {"question": "PRIVATE AGENT QUESTION"},
             },
             {
                 "type": "tool_output",
                 "name": "ask_user",
                 "output": {
                     "user_response": {
-                        "answered": True,
+                        "answered": False,
                         "answer": "PRIVATE GROUNDED ANSWER",
                         "matched_file": "private-grounded.md",
+                        "code": "no_match",
+                        "reason": "PRIVATE MATCHER REASON",
                     }
                 },
             },
         ]
     )
 
-    assert trace[0]["args"]["question"] == "Which interpretation should I use?"
-    assert trace[0]["output"] == {"answered": True}
-    assert "PRIVATE GROUNDED ANSWER" not in json.dumps(trace)
-    assert "private-grounded.md" not in json.dumps(trace)
+    assert trace[0]["args"] == {}
+    assert trace[0]["output"] == {
+        "answered": False,
+        "code": "no_match",
+        "reason": "No task-specific clarification matches this question.",
+    }
+    serialized = json.dumps(trace)
+    assert "PRIVATE AGENT QUESTION" not in serialized
+    assert "PRIVATE GROUNDED ANSWER" not in serialized
+    assert "private-grounded.md" not in serialized
+    assert "PRIVATE MATCHER REASON" not in serialized
 
 
 def test_step_opsd_leakage_check_covers_oracle_and_grounded_content() -> None:
@@ -215,13 +224,20 @@ def test_interaction_metrics_cover_recall_abstention_and_answer_use() -> None:
     rows = [
         {"success": True, "has_grounded": True, "ask_count": 1, "answered_ask_count": 1},
         {"success": False, "has_grounded": True, "ask_count": 0, "answered_ask_count": 0},
-        {"success": True, "has_grounded": False, "ask_count": 0, "answered_ask_count": 0},
+        {
+            "success": True,
+            "has_grounded": True,
+            "has_answerable_grounded": False,
+            "ask_count": 0,
+            "answered_ask_count": 0,
+        },
         {
             "success": False,
             "has_grounded": False,
             "ask_count": 1,
             "answered_ask_count": 0,
             "refused_ask_count": 1,
+            "no_grounded_records_ask_count": 1,
         },
     ]
     reviews = [{
@@ -240,6 +256,10 @@ def test_interaction_metrics_cover_recall_abstention_and_answer_use() -> None:
     assert metrics["grounded_match_rate"] == 0.5
     assert metrics["correct_abstention_rate"] == 0.5
     assert metrics["answer_utilization_rate"] == 1.0
+    assert metrics["no_grounded_records_asks"] == 1
+    assert metrics["no_grounded_records_rate"] == 0.5
+    assert metrics["no_match_asks"] == 0
+    assert metrics["no_match_rate"] == 0.0
 
 
 def test_tool_trace_redacts_code_and_uses_branch_summary_detail() -> None:

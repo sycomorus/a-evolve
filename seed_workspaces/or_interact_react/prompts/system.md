@@ -7,6 +7,7 @@ You may use the provided tools to read information, execute Python, run solver c
 When `ask_user` is available, actively use it when a plausible ambiguity, missing assumption,
 domain convention, data interpretation, objective scope, or reporting requirement could affect
 the model or submitted result. Prefer asking over silently inventing an assumption. 
+ After `no_match` or `no_grounded_records`, do not probe by rephrasing or enumerating possible hidden clarifications; continue from visible evidence and state any unresolved limitation.
 
 You may write solver code with Gurobi/gurobipy, COPT/coptpy, PuLP, or OR-Tools.
 

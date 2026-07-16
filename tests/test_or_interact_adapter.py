@@ -131,7 +131,29 @@ def test_evaluate_records_grounded_ask_diagnostics(tmp_path: Path) -> None:
         {
             "type": "tool_output",
             "name": "ask_user",
-            "output": {"user_response": {"answered": True, "answer": "private"}},
+            "output": {
+                "user_response": {
+                    "answered": True,
+                    "answer": "private",
+                    "matched_file": "clarification.md",
+                    "code": "answered",
+                    "reason": "private matcher reason",
+                }
+            },
+        },
+        {"type": "tool_call", "name": "ask_user", "arguments": {"question": "Which route?"}},
+        {
+            "type": "tool_output",
+            "name": "ask_user",
+            "output": {
+                "user_response": {
+                    "answered": False,
+                    "answer": "private refusal",
+                    "matched_file": None,
+                    "code": "no_match",
+                    "reason": "private matcher reason",
+                }
+            },
         },
         {"type": "run_summary", "runtime_dir": str(tmp_path), "status": "success"},
     ]
@@ -146,23 +168,41 @@ def test_evaluate_records_grounded_ask_diagnostics(tmp_path: Path) -> None:
 
     evaluation = feedback.raw["evaluation"]
     assert evaluation["has_grounded"] is True
-    assert evaluation["ask_count"] == 1
+    assert evaluation["grounded_record_count"] > 0
+    assert evaluation["has_answerable_grounded"] is True
+    assert evaluation["ask_count"] == 2
     assert evaluation["answered_ask_count"] == 1
-    assert evaluation["refused_ask_count"] == 0
+    assert evaluation["refused_ask_count"] == 1
+    assert evaluation["no_match_ask_count"] == 1
+    assert evaluation["no_grounded_records_ask_count"] == 0
 
 
 def test_observer_redacts_grounded_answer_from_persisted_trajectory(tmp_path: Path) -> None:
     task = Task(id="task_x", input="", metadata={})
     events = [
+        {
+            "type": "assistant_message",
+            "content": "I should ask.",
+            "tool_calls": [
+                {
+                    "function": {
+                        "name": "ask_user",
+                        "arguments": json.dumps({"question": "PRIVATE DUPLICATE QUESTION"}),
+                    }
+                }
+            ],
+        },
         {"type": "tool_call", "name": "ask_user", "arguments": {"question": "Which rule?"}},
         {
             "type": "tool_output",
             "name": "ask_user",
             "output": {
                 "user_response": {
-                    "answered": True,
+                    "answered": False,
                     "answer": "PRIVATE GROUNDED ANSWER",
                     "matched_file": "private.md",
+                    "code": "no_match",
+                    "reason": "PRIVATE MATCHER REASON",
                 }
             },
         },
@@ -176,10 +216,19 @@ def test_observer_redacts_grounded_answer_from_persisted_trajectory(tmp_path: Pa
     record = Observer(tmp_path / "evolution").record_from_observation(observation)
 
     serialized = json.dumps(record)
+    assert "Which rule?" not in serialized
+    assert "PRIVATE DUPLICATE QUESTION" not in serialized
     assert "PRIVATE GROUNDED ANSWER" not in serialized
     assert "private.md" not in serialized
-    assert record["conversation"][1]["output"] == {
-        "user_response": {"answered": True}
+    assert "PRIVATE MATCHER REASON" not in serialized
+    assert record["conversation"][0]["tool_calls"][0]["function"]["arguments"] == "{}"
+    assert record["conversation"][1]["arguments"] == {}
+    assert record["conversation"][2]["output"] == {
+        "user_response": {
+            "answered": False,
+            "code": "no_match",
+            "reason": "No task-specific clarification matches this question.",
+        }
     }
 
 
@@ -343,22 +392,23 @@ def test_or_interact_user_tool_is_enabled_only_by_workspace_setting(
 
     class FakeReActAgent:
         def __init__(self, *, config, trace, registry, system_prompt):
+            self.registry = registry
             captured["system_prompt"] = system_prompt
             captured["tools"] = registry.list_tools()
 
         def run(self, **kwargs):
             from baseline.react.agent import AgentResult
 
+            captured["user_response"] = self.registry.call(
+                "ask_user",
+                question="Which depot?",
+            )
             return AgentResult(status="success", turns=1, objective_value=1)
 
     monkeypatch.setattr("user.simulator.OpenAI", FakeOpenAI)
     monkeypatch.setattr("agent_evolve.agents.or_interact.react_agent.ReActAgent", FakeReActAgent)
     task_dir = _visible_task(tmp_path)
     (task_dir / "grounded").mkdir()
-    (task_dir / "grounded" / "clarification.md").write_text(
-        "## Question\nWhich depot?\n\n## Answer\nDepot A.\n",
-        encoding="utf-8",
-    )
     agent = ORReactAgent(workspace)
     task = Task(id="task_x", input="", metadata={"task_dir": str(task_dir), "dataset": "IndustryOR"})
 
@@ -367,9 +417,21 @@ def test_or_interact_user_tool_is_enabled_only_by_workspace_setting(
     prompt = str(captured["system_prompt"])
     assert "ask_user" in captured["tools"]
     assert "ask_user" in prompt
-    assert "Use it proactively" in prompt
-    assert "multiple distinct questions" in prompt
-    assert "rephrase a refused question" in prompt
+    assert "limited set" in prompt
+    assert "not a general-purpose user" in prompt
+    assert "no_grounded_records" in prompt
+    assert "multiple distinct questions" not in prompt
+    assert "rephrase a refused question" not in prompt
+    assert captured["user_response"] == {
+        "user_response": {
+            "answered": False,
+            "question": "Which depot?",
+            "answer": "I cannot answer this from the available grounded clarifications.",
+            "matched_file": None,
+            "code": "no_grounded_records",
+            "reason": "No task-specific grounded clarifications are available.",
+        }
+    }
     assert "run_heuristic" not in captured["tools"]
 
 

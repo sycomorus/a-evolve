@@ -13,6 +13,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from user.simulator import safe_user_response_summary
+
 from ..types import Observation
 
 logger = logging.getLogger(__name__)
@@ -143,17 +145,35 @@ def _redact_ask_user_outputs(events: list[dict[str, Any]]) -> list[dict[str, Any
     redacted = []
     for event in events:
         safe_event = dict(event)
-        if safe_event.get("type") == "tool_output" and safe_event.get("name") == "ask_user":
-            output = safe_event.get("output", safe_event.get("content", {}))
-            if isinstance(output, str):
-                try:
-                    output = json.loads(output)
-                except Exception:
-                    output = {}
-            response = output.get("user_response", {}) if isinstance(output, dict) else {}
-            safe_event["output"] = {
-                "user_response": {"answered": bool(response.get("answered"))}
-            }
-            safe_event.pop("content", None)
+        if safe_event.get("name") == "ask_user":
+            if safe_event.get("type") == "tool_output":
+                output = safe_event.get("output", safe_event.get("content", {}))
+                safe_event["output"] = {
+                    "user_response": safe_user_response_summary(output)
+                }
+                safe_event.pop("content", None)
+            elif safe_event.get("type") in {"tool_call", "assistant_tool_call"}:
+                safe_event["arguments"] = {}
+        tool_calls = safe_event.get("tool_calls")
+        if isinstance(tool_calls, list):
+            safe_calls = []
+            for tool_call in tool_calls:
+                if not isinstance(tool_call, dict):
+                    safe_calls.append(tool_call)
+                    continue
+                safe_call = dict(tool_call)
+                function = safe_call.get("function")
+                if isinstance(function, dict) and function.get("name") == "ask_user":
+                    safe_function = dict(function)
+                    safe_function["arguments"] = (
+                        "{}" if isinstance(safe_function.get("arguments"), str) else {}
+                    )
+                    safe_call["function"] = safe_function
+                elif safe_call.get("name") == "ask_user":
+                    safe_call["arguments"] = (
+                        "{}" if isinstance(safe_call.get("arguments"), str) else {}
+                    )
+                safe_calls.append(safe_call)
+            safe_event["tool_calls"] = safe_calls
         redacted.append(safe_event)
     return redacted

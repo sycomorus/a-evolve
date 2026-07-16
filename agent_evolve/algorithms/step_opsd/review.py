@@ -8,6 +8,8 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+from user.simulator import safe_user_response_summary
+
 from ...llm.base import LLMMessage, LLMProvider
 from ...types import Observation
 
@@ -722,10 +724,34 @@ def _redact_user_answers(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     redacted: list[dict[str, Any]] = []
     for event in events:
         compact = dict(event)
-        if compact.get("type") == "tool_output" and compact.get("name") == "ask_user":
-            output = compact.get("output", compact.get("content", {}))
-            compact["output"] = _safe_user_response(output)
-            compact.pop("content", None)
+        if compact.get("name") == "ask_user":
+            if compact.get("type") == "tool_output":
+                output = compact.get("output", compact.get("content", {}))
+                compact["output"] = _safe_user_response(output)
+                compact.pop("content", None)
+            elif compact.get("type") in {"tool_call", "assistant_tool_call"}:
+                compact["arguments"] = {}
+        tool_calls = compact.get("tool_calls")
+        if isinstance(tool_calls, list):
+            safe_calls = []
+            for tool_call in tool_calls:
+                if not isinstance(tool_call, dict):
+                    safe_calls.append(tool_call)
+                    continue
+                safe_call = dict(tool_call)
+                function = safe_call.get("function")
+                if isinstance(function, dict) and function.get("name") == "ask_user":
+                    safe_function = dict(function)
+                    safe_function["arguments"] = (
+                        "{}" if isinstance(safe_function.get("arguments"), str) else {}
+                    )
+                    safe_call["function"] = safe_function
+                elif safe_call.get("name") == "ask_user":
+                    safe_call["arguments"] = (
+                        "{}" if isinstance(safe_call.get("arguments"), str) else {}
+                    )
+                safe_calls.append(safe_call)
+            compact["tool_calls"] = safe_calls
         redacted.append(compact)
     return redacted
 
@@ -766,14 +792,7 @@ def _redact_record_for_evolver(record: dict[str, Any]) -> dict[str, Any]:
 
 
 def _safe_user_response(output: Any) -> dict[str, Any]:
-    if isinstance(output, str):
-        output = _parse_jsonish(output)
-    response = output.get("user_response", {}) if isinstance(output, dict) else {}
-    return {
-        "user_response": {
-            "answered": bool(response.get("answered")),
-        }
-    }
+    return {"user_response": safe_user_response_summary(output)}
 
 
 def _step_observation(tool: str, output: Any) -> dict[str, Any]:
