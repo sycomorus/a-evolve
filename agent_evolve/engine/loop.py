@@ -183,6 +183,12 @@ class EvolutionLoop:
                                 min(self.config.evolver_max_tokens, 4096),
                             )
                         ),
+                        interaction_enabled=bool(
+                            self.config.extra.get(
+                                "step_opsd_interaction_enabled",
+                                False,
+                            )
+                        ),
                     )
                     batch_path = self.observer.collect_records(records)
                 else:

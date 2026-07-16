@@ -80,6 +80,7 @@ def main() -> int:
         seed=42,
         train_size=train_size_from_limit(args.limit_train),
         val_size=args.limit_val,
+        interaction_enabled=args.enable_user_tool,
     )
     config = EvolveConfig(
         batch_size=args.batch_size,
@@ -382,7 +383,6 @@ def main() -> int:
         "batch_size": args.batch_size,
         "harness_tree": args.harness_tree,
         "step_opsd": args.step_opsd,
-        "step_opsd_interaction": interaction_training,
         "offline": args.offline if args.harness_tree else None,
         "disable_main_evolve": args.disable_main_evolve if args.harness_tree else None,
         "type_buffer_size": (args.type_buffer_size or args.batch_size) if args.harness_tree else None,
@@ -397,9 +397,15 @@ def main() -> int:
         "test_accuracy": eval_summary["accuracy"],
         "test_per_branch": eval_summary.get("per_branch"),
         "test_results_csv": eval_summary.get("results_csv"),
-        "test_interaction_metrics": eval_summary.get("interaction_metrics"),
-        "test_interaction_metrics_path": eval_summary.get("interaction_metrics_path"),
     }
+    if interaction_training:
+        summary.update({
+            "step_opsd_interaction": True,
+            "test_interaction_metrics": eval_summary.get("interaction_metrics"),
+            "test_interaction_metrics_path": eval_summary.get(
+                "interaction_metrics_path"
+            ),
+        })
     (final_dir / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2),
         encoding="utf-8",

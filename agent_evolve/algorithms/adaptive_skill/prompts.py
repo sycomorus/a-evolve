@@ -709,6 +709,7 @@ def build_evolution_prompt(
     scope_instruction: str | None = None,
     evolution_instruction: str | None = None,
     trajectory_profile: str = "main",
+    interaction_enabled: bool = False,
 ) -> str:
     """Build the user-message prompt for one evolution cycle.
 
@@ -760,8 +761,16 @@ def build_evolution_prompt(
                 else None
             )
             if isinstance(compressed, dict):
-                entry["evolve_compressed"] = compressed
-            step_opsd = redacted_step_opsd_for_evolver(log)
+                entry["evolve_compressed"] = dict(compressed)
+                if not interaction_enabled:
+                    entry["evolve_compressed"].pop(
+                        "teacher_interaction_review",
+                        None,
+                    )
+            step_opsd = redacted_step_opsd_for_evolver(
+                log,
+                interaction_enabled=interaction_enabled,
+            )
             if step_opsd is not None:
                 entry["step_opsd"] = step_opsd
             summaries.append(entry)
@@ -803,7 +812,9 @@ def build_evolution_prompt(
         else:
             instruction_lines = _build_trajectory_only_instructions(len(skill_names), max_skills=max_skills, protect_skills=protect_skills)
     else:
-        summary_heading = _build_standard_heading()
+        summary_heading = _build_standard_heading(
+            interaction_enabled=interaction_enabled
+        )
         instruction_lines = _build_standard_instructions()
 
     scope_section = f"### Scope\n{scope_instruction}" if scope_instruction else ""
@@ -812,7 +823,10 @@ def build_evolution_prompt(
         evolution_instruction_section = (
             f"\n\n### Run-Specific Evolution Guidance\n{evolution_instruction}"
         )
-    step_opsd_batch = summarize_step_opsd_batch(recent_logs)
+    step_opsd_batch = summarize_step_opsd_batch(
+        recent_logs,
+        interaction_enabled=interaction_enabled,
+    )
     step_opsd_section = ""
     if step_opsd_batch is not None:
         step_opsd_section = (
@@ -875,8 +889,17 @@ Each task includes:
 **Group failures by category.** If multiple tasks in the same category failed for similar reasons, that's a pattern worth addressing with a category-specific skill."""
 
 
-def _build_standard_heading() -> str:
-    return """\
+def _build_standard_heading(*, interaction_enabled: bool) -> str:
+    interaction_guidance = ""
+    if interaction_enabled:
+        interaction_guidance = """
+- Interaction reviews describe when clarification was required, whether the question was useful,
+  and whether the answer was applied. They never contain the grounded answer. Improve reusable
+  prompt/skill policy that encourages clarification when plausible missing user knowledge
+  could reduce modeling risk. Still never request the oracle/final objective, and apply
+  useful answers to the formulation.
+"""
+    return f"""\
 ### Task Summaries (this batch)
 
 Each task includes:
@@ -886,11 +909,7 @@ Each task includes:
   instead of full source.
 - When Step-OPSD is enabled, `evolve_compressed`, `step_opsd`, and the batch summary contain
   redacted teacher-derived diagnosis for reusable harness evolution.
-- Interaction reviews describe when clarification was required, whether the question was useful,
-  and whether the answer was applied. They never contain the grounded answer. Improve reusable
-  prompt/skill policy that encourages clarification when plausible missing user knowledge
-  could reduce modeling risk. Still never request the oracle/final objective, and apply
-  useful answers to the formulation.
+{interaction_guidance}
 
 Oracle/reference values, reference paths, and reference code are not available to you. Use only
 the redacted feedback, trajectory fields, and redacted Teacher output to identify reusable

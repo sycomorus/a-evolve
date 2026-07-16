@@ -114,6 +114,7 @@ def test_standard_prompt_includes_real_feedback_and_tool_trace(tmp_path: Path) -
         drafts=[],
         evo_number=1,
         trajectory_only=False,
+        interaction_enabled=True,
     )
 
     assert "real benchmark feedback" in prompt
@@ -374,6 +375,7 @@ def test_standard_prompt_includes_redacted_step_opsd_signal(tmp_path: Path) -> N
         drafts=[],
         evo_number=1,
         trajectory_only=False,
+        interaction_enabled=True,
     )
 
     assert "Step-OPSD Batch Summary" in prompt
@@ -381,6 +383,49 @@ def test_standard_prompt_includes_redacted_step_opsd_signal(tmp_path: Path) -> N
     assert "missed_ask" in prompt
     assert "Expected objective: <redacted>" in prompt
     assert "Expected objective: 123" not in prompt
+
+
+def test_standard_prompt_omits_interaction_guidance_when_disabled(
+    tmp_path: Path,
+) -> None:
+    workspace = AgentWorkspace(tmp_path)
+    logs = [
+        {
+            "task_id": "task_001",
+            "success": False,
+            "score": 0.0,
+            "feedback_detail": "Failure reason: outside relative tolerance",
+            "conversation": [],
+            "trace_views": {
+                "evolve_compressed": {
+                    "teacher_interaction_review": {"decision": "missed_ask"},
+                }
+            },
+            "step_opsd": {
+                "redaction_status": "passed",
+                "teacher_review": {
+                    "overall_diagnosis": "Wrong quantity.",
+                    "step_reviews": [],
+                    "missed_steps": [],
+                    "interaction_review": {"decision": "missed_ask"},
+                },
+            },
+        }
+    ]
+
+    prompt = build_evolution_prompt(
+        workspace=workspace,
+        logs=logs,
+        drafts=[],
+        evo_number=1,
+        trajectory_only=False,
+        interaction_enabled=False,
+    )
+
+    assert "Wrong quantity" in prompt
+    assert "interaction" not in prompt.lower()
+    assert "grounded" not in prompt.lower()
+    assert "missed_ask" not in prompt
 
 
 def test_evolution_prompt_includes_run_specific_instruction_only_when_given(

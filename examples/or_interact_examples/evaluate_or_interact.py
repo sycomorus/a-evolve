@@ -55,6 +55,7 @@ def main() -> int:
         seed=42,
         train_size=train_size_from_limit(args.limit_train),
         val_size=args.limit_val,
+        interaction_enabled=_workspace_user_tool_enabled(workspace),
     )
     evaluation_limit = evaluation_limit_for_split(
         args.split,
@@ -153,6 +154,14 @@ def _non_negative_int(value: str) -> int:
     if parsed < 0:
         raise argparse.ArgumentTypeError("must be a non-negative integer")
     return parsed
+
+
+def _workspace_user_tool_enabled(workspace: Path) -> bool:
+    settings_path = workspace / "or_interact_settings.json"
+    if not settings_path.is_file():
+        return False
+    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    return bool(settings.get("enable_user_tool")) if isinstance(settings, dict) else False
 
 
 def _default_output_dir(work_dir: str | Path, _workspace: Path, split: str) -> Path:

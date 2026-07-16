@@ -6,6 +6,7 @@ import importlib.util
 import inspect
 import json
 import os
+import re
 import signal
 import time
 import uuid
@@ -44,6 +45,17 @@ FORBIDDEN_TOOL_STRINGS = (
 TASK_CATEGORY_ENV = "OR_INTERACT_TASK_CATEGORY"
 OR_INTERACT_SETTINGS_FILE = "or_interact_settings.json"
 RESERVED_DYNAMIC_TOOL_NAMES = {"ask_user", "list_skills", "read_skill", "run_heuristic"}
+USER_INTERACTION_MARKERS = (
+    "ask_user",
+    "ask user",
+    "user interaction",
+    "clarification",
+    "grounded knowledge",
+    "interaction_review",
+    "missed_ask",
+    "correct_ask",
+    "no_grounded_records",
+)
 HEURISTIC_PROMPT_EXTENSION = """\
 ## Heuristic Algorithm Evolution
 
@@ -128,6 +140,13 @@ class ORReactAgent(BaseAgent):
             task_dir=task_dir,
         )
         self.registry = registry
+        effective_system_prompt = system_prompt or self._build_system_prompt(
+            enable_skill_tools=enable_skill_tools
+        )
+        if not self._user_tool_enabled():
+            effective_system_prompt = _strip_user_interaction_content(
+                effective_system_prompt
+            )
         try:
             with _task_timeout(self.config.task_timeout_seconds):
                 with _task_category_env(task.metadata.get("category")):
@@ -135,8 +154,7 @@ class ORReactAgent(BaseAgent):
                         config=self.config,
                         trace=trace,
                         registry=registry,
-                        system_prompt=system_prompt
-                        or self._build_system_prompt(enable_skill_tools=enable_skill_tools),
+                        system_prompt=effective_system_prompt,
                     ).run(
                         initial_messages=initial_messages,
                         user_message=user_message,
@@ -245,17 +263,34 @@ class ORReactAgent(BaseAgent):
         )
 
     def _build_system_prompt(self, *, enable_skill_tools: bool = False) -> str:
+        exposed_skills = self._exposed_skills()
+        exposed_memories = self._exposed_memories()
+        base_prompt = (
+            self.system_prompt
+            if self._user_tool_enabled()
+            else _strip_user_interaction_content(self.system_prompt)
+        )
         hook = self.harness_hook("build_system_prompt")
         if hook:
-            return hook(self.system_prompt, self.skills, self.memories, self.registry)
+            prompt = hook(
+                base_prompt,
+                exposed_skills,
+                exposed_memories,
+                self.registry,
+            )
+            return (
+                prompt
+                if self._user_tool_enabled()
+                else _strip_user_interaction_content(prompt)
+            )
 
-        sections = [self.system_prompt.strip()]
+        sections = [base_prompt.strip()]
         if self._heuristic_enabled():
             sections.append(HEURISTIC_PROMPT_EXTENSION.strip())
         if self._user_tool_enabled():
             sections.append(USER_INTERACTION_PROMPT_EXTENSION.strip())
 
-        skill_catalog = self._skill_catalog()
+        skill_catalog = self._skill_catalog(exposed_skills)
         if skill_catalog:
             sections.append("## Evolved Skill Catalog\n" + skill_catalog)
             if enable_skill_tools:
@@ -266,7 +301,7 @@ class ORReactAgent(BaseAgent):
                     "it is relevant."
                 )
 
-        memory_catalog = self._memory_catalog()
+        memory_catalog = self._memory_catalog(exposed_memories)
         if memory_catalog:
             sections.append("## Evolved Memory Catalog\n" + memory_catalog)
 
@@ -277,9 +312,9 @@ class ORReactAgent(BaseAgent):
         sections.append("## Available Tools\n" + "\n".join(tool_lines))
         return "\n\n".join(section for section in sections if section)
 
-    def _memory_catalog(self) -> str:
+    def _memory_catalog(self, memories: list[dict[str, Any]]) -> str:
         lines = []
-        for index, memory in enumerate(self.memories[-20:], start=1):
+        for index, memory in enumerate(memories[-20:], start=1):
             category = memory.get("_category", "memory")
             content = " ".join(str(memory.get("content") or "").split())
             if not content:
@@ -289,12 +324,34 @@ class ORReactAgent(BaseAgent):
             )
         return "\n".join(lines)
 
-    def _skill_catalog(self) -> str:
+    def _skill_catalog(self, skills: list[Any]) -> str:
         lines = []
-        for skill in self.skills:
+        for skill in skills:
             description = " ".join(skill.description.split())
             lines.append(f"- {skill.name}; description={description}")
         return "\n".join(lines)
+
+    def _exposed_skills(self) -> list[Any]:
+        if self._user_tool_enabled():
+            return list(self.skills)
+        return [
+            skill
+            for skill in self.skills
+            if not _contains_user_interaction_content(
+                f"{skill.name}\n{skill.description}\n{self.workspace.read_skill(skill.name)}"
+            )
+        ]
+
+    def _exposed_memories(self) -> list[dict[str, Any]]:
+        if self._user_tool_enabled():
+            return list(self.memories)
+        return [
+            memory
+            for memory in self.memories
+            if not _contains_user_interaction_content(
+                json.dumps(memory, ensure_ascii=False, default=str)
+            )
+        ]
 
     def _build_registry(
         self,
@@ -347,6 +404,10 @@ class ORReactAgent(BaseAgent):
                 continue
             if name in RESERVED_DYNAMIC_TOOL_NAMES:
                 continue
+            if not self._user_tool_enabled() and _contains_user_interaction_content(
+                json.dumps(entry, ensure_ascii=False, default=str)
+            ):
+                continue
             if not _is_evolved_tool_entry(entry):
                 continue
             spec = self._load_evolved_tool(entry)
@@ -355,7 +416,7 @@ class ORReactAgent(BaseAgent):
 
     def _tool_list_skills(self) -> dict[str, Any]:
         skills = []
-        for skill in self.skills:
+        for skill in self._exposed_skills():
             path = skill.path or f"skills/{skill.name}"
             name = Path(path).name
             skills.append(
@@ -478,6 +539,29 @@ def _workspace_skill_name_from_path(file: str | Path) -> str | None:
         if name and not name.startswith("."):
             return name
     return None
+
+
+def _contains_user_interaction_content(value: str) -> bool:
+    lowered = value.casefold()
+    return any(marker in lowered for marker in USER_INTERACTION_MARKERS)
+
+
+def _strip_user_interaction_content(value: str) -> str:
+    sections = re.split(r"(?=^##\s+)", value, flags=re.MULTILINE)
+    retained = []
+    for index, section in enumerate(sections):
+        if not _contains_user_interaction_content(section):
+            retained.append(section)
+            continue
+        if index == 0:
+            retained.append(
+                "\n".join(
+                    line
+                    for line in section.splitlines()
+                    if not _contains_user_interaction_content(line)
+                )
+            )
+    return "".join(retained).strip()
 
 
 @contextmanager

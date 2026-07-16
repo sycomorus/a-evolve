@@ -48,12 +48,14 @@ class ORInteractBenchmark(BenchmarkAdapter):
         seed: int = 42,
         train_size: int = 50,
         val_size: int = 0,
+        interaction_enabled: bool = False,
     ) -> None:
         self.benchmark_dir = _default_benchmark_dir() if benchmark_dir is None else Path(benchmark_dir).resolve()
         self.dataset = dataset
         self.seed = seed
         self.train_size = train_size
         self.val_size = val_size
+        self.interaction_enabled = interaction_enabled
         self._tasks = self._load_tasks()
         self._train, self._val, self._test = self._split_tasks()
 
@@ -83,7 +85,8 @@ class ORInteractBenchmark(BenchmarkAdapter):
 
         detail = _feedback_detail(evaluation, trajectory, task_dir)
         evaluation_record = asdict(evaluation)
-        evaluation_record.update(_interaction_diagnostics(task_dir, trajectory))
+        if self.interaction_enabled:
+            evaluation_record.update(_interaction_diagnostics(task_dir, trajectory))
         return Feedback(
             success=evaluation.correct,
             score=1.0 if evaluation.correct else 0.0,

@@ -53,6 +53,7 @@ def main() -> int:
         dataset=args.dataset,
         seed=42,
         train_size=train_size_from_limit(args.limit_train),
+        interaction_enabled=args.enable_user_tool,
     )
     seed_workspace = ROOT / "seed_workspaces" / "or_interact_react"
     run = create_run_workspace(
@@ -107,6 +108,7 @@ def main() -> int:
                 output_dir=output_dir,
                 llm=llm,
                 max_tokens=args.teacher_max_tokens,
+                interaction_enabled=args.enable_user_tool,
             )
         )
 

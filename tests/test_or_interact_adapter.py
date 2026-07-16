@@ -224,7 +224,11 @@ def test_evaluate_correct_objective(tmp_path: Path) -> None:
 
 
 def test_evaluate_records_grounded_ask_diagnostics(tmp_path: Path) -> None:
-    benchmark = ORInteractBenchmark(benchmark_dir=BENCHMARK_DIR, dataset="IndustryOR")
+    benchmark = ORInteractBenchmark(
+        benchmark_dir=BENCHMARK_DIR,
+        dataset="IndustryOR",
+        interaction_enabled=True,
+    )
     task = _task_by_id(benchmark, "task_001")
     expected = _oracle_value(task)
     _write_answer(tmp_path, expected)
@@ -277,6 +281,30 @@ def test_evaluate_records_grounded_ask_diagnostics(tmp_path: Path) -> None:
     assert evaluation["refused_ask_count"] == 1
     assert evaluation["no_match_ask_count"] == 1
     assert evaluation["no_grounded_records_ask_count"] == 0
+
+
+def test_evaluate_omits_interaction_diagnostics_by_default(tmp_path: Path) -> None:
+    benchmark = ORInteractBenchmark(
+        benchmark_dir=BENCHMARK_DIR,
+        dataset="IndustryOR",
+    )
+    task = _task_by_id(benchmark, "task_001")
+    expected = _oracle_value(task)
+    _write_answer(tmp_path, expected)
+    events = [
+        {"type": "tool_call", "name": "ask_user", "arguments": {"question": "Hidden?"}},
+        {"type": "run_summary", "runtime_dir": str(tmp_path)},
+    ]
+
+    feedback = benchmark.evaluate(
+        task,
+        Trajectory(task_id=task.id, output="", steps=events, conversation=events),
+    )
+
+    evaluation = feedback.raw["evaluation"]
+    assert "has_grounded" not in evaluation
+    assert "grounded_record_count" not in evaluation
+    assert "ask_count" not in evaluation
 
 
 def test_observer_redacts_grounded_answer_from_persisted_trajectory(tmp_path: Path) -> None:
@@ -535,6 +563,70 @@ def test_or_interact_user_tool_is_enabled_only_by_workspace_setting(
         }
     }
     assert "run_heuristic" not in captured["tools"]
+
+
+def test_or_interact_user_tool_disabled_hides_inherited_interaction_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = _workspace(tmp_path / "workspace")
+    (workspace / "prompts" / "system.md").write_text(
+        "Base prompt\n\n## User Interaction\nUse ask_user with grounded clarifications.\n",
+        encoding="utf-8",
+    )
+    _write_skill(workspace, "modeling", "Prefer explicit variable bounds.")
+    _write_skill(
+        workspace,
+        "clarification-policy",
+        "Use ask_user when grounded clarification is needed.",
+    )
+    (workspace / "memory" / "memories.jsonl").write_text(
+        json.dumps({"content": "Remember the ask_user interaction policy."}) + "\n",
+        encoding="utf-8",
+    )
+    captured: dict[str, object] = {}
+
+    class FakeReActAgent:
+        def __init__(self, *, config, trace, registry, system_prompt):
+            captured["system_prompt"] = system_prompt
+            captured["tools"] = registry.list_tools()
+            captured["skills"] = registry.call("list_skills")
+
+        def run(self, **kwargs):
+            return AgentResult(status="success", turns=1, objective_value=1)
+
+    monkeypatch.setattr(
+        "agent_evolve.agents.or_interact.react_agent.ReActAgent",
+        FakeReActAgent,
+    )
+    agent = ORReactAgent(workspace)
+    task = Task(
+        id="task_x",
+        input="",
+        metadata={"task_dir": str(_visible_task(tmp_path)), "dataset": "IndustryOR"},
+    )
+
+    agent.solve(task)
+
+    prompt = str(captured["system_prompt"])
+    assert "Base prompt" in prompt
+    assert "modeling; description=Test skill" in prompt
+    assert "ask_user" not in prompt
+    assert "User Interaction" not in prompt
+    assert "grounded clarification" not in prompt
+    assert "clarification-policy" not in prompt
+    assert "interaction policy" not in prompt
+    assert "ask_user" not in captured["tools"]
+    assert captured["skills"] == {
+        "skills": [
+            {
+                "name": "modeling",
+                "path": "skills/modeling",
+                "description": "Test skill",
+            }
+        ],
+        "count": 1,
+    }
 
 
 @pytest.mark.parametrize(

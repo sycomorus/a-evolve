@@ -71,6 +71,9 @@ class AdaptiveSkillEngine(EvolutionEngine):
             judge_llm=self.llm if self.config.trajectory_only else None,
             scope_instruction=self.config.extra.get("scope_instruction"),
             evolution_instruction=self.config.extra.get("evolution_instruction"),
+            interaction_enabled=bool(
+                self.config.extra.get("step_opsd_interaction_enabled", False)
+            ),
         )
         prompt_snapshot_dir = _write_evolver_prompt_snapshot(
             workspace_root=workspace.root,
@@ -140,6 +143,9 @@ class AdaptiveSkillEngine(EvolutionEngine):
             judge_llm=self.llm if self.config.trajectory_only else None,
             scope_instruction=self.config.extra.get("scope_instruction"),
             evolution_instruction=self.config.extra.get("evolution_instruction"),
+            interaction_enabled=bool(
+                self.config.extra.get("step_opsd_interaction_enabled", False)
+            ),
             trajectory_profile=trajectory_profile,
         )
         prompt_snapshot_dir = _write_evolver_prompt_snapshot(

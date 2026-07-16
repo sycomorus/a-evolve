@@ -24,10 +24,6 @@ You may use privileged oracle/reference information to diagnose the student traj
 Do not solve the task again.
 Do not reveal oracle/reference content in your output, including oracle objective values,
 reference solution code, reference formulation code, paths, or task-specific answer parameters.
-Grounded clarifications are also privileged. Do not repeat or paraphrase a grounded answer,
-the original grounded question, its file name, or task-specific values from it. Describe only
-the abstract information need, the visible evidence that should trigger a question, a reusable
-question template, and how the answer should affect the formulation.
 Most steps are expected to be acceptable. Do not review every step. In step_reviews,
 include only the earliest causally wrong step, or at most 1-2 steps with the largest
 impact on the final failure. Omit correct or minor steps. Keep each field concise.
@@ -39,13 +35,22 @@ Return JSON only with:
   better_next_action, harness_update_hint}
 - missed_steps: list of {after_step_id, phase, expected_action, why_it_matters,
   harness_update_hint}
-- interaction_review: {requirement, observed_behavior, decision, evidence_before_decision,
-  recommended_timing, information_need, question_template, answer_use,
-  expected_answer_use, harness_update_hint}. Use requirement required|helpful|unnecessary;
-  observed_behavior answered_ask|refused_ask|no_ask; decision correct_ask|missed_ask|
-  unnecessary_ask|poor_question|correct_abstention; answer_use used_correctly|ignored|
-  misused|unavailable. Keep reusable fields abstract and answer-free.
 - leakage_check: {contains_oracle_value, contains_reference_code}
+"""
+TEACHER_INTERACTION_PROMPT_EXTENSION = """\
+
+Grounded clarifications are also privileged. Do not repeat or paraphrase a grounded answer,
+the original grounded question, its file name, or task-specific values from it. Describe only
+the abstract information need, the visible evidence that should trigger a question, a reusable
+question template, and how the answer should affect the formulation.
+
+Also return interaction_review: {requirement, observed_behavior, decision,
+evidence_before_decision, recommended_timing, information_need, question_template,
+answer_use, expected_answer_use, harness_update_hint}. Use requirement
+required|helpful|unnecessary; observed_behavior answered_ask|refused_ask|no_ask;
+decision correct_ask|missed_ask|unnecessary_ask|poor_question|correct_abstention;
+answer_use used_correctly|ignored|misused|unavailable. Keep reusable fields abstract
+and answer-free.
 """
 
 
@@ -57,6 +62,7 @@ def build_step_opsd_records(
     llm: LLMProvider | None,
     failures_only: bool = True,
     max_tokens: int = 2048,
+    interaction_enabled: bool = True,
 ) -> list[dict[str, Any]]:
     """Attach Step-OPSD trace views and redacted teacher reviews to records."""
     full_cleaned_dir = evolution_dir / "step_opsd" / "full_cleaned"
@@ -72,7 +78,11 @@ def build_step_opsd_records(
             obs.task.id,
             _redact_user_answers(full_cleaned),
         )
-        privileged_packet = _build_privileged_packet(obs, steps)
+        privileged_packet = _build_privileged_packet(
+            obs,
+            steps,
+            interaction_enabled=interaction_enabled,
+        )
 
         should_review = bool(llm is not None) and (
             not failures_only or not bool(obs.feedback.success)
@@ -86,6 +96,7 @@ def build_step_opsd_records(
                 steps=steps,
                 privileged_packet=privileged_packet,
                 max_tokens=max_tokens,
+                interaction_enabled=interaction_enabled,
             )
         else:
             teacher_review = {
@@ -93,8 +104,9 @@ def build_step_opsd_records(
                 "overall_diagnosis": "Teacher review skipped.",
                 "step_reviews": [],
                 "missed_steps": [],
-                "interaction_review": {},
             }
+            if interaction_enabled:
+                teacher_review["interaction_review"] = {}
 
         record["trace_views"] = {
             "teacher_full_cleaned_path": str(full_cleaned_path),
@@ -103,6 +115,7 @@ def build_step_opsd_records(
                 steps=steps,
                 teacher_review=teacher_review,
                 redaction_status=redaction_status,
+                interaction_enabled=interaction_enabled,
             ),
         }
         record["step_opsd"] = {
@@ -148,7 +161,11 @@ def sanitize_feedback_detail(value: Any) -> str:
     return "\n".join(sanitized_lines).strip()
 
 
-def redacted_step_opsd_for_evolver(record: dict[str, Any]) -> dict[str, Any] | None:
+def redacted_step_opsd_for_evolver(
+    record: dict[str, Any],
+    *,
+    interaction_enabled: bool = True,
+) -> dict[str, Any] | None:
     """Return the Step-OPSD subset that may be shown to the Evolver."""
     step_opsd = record.get("step_opsd")
     if not isinstance(step_opsd, dict):
@@ -156,31 +173,45 @@ def redacted_step_opsd_for_evolver(record: dict[str, Any]) -> dict[str, Any] | N
     status = step_opsd.get("redaction_status")
     review = step_opsd.get("teacher_review")
     if status != "passed" or not isinstance(review, dict):
+        withheld_review = {
+            "overall_diagnosis": "Teacher review unavailable or withheld.",
+            "step_reviews": [],
+            "missed_steps": [],
+        }
+        if interaction_enabled:
+            withheld_review["interaction_review"] = {}
         return {
             "redaction_status": status or "missing",
-            "teacher_review": {
-                "overall_diagnosis": "Teacher review unavailable or withheld.",
-                "step_reviews": [],
-                "missed_steps": [],
-                "interaction_review": {},
-            },
+            "teacher_review": withheld_review,
         }
+    safe_review = {
+        "overall_diagnosis": review.get("overall_diagnosis", ""),
+        "step_reviews": _redacted_step_reviews(review.get("step_reviews")),
+        "missed_steps": _redacted_missed_steps(review.get("missed_steps")),
+    }
+    if interaction_enabled:
+        safe_review["interaction_review"] = _redacted_interaction_review(
+            review.get("interaction_review")
+        )
     return {
         "redaction_status": "passed",
-        "teacher_review": {
-            "overall_diagnosis": review.get("overall_diagnosis", ""),
-            "step_reviews": _redacted_step_reviews(review.get("step_reviews")),
-            "missed_steps": _redacted_missed_steps(review.get("missed_steps")),
-            "interaction_review": _redacted_interaction_review(
-                review.get("interaction_review")
-            ),
-        },
+        "teacher_review": safe_review,
     }
 
 
-def summarize_step_opsd_batch(records: list[dict[str, Any]]) -> dict[str, Any] | None:
+def summarize_step_opsd_batch(
+    records: list[dict[str, Any]],
+    *,
+    interaction_enabled: bool = True,
+) -> dict[str, Any] | None:
     """Aggregate redacted Step-OPSD reviews into a compact batch summary."""
-    step_records = [redacted_step_opsd_for_evolver(record) for record in records]
+    step_records = [
+        redacted_step_opsd_for_evolver(
+            record,
+            interaction_enabled=interaction_enabled,
+        )
+        for record in records
+    ]
     step_records = [record for record in step_records if record is not None]
     if not step_records:
         return None
@@ -209,7 +240,7 @@ def summarize_step_opsd_batch(records: list[dict[str, Any]]) -> dict[str, Any] |
             key = (str(item.get("phase", "")), str(item.get("expected_action", "")))
             missed[key] += 1
         interaction_review = review.get("interaction_review", {})
-        if isinstance(interaction_review, dict):
+        if interaction_enabled and isinstance(interaction_review, dict):
             decision = str(interaction_review.get("decision", ""))
             if decision:
                 interaction[decision] += 1
@@ -217,15 +248,17 @@ def summarize_step_opsd_batch(records: list[dict[str, Any]]) -> dict[str, Any] |
             if use:
                 answer_use[use] += 1
 
-    return {
+    summary = {
         "records": len(records),
         "reviewed_records": sum(1 for record in step_records if record.get("redaction_status") == "passed"),
         "top_negative_patterns": _counter_items(negative),
         "top_missed_steps": _counter_items(missed),
         "positive_patterns": _counter_items(positive),
-        "interaction_decisions": _label_counter_items(interaction),
-        "answer_use_patterns": _label_counter_items(answer_use),
     }
+    if interaction_enabled:
+        summary["interaction_decisions"] = _label_counter_items(interaction)
+        summary["answer_use_patterns"] = _label_counter_items(answer_use)
+    return summary
 
 
 def review_observation_for_audit(
@@ -234,6 +267,7 @@ def review_observation_for_audit(
     output_dir: Path,
     llm: LLMProvider,
     max_tokens: int = 4096,
+    interaction_enabled: bool = True,
 ) -> dict[str, Any]:
     """Run one teacher review and write the exact teacher context/response."""
     task_dir = output_dir / _safe_name(obs.task.id)
@@ -244,7 +278,11 @@ def review_observation_for_audit(
     full_cleaned = _clean_trace(obs.trajectory.conversation or obs.trajectory.steps)
     steps = _segment_steps(full_cleaned)
     full_cleaned_path = _write_full_cleaned(full_cleaned_dir, obs.task.id, full_cleaned)
-    privileged_packet = _build_privileged_packet(obs, steps)
+    privileged_packet = _build_privileged_packet(
+        obs,
+        steps,
+        interaction_enabled=interaction_enabled,
+    )
     prompt_payload = _teacher_prompt_payload(obs, steps, privileged_packet)
     context_text = json.dumps(prompt_payload, ensure_ascii=False, indent=2, default=str)
 
@@ -260,10 +298,18 @@ def review_observation_for_audit(
     redaction_status = "failed"
     leakage_reasons: list[str] = []
     error: str | None = None
+    teacher_system_prompt = (
+        TEACHER_SYSTEM_PROMPT + TEACHER_INTERACTION_PROMPT_EXTENSION
+        if interaction_enabled
+        else TEACHER_SYSTEM_PROMPT
+    )
     try:
         response = llm.complete(
             [
-                LLMMessage(role="system", content=TEACHER_SYSTEM_PROMPT),
+                LLMMessage(
+                    role="system",
+                    content=teacher_system_prompt,
+                ),
                 LLMMessage(role="user", content=context_text),
             ],
             max_tokens=max_tokens,
@@ -272,13 +318,15 @@ def review_observation_for_audit(
         raw_response = response.content
         response_metadata = _response_metadata(response, max_tokens=max_tokens)
         parsed_review = _parse_json_response(raw_response)
+        if not interaction_enabled:
+            parsed_review.pop("interaction_review", None)
         leaked, leakage_reasons = _contains_leakage(parsed_review, privileged_packet)
         redaction_status = "withheld" if leaked else "passed"
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
 
     (task_dir / "teacher_system_prompt.txt").write_text(
-        TEACHER_SYSTEM_PROMPT,
+        teacher_system_prompt,
         encoding="utf-8",
     )
     (task_dir / "teacher_context.json").write_text(context_text, encoding="utf-8")
@@ -325,6 +373,7 @@ def _run_teacher_review(
     steps: list[dict[str, Any]],
     privileged_packet: dict[str, Any],
     max_tokens: int,
+    interaction_enabled: bool,
 ) -> tuple[dict[str, Any], str]:
     prompt = json.dumps(
         _teacher_prompt_payload(obs, steps, privileged_packet),
@@ -335,7 +384,14 @@ def _run_teacher_review(
     try:
         response = llm.complete(
             [
-                LLMMessage(role="system", content=TEACHER_SYSTEM_PROMPT),
+                LLMMessage(
+                    role="system",
+                    content=(
+                        TEACHER_SYSTEM_PROMPT + TEACHER_INTERACTION_PROMPT_EXTENSION
+                        if interaction_enabled
+                        else TEACHER_SYSTEM_PROMPT
+                    ),
+                ),
                 LLMMessage(role="user", content=prompt),
             ],
             max_tokens=max_tokens,
@@ -343,35 +399,36 @@ def _run_teacher_review(
         )
         review = _parse_json_response(response.content)
     except Exception as exc:
-        return (
-            {
-                "task_id": obs.task.id,
-                "overall_diagnosis": f"Teacher review failed: {type(exc).__name__}: {exc}",
-                "step_reviews": [],
-                "missed_steps": [],
-                "interaction_review": {},
-            },
-            "failed",
-        )
+        failure_review = {
+            "task_id": obs.task.id,
+            "overall_diagnosis": f"Teacher review failed: {type(exc).__name__}: {exc}",
+            "step_reviews": [],
+            "missed_steps": [],
+        }
+        if interaction_enabled:
+            failure_review["interaction_review"] = {}
+        return failure_review, "failed"
 
     review.setdefault("task_id", obs.task.id)
     review.setdefault("step_reviews", [])
     review.setdefault("missed_steps", [])
-    review.setdefault("interaction_review", {})
+    if interaction_enabled:
+        review.setdefault("interaction_review", {})
+    else:
+        review.pop("interaction_review", None)
     review.setdefault("leakage_check", {})
     leaked, reasons = _contains_leakage(review, privileged_packet)
     if leaked:
-        return (
-            {
-                "task_id": obs.task.id,
-                "overall_diagnosis": "Teacher review withheld because privileged content leaked.",
-                "step_reviews": [],
-                "missed_steps": [],
-                "interaction_review": {},
-                "leakage_check": {"reasons": reasons},
-            },
-            "withheld",
-        )
+        withheld_review = {
+            "task_id": obs.task.id,
+            "overall_diagnosis": "Teacher review withheld because privileged content leaked.",
+            "step_reviews": [],
+            "missed_steps": [],
+            "leakage_check": {"reasons": reasons},
+        }
+        if interaction_enabled:
+            withheld_review["interaction_review"] = {}
+        return withheld_review, "withheld"
     return review, "passed"
 
 
@@ -391,11 +448,16 @@ def _teacher_prompt_payload(
     }
 
 
-def _build_privileged_packet(obs: Observation, steps: list[dict[str, Any]]) -> dict[str, Any]:
+def _build_privileged_packet(
+    obs: Observation,
+    steps: list[dict[str, Any]],
+    *,
+    interaction_enabled: bool,
+) -> dict[str, Any]:
     raw = obs.feedback.raw or {}
     task_dir = Path(str(raw.get("task_dir") or obs.task.metadata.get("task_dir", "")))
     evaluation = raw.get("evaluation", {}) if isinstance(raw.get("evaluation"), dict) else {}
-    return {
+    packet = {
         "task_id": obs.task.id,
         "dataset": obs.task.metadata.get("dataset"),
         "success": obs.feedback.success,
@@ -414,8 +476,10 @@ def _build_privileged_packet(obs: Observation, steps: list[dict[str, Any]]) -> d
         },
         "reference_solution": _read_reference_solution(task_dir),
         "reference_formulation": _read_reference_formulation(task_dir),
-        "grounded_clarifications": _read_grounded_clarifications(task_dir),
     }
+    if interaction_enabled:
+        packet["grounded_clarifications"] = _read_grounded_clarifications(task_dir)
+    return packet
 
 
 def _compress_for_evolver(
@@ -424,14 +488,18 @@ def _compress_for_evolver(
     steps: list[dict[str, Any]],
     teacher_review: dict[str, Any],
     redaction_status: str,
+    interaction_enabled: bool,
 ) -> dict[str, Any]:
-    safe_review = redacted_step_opsd_for_evolver({
-        "step_opsd": {
-            "teacher_review": teacher_review,
-            "redaction_status": redaction_status,
-        }
-    })
-    return {
+    safe_review = redacted_step_opsd_for_evolver(
+        {
+            "step_opsd": {
+                "teacher_review": teacher_review,
+                "redaction_status": redaction_status,
+            }
+        },
+        interaction_enabled=interaction_enabled,
+    )
+    compressed = {
         "key_tool_sequence": [
             step.get("action", {}).get("tool")
             for step in steps
@@ -444,12 +512,14 @@ def _compress_for_evolver(
             if isinstance(safe_review, dict)
             else []
         ),
-        "teacher_interaction_review": (
+    }
+    if interaction_enabled:
+        compressed["teacher_interaction_review"] = (
             safe_review.get("teacher_review", {}).get("interaction_review", {})
             if isinstance(safe_review, dict)
             else {}
-        ),
-    }
+        )
+    return compressed
 
 
 def _clean_trace(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
