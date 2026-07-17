@@ -351,23 +351,25 @@ def main() -> int:
             show_progress=True,
             console=console,
         )
-    if interaction_training:
-        interaction_metrics = _run_final_interaction_audit(
-            benchmark=benchmark,
-            split="test",
-            limit=test_limit,
-            results_csv=Path(str(eval_summary["results_csv"])),
-            output_dir=final_dir / "interaction_audit",
-            llm=engine.llm,
-            max_tokens=min(config.evolver_max_tokens, 4096),
-        )
-        metrics_path = final_dir / "interaction_metrics.json"
-        metrics_path.write_text(
-            json.dumps(interaction_metrics, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        eval_summary["interaction_metrics"] = interaction_metrics
-        eval_summary["interaction_metrics_path"] = str(metrics_path)
+    # The post-test interaction audit is intentionally disabled. Training-time
+    # Step-OPSD teacher reviews remain controlled by ``interaction_training``.
+    # if interaction_training:
+    #     interaction_metrics = _run_final_interaction_audit(
+    #         benchmark=benchmark,
+    #         split="test",
+    #         limit=test_limit,
+    #         results_csv=Path(str(eval_summary["results_csv"])),
+    #         output_dir=final_dir / "interaction_audit",
+    #         llm=engine.llm,
+    #         max_tokens=min(config.evolver_max_tokens, 4096),
+    #     )
+    #     metrics_path = final_dir / "interaction_metrics.json"
+    #     metrics_path.write_text(
+    #         json.dumps(interaction_metrics, ensure_ascii=False, indent=2),
+    #         encoding="utf-8",
+    #     )
+    #     eval_summary["interaction_metrics"] = interaction_metrics
+    #     eval_summary["interaction_metrics_path"] = str(metrics_path)
     summary = {
         "run_id": run.run_id,
         "run_dir": str(run.run_dir),
