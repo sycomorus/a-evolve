@@ -135,6 +135,7 @@ def main() -> int:
             base_url=evolver_base_url,
             api_key=evolver_api_key,
             temperature=evolver_temperature,
+            parallel_workers=agent.config.parallelism,
         )
         total_updates = 1
     else:
@@ -407,6 +408,9 @@ def main() -> int:
             args.limit_val if args.algorithm == "adaptive-skill" else None
         ),
         "gepa_holdout_limit": args.limit_val if args.algorithm == "gepa" else None,
+        "gepa_parallel_workers": (
+            engine.parallel_workers if args.algorithm == "gepa" else None
+        ),
         "batch_size": args.batch_size,
         "harness_tree": args.harness_tree,
         "step_opsd": args.step_opsd,
@@ -762,6 +766,7 @@ def _build_gepa_engine(
     base_url: str,
     api_key: str | None,
     temperature: float | None,
+    parallel_workers: int,
 ) -> Any:
     from gepa.optimize_anything import EngineConfig, GEPAConfig, ReflectionConfig
 
@@ -780,6 +785,7 @@ def _build_gepa_engine(
     return GEPAEngine(
         config,
         gepa_config=gepa_config,
+        parallel_workers=parallel_workers,
         validation_limit=validation_limit,
     )
 

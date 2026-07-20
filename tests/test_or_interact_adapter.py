@@ -266,11 +266,13 @@ def test_gepa_engine_uses_evolver_openai_endpoint(
         base_url="https://example.invalid/v1",
         api_key="test-key",
         temperature=0.25,
+        parallel_workers=8,
     )
     reflection_lm = engine.gepa_config.reflection.reflection_lm
 
     assert engine.gepa_config.engine.max_metric_calls == 50
     assert engine.validation_limit == 10
+    assert engine.parallel_workers == 8
     assert config.validation_limit is None
     assert config.evolve_tools is False
     assert reflection_lm("reflect") == "updated"

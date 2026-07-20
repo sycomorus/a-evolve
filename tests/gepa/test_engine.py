@@ -109,6 +109,55 @@ def test_gepa_engine_step_calls_optimize_anything(tmp_path):
         assert ws.read_prompt() == "Improved prompt."
 
 
+def test_gepa_engine_parallel_mode_uses_worker_pool(tmp_path):
+    fake_result = FakeGEPAResult(
+        candidates=[{"system_prompt": "Parallel prompt."}],
+        val_aggregate_scores=[0.9],
+        num_candidates=2,
+        total_metric_calls=12,
+    )
+    mocks = _mock_gepa_modules()
+    mocks["gepa.optimize_anything"].optimize_anything = MagicMock(
+        return_value=fake_result
+    )
+
+    with patch.dict(sys.modules, mocks):
+        if "agent_evolve.algorithms.gepa.engine" in sys.modules:
+            importlib.reload(sys.modules["agent_evolve.algorithms.gepa.engine"])
+        from agent_evolve.algorithms.gepa.engine import GEPAEngine
+
+        workspace = _make_workspace(tmp_path)
+        gepa_config = SimpleNamespace(
+            engine=SimpleNamespace(max_metric_calls=50, run_dir=None)
+        )
+        engine = GEPAEngine(
+            EvolveConfig(evolve_skills=False, evolve_memory=False),
+            gepa_config=gepa_config,
+            parallel_workers=8,
+            validation_limit=10,
+        )
+        trial = MagicMock()
+        trial.get_tasks.return_value = [Task(id="t1", input="test")]
+        evaluator = MagicMock()
+        cleanup = MagicMock()
+
+        with patch(
+            "agent_evolve.algorithms.gepa.engine.make_parallel_evaluator",
+            return_value=(evaluator, cleanup),
+        ) as make_parallel:
+            engine.step(
+                workspace=workspace,
+                observations=[],
+                history=MagicMock(),
+                trial=trial,
+            )
+
+        make_parallel.assert_called_once_with(trial, workspace, 8, engine.config)
+        assert engine.gepa_config.engine.parallel is True
+        assert engine.gepa_config.engine.max_workers == 8
+        cleanup.assert_called_once_with()
+
+
 def test_gepa_engine_default_config():
     mock_engine_config = MagicMock()
     mock_reflection_config = MagicMock()
