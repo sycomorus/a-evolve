@@ -137,7 +137,10 @@ def test_make_evaluator_calls_restore_and_run():
     evaluator = make_evaluator(trial, config)
     with patch("agent_evolve.algorithms.gepa.evaluator.restore_candidate") as mock_restore:
         task = Task(id="t1", input="do something")
-        score, side_info = evaluator({"system_prompt": "test"}, task)
+        score, side_info = evaluator(
+            {"system_prompt": "test"},
+            example=task,
+        )
     assert score == 0.8
     assert "scores" in side_info
     mock_restore.assert_called_once()

@@ -3,7 +3,8 @@ import importlib
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, call, patch
 
 from agent_evolve.config import EvolveConfig
 from agent_evolve.contract.workspace import AgentWorkspace
@@ -79,7 +80,14 @@ def test_gepa_engine_step_calls_optimize_anything(tmp_path):
 
         ws = _make_workspace(tmp_path)
         config = EvolveConfig(evolve_prompts=True, evolve_skills=False, evolve_memory=False)
-        engine = GEPAEngine(config)
+        gepa_config = SimpleNamespace(
+            engine=SimpleNamespace(max_metric_calls=50, run_dir=None)
+        )
+        engine = GEPAEngine(
+            config,
+            gepa_config=gepa_config,
+            validation_limit=10,
+        )
 
         trial = MagicMock()
         trial.get_tasks.return_value = [Task(id="t1", input="test")]
@@ -93,6 +101,11 @@ def test_gepa_engine_step_calls_optimize_anything(tmp_path):
         assert result.metadata["gepa_best_score"] == 0.85
         assert result.metadata["gepa_num_candidates"] == 5
         mocks["gepa.optimize_anything"].optimize_anything.assert_called_once()
+        assert engine.gepa_config.engine.parallel is False
+        assert trial.get_tasks.call_args_list == [
+            call(split="train", limit=50),
+            call(split="holdout", limit=10),
+        ]
         assert ws.read_prompt() == "Improved prompt."
 
 
@@ -112,7 +125,7 @@ def test_gepa_engine_default_config():
         from agent_evolve.algorithms.gepa.engine import GEPAEngine
 
         config = EvolveConfig(batch_size=10, max_cycles=20)
-        engine = GEPAEngine(config)
+        GEPAEngine(config)
 
         mock_engine_config.assert_called_once()
         mock_reflection_config.assert_called_once()

@@ -85,13 +85,17 @@ def main() -> int:
     config = EvolveConfig(
         batch_size=args.batch_size,
         train_limit=args.limit_train,
-        validation_limit=args.limit_val or None,
+        validation_limit=(
+            (args.limit_val or None)
+            if args.algorithm == "adaptive-skill"
+            else None
+        ),
         max_cycles=args.max_cycles,
         evolver_model=evolver_model,
         evolve_prompts=True,
         evolve_skills=True,
         evolve_memory=True,
-        evolve_tools=True,
+        evolve_tools=args.algorithm == "adaptive-skill",
         trajectory_only=False,
         extra={
             "max_skills": args.max_skills,
@@ -107,13 +111,25 @@ def main() -> int:
             ),
         },
     )
-    engine = AdaptiveSkillEngine(config)
-    total_updates = _total_updates(
-        benchmark=benchmark,
-        max_epochs=args.max_cycles,
-        batch_size=args.batch_size,
-        train_limit=args.limit_train,
-    )
+    if args.algorithm == "gepa":
+        engine = _build_gepa_engine(
+            config,
+            max_metric_calls=args.gepa_max_metric_calls,
+            validation_limit=args.limit_val,
+            model=evolver_model,
+            base_url=evolver_base_url,
+            api_key=evolver_api_key,
+            temperature=evolver_temperature,
+        )
+        total_updates = 1
+    else:
+        engine = AdaptiveSkillEngine(config)
+        total_updates = _total_updates(
+            benchmark=benchmark,
+            max_epochs=args.max_cycles,
+            batch_size=args.batch_size,
+            train_limit=args.limit_train,
+        )
     seed_workspace = ROOT / "seed_workspaces" / "or_interact_react"
     run = create_run_workspace(
         args.work_dir,
@@ -327,7 +343,7 @@ def main() -> int:
                     mutated="yes" if event["mutated"] else "no",
                     gate=(
                         ("accept" if event.get("accepted") else "reject")
-                        if args.limit_val
+                        if args.algorithm == "adaptive-skill" and args.limit_val
                         else "n/a"
                     ),
                 )
@@ -375,13 +391,20 @@ def main() -> int:
         "run_dir": str(run.run_dir),
         "workspace": str(workspace),
         "dataset": args.dataset,
+        "algorithm": args.algorithm,
+        "gepa_max_metric_calls": (
+            args.gepa_max_metric_calls if args.algorithm == "gepa" else None
+        ),
         "check": False,
         "cycles_completed": result.cycles_completed,
         "epochs_completed": result.details.get("epochs_completed"),
         "updates_completed": result.details.get("updates_completed"),
         "max_epochs": args.max_cycles,
         "train_limit": args.limit_train,
-        "validation_limit": args.limit_val,
+        "validation_limit": (
+            args.limit_val if args.algorithm == "adaptive-skill" else None
+        ),
+        "gepa_holdout_limit": args.limit_val if args.algorithm == "gepa" else None,
         "batch_size": args.batch_size,
         "harness_tree": args.harness_tree,
         "step_opsd": args.step_opsd,
@@ -447,6 +470,18 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--batch-size", type=int, default=10, help="Tasks per harness update.")
+    parser.add_argument(
+        "--algorithm",
+        choices=["adaptive-skill", "gepa"],
+        default="adaptive-skill",
+        help="Evolution algorithm. Defaults to adaptive-skill for backward compatibility.",
+    )
+    parser.add_argument(
+        "--gepa-max-metric-calls",
+        type=_positive_int,
+        default=50,
+        help="Maximum GEPA metric calls. Used only with --algorithm gepa.",
+    )
     parser.add_argument(
         "--harness-tree",
         action="store_true",
@@ -529,6 +564,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("--offline requires --harness-tree")
     if args.step_opsd and args.harness_tree:
         parser.error("--step-opsd is only supported without --harness-tree")
+    if args.algorithm == "gepa" and args.step_opsd:
+        parser.error("--step-opsd cannot be used with --algorithm gepa")
+    if args.algorithm == "gepa" and args.harness_tree:
+        parser.error("--harness-tree cannot be used with --algorithm gepa")
+    if args.algorithm == "gepa" and args.limit_val <= 0:
+        parser.error("--algorithm gepa requires --limit-val greater than 0")
     if args.limit_val and args.harness_tree:
         parser.error("--limit-val is only supported without --harness-tree")
     return args
@@ -538,6 +579,13 @@ def _non_negative_int(value: str) -> int:
     parsed = int(value)
     if parsed < 0:
         raise argparse.ArgumentTypeError("must be a non-negative integer")
+    return parsed
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
     return parsed
 
 
@@ -665,6 +713,73 @@ def _total_updates(
     train_count = len(benchmark.get_tasks(split="train", limit=train_limit))
     batches = (train_count + max(1, batch_size) - 1) // max(1, batch_size)
     return max_epochs * batches
+
+
+class _OpenAICompatibleReflectionLM:
+    def __init__(
+        self,
+        *,
+        model: str,
+        base_url: str,
+        api_key: str | None,
+        temperature: float | None,
+    ) -> None:
+        import openai
+
+        self.model = model.removeprefix("openai:")
+        self.base_url = base_url
+        self.api_key = api_key
+        self.temperature = temperature
+        self.client = openai.OpenAI(
+            base_url=base_url,
+            api_key=api_key or "EMPTY",
+        )
+
+    def __call__(self, prompt: str | list[dict[str, Any]]) -> str:
+        messages = (
+            [{"role": "user", "content": prompt}]
+            if isinstance(prompt, str)
+            else prompt
+        )
+        params: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+        }
+        if self.temperature is not None:
+            params["temperature"] = self.temperature
+        response = self.client.chat.completions.create(**params)
+        return response.choices[0].message.content or ""
+
+
+def _build_gepa_engine(
+    config: EvolveConfig,
+    *,
+    max_metric_calls: int,
+    validation_limit: int,
+    model: str,
+    base_url: str,
+    api_key: str | None,
+    temperature: float | None,
+) -> Any:
+    from gepa.optimize_anything import EngineConfig, GEPAConfig, ReflectionConfig
+
+    from agent_evolve.algorithms.gepa.engine import GEPAEngine
+
+    reflection_lm = _OpenAICompatibleReflectionLM(
+        model=model,
+        base_url=base_url,
+        api_key=api_key,
+        temperature=temperature,
+    )
+    gepa_config = GEPAConfig(
+        engine=EngineConfig(max_metric_calls=max_metric_calls),
+        reflection=ReflectionConfig(reflection_lm=reflection_lm),
+    )
+    return GEPAEngine(
+        config,
+        gepa_config=gepa_config,
+        validation_limit=validation_limit,
+    )
 
 
 def resolve_evolver_llm() -> tuple[str, str, str | None, float | None]:

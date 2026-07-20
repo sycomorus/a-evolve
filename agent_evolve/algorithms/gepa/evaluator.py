@@ -28,10 +28,10 @@ def make_evaluator(
     trial: TrialRunner, config: EvolveConfig
 ) -> Any:
     """Create a serial evaluator for GEPA's optimize_anything."""
-    def evaluator(candidate: dict[str, str], task: Task) -> tuple[float, dict]:
+    def evaluator(candidate: dict[str, str], example: Task) -> tuple[float, dict]:
         restore_candidate(trial.agent.workspace, candidate, config)
         trial.agent.reload_from_fs()
-        obs = trial.run_single(task)
+        obs = trial.run_single(example)
         return obs.feedback.score, build_side_info(obs)
     return evaluator
 
@@ -72,12 +72,12 @@ def make_parallel_evaluator(
         with worker_lock:
             worker_available[idx] = True
 
-    def evaluator(candidate: dict[str, str], task: Task) -> tuple[float, dict]:
+    def evaluator(candidate: dict[str, str], example: Task) -> tuple[float, dict]:
         idx, (ws, ag, tr) = get_worker()
         try:
             restore_candidate(ws, candidate, config)
             ag.reload_from_fs()
-            obs = tr.run_single(task)
+            obs = tr.run_single(example)
             return obs.feedback.score, build_side_info(obs)
         finally:
             release_worker(idx)

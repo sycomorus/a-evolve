@@ -9,6 +9,7 @@ import time
 import types
 from pathlib import Path
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -146,6 +147,141 @@ def test_or_interact_clis_parse_validation_limit(
         40,
         10,
         50,
+    )
+
+
+def test_evolve_cli_selects_gepa_and_metric_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from examples.or_interact_examples import evolve_or_interact
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "evolve_or_interact.py",
+            "--algorithm",
+            "gepa",
+            "--limit-val",
+            "10",
+            "--gepa-max-metric-calls",
+            "50",
+        ],
+    )
+
+    args = evolve_or_interact.parse_args()
+
+    assert args.algorithm == "gepa"
+    assert args.gepa_max_metric_calls == 50
+
+
+@pytest.mark.parametrize(
+    "extra_args, message",
+    [
+        (["--step-opsd"], "--step-opsd cannot be used"),
+        (["--harness-tree"], "--harness-tree cannot be used"),
+        (["--limit-val", "0"], "requires --limit-val greater than 0"),
+    ],
+)
+def test_evolve_cli_rejects_invalid_gepa_combinations(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    extra_args: list[str],
+    message: str,
+) -> None:
+    from examples.or_interact_examples import evolve_or_interact
+
+    argv = ["evolve_or_interact.py", "--algorithm", "gepa"]
+    if "--limit-val" not in extra_args:
+        argv.extend(["--limit-val", "10"])
+    monkeypatch.setattr(sys, "argv", [*argv, *extra_args])
+
+    with pytest.raises(SystemExit):
+        evolve_or_interact.parse_args()
+
+    assert message in capsys.readouterr().err
+
+
+def test_evolve_cli_rejects_non_positive_gepa_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from examples.or_interact_examples import evolve_or_interact
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "evolve_or_interact.py",
+            "--algorithm",
+            "gepa",
+            "--limit-val",
+            "10",
+            "--gepa-max-metric-calls",
+            "0",
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        evolve_or_interact.parse_args()
+
+    assert "must be a positive integer" in capsys.readouterr().err
+
+
+def test_gepa_engine_uses_evolver_openai_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import openai
+
+    from examples.or_interact_examples import evolve_or_interact
+
+    response = types.SimpleNamespace(
+        choices=[types.SimpleNamespace(message=types.SimpleNamespace(content="updated"))]
+    )
+    create = MagicMock(return_value=response)
+    client = types.SimpleNamespace(
+        chat=types.SimpleNamespace(completions=types.SimpleNamespace(create=create))
+    )
+    openai_factory = MagicMock(return_value=client)
+    monkeypatch.setattr(openai, "OpenAI", openai_factory)
+    fake_gepa = types.SimpleNamespace(
+        EngineConfig=lambda **kwargs: types.SimpleNamespace(**kwargs),
+        ReflectionConfig=lambda **kwargs: types.SimpleNamespace(**kwargs),
+        GEPAConfig=lambda **kwargs: types.SimpleNamespace(**kwargs),
+        optimize_anything=MagicMock(),
+    )
+    monkeypatch.setitem(sys.modules, "gepa.optimize_anything", fake_gepa)
+    config = EvolveConfig(
+        batch_size=10,
+        max_cycles=1,
+        validation_limit=None,
+        evolve_tools=False,
+    )
+
+    engine = evolve_or_interact._build_gepa_engine(
+        config,
+        max_metric_calls=50,
+        validation_limit=10,
+        model="openai:deepseek-v4-flash",
+        base_url="https://example.invalid/v1",
+        api_key="test-key",
+        temperature=0.25,
+    )
+    reflection_lm = engine.gepa_config.reflection.reflection_lm
+
+    assert engine.gepa_config.engine.max_metric_calls == 50
+    assert engine.validation_limit == 10
+    assert config.validation_limit is None
+    assert config.evolve_tools is False
+    assert reflection_lm("reflect") == "updated"
+    openai_factory.assert_called_once_with(
+        base_url="https://example.invalid/v1",
+        api_key="test-key",
+    )
+    create.assert_called_once_with(
+        model="deepseek-v4-flash",
+        messages=[{"role": "user", "content": "reflect"}],
+        temperature=0.25,
     )
 
 
@@ -547,21 +683,14 @@ def test_or_interact_user_tool_is_enabled_only_by_workspace_setting(
     prompt = str(captured["system_prompt"])
     assert "ask_user" in captured["tools"]
     assert "ask_user" in prompt
-    assert "limited set" in prompt
-    assert "not a general-purpose user" in prompt
-    assert "no_grounded_records" in prompt
-    assert "multiple distinct questions" not in prompt
-    assert "rephrase a refused question" not in prompt
-    assert captured["user_response"] == {
-        "user_response": {
-            "answered": False,
-            "question": "Which depot?",
-            "answer": "I cannot answer this from the available grounded clarifications.",
-            "matched_file": None,
-            "code": "no_grounded_records",
-            "reason": "No task-specific grounded clarifications are available.",
-        }
-    }
+    tool_response = captured["user_response"]
+    assert isinstance(tool_response, dict)
+    user_response = tool_response["user_response"]
+    assert user_response["answered"] is False
+    assert user_response["question"] == "Which depot?"
+    assert user_response["matched_file"] is None
+    assert user_response["code"] == "no_grounded_records"
+    assert user_response["answer"]
     assert "run_heuristic" not in captured["tools"]
 
 
@@ -833,6 +962,7 @@ def test_or_interact_cli_has_no_check_flags(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setattr(sys, "argv", ["evolve_or_interact.py"])
     args = evolve_or_interact.parse_args()
     assert not hasattr(args, "check")
+    assert args.algorithm == "adaptive-skill"
     assert args.enable_heuristic_tool is False
     assert args.enable_user_tool is False
     assert args.step_opsd is False

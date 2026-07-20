@@ -10,7 +10,7 @@ should only be imported when GEPA is installed.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from gepa.optimize_anything import (
     EngineConfig,
@@ -49,11 +49,13 @@ class GEPAEngine(EvolutionEngine):
         objective: str | None = None,
         background: str | None = None,
         parallel_workers: int = 1,
+        validation_limit: int | None = None,
     ):
         self.config = config
         self.objective = objective
         self.background = background
         self.parallel_workers = parallel_workers
+        self.validation_limit = validation_limit
 
         if gepa_config is not None:
             self.gepa_config = gepa_config
@@ -90,7 +92,12 @@ class GEPAEngine(EvolutionEngine):
         )
         try:
             val_tasks = trial.get_tasks(
-                split="holdout", limit=max(20, self.config.batch_size)
+                split="holdout",
+                limit=(
+                    self.validation_limit
+                    if self.validation_limit is not None
+                    else max(20, self.config.batch_size)
+                ),
             )
         except Exception:
             val_tasks = None
@@ -104,6 +111,7 @@ class GEPAEngine(EvolutionEngine):
             self.gepa_config.engine.max_workers = self.parallel_workers
         else:
             evaluator = make_evaluator(trial, self.config)
+            self.gepa_config.engine.parallel = False
 
         try:
             result = optimize_anything(
