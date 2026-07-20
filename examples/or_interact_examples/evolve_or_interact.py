@@ -31,6 +31,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from agent_evolve.api import Evolver  # noqa: E402
 from agent_evolve.algorithms.adaptive_skill import AdaptiveSkillEngine  # noqa: E402
+from agent_evolve.algorithms.unified.openai_compat import OpenAICompatProvider  # noqa: E402
 from agent_evolve.algorithms.step_opsd import (  # noqa: E402
     build_step_opsd_records,
     summarize_interaction_metrics,
@@ -111,25 +112,6 @@ def main() -> int:
             ),
         },
     )
-    if args.algorithm == "gepa":
-        engine = _build_gepa_engine(
-            config,
-            max_metric_calls=args.gepa_max_metric_calls,
-            validation_limit=args.limit_val,
-            model=evolver_model,
-            base_url=evolver_base_url,
-            api_key=evolver_api_key,
-            temperature=evolver_temperature,
-        )
-        total_updates = 1
-    else:
-        engine = AdaptiveSkillEngine(config)
-        total_updates = _total_updates(
-            benchmark=benchmark,
-            max_epochs=args.max_cycles,
-            batch_size=args.batch_size,
-            train_limit=args.limit_train,
-        )
     seed_workspace = ROOT / "seed_workspaces" / "or_interact_react"
     run = create_run_workspace(
         args.work_dir,
@@ -143,6 +125,27 @@ def main() -> int:
         enable_heuristic_tool=args.enable_heuristic_tool,
         enable_user_tool=args.enable_user_tool,
     )
+    agent = ORReactAgent(run.workspace_dir)
+    if args.algorithm == "gepa":
+        engine = _build_gepa_engine(
+            config,
+            max_metric_calls=args.gepa_max_metric_calls,
+            validation_limit=args.limit_val,
+            model=evolver_model,
+            base_url=evolver_base_url,
+            api_key=evolver_api_key,
+            temperature=evolver_temperature,
+        )
+        total_updates = 1
+    else:
+        teacher_llm = _build_teacher_llm(agent.config) if args.step_opsd else None
+        engine = AdaptiveSkillEngine(config, teacher_llm=teacher_llm)
+        total_updates = _total_updates(
+            benchmark=benchmark,
+            max_epochs=args.max_cycles,
+            batch_size=args.batch_size,
+            train_limit=args.limit_train,
+        )
     print_run_header(
         title="OR-Interact Evolution",
         run_dir=run.run_dir,
@@ -151,7 +154,6 @@ def main() -> int:
         console=console,
     )
     if args.harness_tree:
-        agent = ORReactAgent(run.workspace_dir)
         workspace = agent.workspace.root
         final_dir = workspace / "evolution" / "final_test"
         test_limit = evaluation_limit_for_split(
@@ -304,7 +306,7 @@ def main() -> int:
             )
     else:
         evolver = Evolver(
-            agent=run.workspace_dir,
+            agent=agent,
             benchmark=benchmark,
             config=config,
             engine=engine,
@@ -796,6 +798,16 @@ def resolve_evolver_llm() -> tuple[str, str, str | None, float | None]:
     if base_url and not model.startswith("openai:"):
         model = f"openai:{model}"
     return model, base_url, api_key, float(temperature) if temperature is not None else None
+
+
+def _build_teacher_llm(config: Any) -> OpenAICompatProvider:
+    return OpenAICompatProvider(
+        model=config.model,
+        api_key=config.api_key,
+        base_url=config.base_url,
+        temperature=config.temperature,
+        omit_temperature=config.temperature is None,
+    )
 
 
 def load_yaml(path: str | Path) -> dict[str, Any]:

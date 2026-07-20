@@ -20,7 +20,7 @@ from ..evaluation import run_evaluation
 from ..types import CycleRecord, EvolutionResult, Observation
 from .history import EvolutionHistory
 from .observer import Observer
-from ..task_runner import run_task_evaluations
+from ..task_runner import resolve_agent_parallelism, run_task_evaluations
 from .trial import TrialRunner
 from .versioning import VersionControl
 
@@ -169,11 +169,15 @@ class EvolutionLoop:
                         self.observer.record_from_observation(observation)
                         for observation in observations
                     ]
+                    teacher_llm = getattr(self.engine, "teacher_llm", None)
+                    if teacher_llm is None:
+                        teacher_llm = getattr(self.engine, "llm", None)
                     records = build_step_opsd_records(
                         observations,
                         base_records,
                         evolution_dir=evolution_dir,
-                        llm=getattr(self.engine, "llm", None),
+                        llm=teacher_llm,
+                        parallelism=resolve_agent_parallelism(self.agent),
                         failures_only=bool(
                             self.config.extra.get("step_opsd_review_failures_only", True)
                         ),

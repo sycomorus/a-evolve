@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -63,12 +64,15 @@ def build_step_opsd_records(
     failures_only: bool = True,
     max_tokens: int = 2048,
     interaction_enabled: bool = True,
+    parallelism: int = 1,
 ) -> list[dict[str, Any]]:
     """Attach Step-OPSD trace views and redacted teacher reviews to records."""
     full_cleaned_dir = evolution_dir / "step_opsd" / "full_cleaned"
     full_cleaned_dir.mkdir(parents=True, exist_ok=True)
 
-    enriched: list[dict[str, Any]] = []
+    prepared: list[
+        tuple[Observation, dict[str, Any], list[dict[str, Any]], dict[str, Any], str]
+    ] = []
     for obs, base_record in zip(observations, base_records):
         record = _redact_record_for_evolver(base_record)
         full_cleaned = _clean_trace(obs.trajectory.conversation or obs.trajectory.steps)
@@ -83,14 +87,21 @@ def build_step_opsd_records(
             steps,
             interaction_enabled=interaction_enabled,
         )
+        prepared.append((obs, record, steps, privileged_packet, str(full_cleaned_path)))
 
-        should_review = bool(llm is not None) and (
+    reviews: list[tuple[dict[str, Any], str] | None] = [None] * len(prepared)
+    review_indices = [
+        index
+        for index, (obs, _record, _steps, _packet, _path) in enumerate(prepared)
+        if bool(llm is not None) and (
             not failures_only or not bool(obs.feedback.success)
         )
-        teacher_review: dict[str, Any]
-        redaction_status = "skipped"
-        if should_review:
-            teacher_review, redaction_status = _run_teacher_review(
+    ]
+    workers = min(max(1, int(parallelism)), len(review_indices)) if review_indices else 0
+    if workers <= 1:
+        for index in review_indices:
+            obs, _record, steps, privileged_packet, _path = prepared[index]
+            reviews[index] = _run_teacher_review(
                 llm=llm,
                 obs=obs,
                 steps=steps,
@@ -98,7 +109,27 @@ def build_step_opsd_records(
                 max_tokens=max_tokens,
                 interaction_enabled=interaction_enabled,
             )
-        else:
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(
+                    _run_teacher_review,
+                    llm=llm,
+                    obs=prepared[index][0],
+                    steps=prepared[index][2],
+                    privileged_packet=prepared[index][3],
+                    max_tokens=max_tokens,
+                    interaction_enabled=interaction_enabled,
+                ): index
+                for index in review_indices
+            }
+            for future in as_completed(futures):
+                reviews[futures[future]] = future.result()
+
+    enriched: list[dict[str, Any]] = []
+    for index, (obs, record, steps, _packet, full_cleaned_path) in enumerate(prepared):
+        review_result = reviews[index]
+        if review_result is None:
             teacher_review = {
                 "task_id": obs.task.id,
                 "overall_diagnosis": "Teacher review skipped.",
@@ -107,9 +138,12 @@ def build_step_opsd_records(
             }
             if interaction_enabled:
                 teacher_review["interaction_review"] = {}
+            redaction_status = "skipped"
+        else:
+            teacher_review, redaction_status = review_result
 
         record["trace_views"] = {
-            "teacher_full_cleaned_path": str(full_cleaned_path),
+            "teacher_full_cleaned_path": full_cleaned_path,
             "evolve_compressed": _compress_for_evolver(
                 obs=obs,
                 steps=steps,

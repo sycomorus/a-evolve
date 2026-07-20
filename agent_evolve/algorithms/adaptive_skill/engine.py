@@ -30,15 +30,25 @@ MUTATION_PATHS = ("prompts", "skills", "memory", "tools", "manifest.yaml")
 class AdaptiveSkillEngine(EvolutionEngine):
     """LLM-driven workspace mutation engine."""
 
-    def __init__(self, config: EvolveConfig, llm: LLMProvider | None = None):
+    def __init__(
+        self,
+        config: EvolveConfig,
+        llm: LLMProvider | None = None,
+        teacher_llm: LLMProvider | None = None,
+    ):
         self.config = config
         self._llm = llm
+        self._teacher_llm = teacher_llm
 
     @property
     def llm(self) -> LLMProvider:
         if self._llm is None:
             self._llm = create_default_llm(self.config)
         return self._llm
+
+    @property
+    def teacher_llm(self) -> LLMProvider:
+        return self._teacher_llm or self.llm
 
     def step(
         self,
