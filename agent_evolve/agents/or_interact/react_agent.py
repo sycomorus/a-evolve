@@ -45,6 +45,7 @@ FORBIDDEN_TOOL_STRINGS = (
 )
 TASK_CATEGORY_ENV = "OR_INTERACT_TASK_CATEGORY"
 OR_INTERACT_SETTINGS_FILE = "or_interact_settings.json"
+USER_TOOL_OVERRIDE_ENV = "A_EVOLVE_OR_INTERACT_USER_TOOL"
 RESERVED_DYNAMIC_TOOL_NAMES = {"ask_user", "list_skills", "read_skill", "run_heuristic"}
 USER_INTERACTION_MARKERS = (
     "ask_user",
@@ -459,6 +460,9 @@ class ORReactAgent(BaseAgent):
         return bool(self.or_interact_settings.get("enable_heuristic_tool"))
 
     def _user_tool_enabled(self) -> bool:
+        override = os.environ.get(USER_TOOL_OVERRIDE_ENV)
+        if override is not None:
+            return override == "1"
         return bool(self.or_interact_settings.get("enable_user_tool"))
 
     def _load_evolved_tool(self, entry: dict[str, Any]) -> ToolSpec:

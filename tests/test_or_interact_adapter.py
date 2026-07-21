@@ -18,7 +18,10 @@ from baseline.react.agent import AgentResult
 from baseline.react.trace import TraceWriter
 from agent_evolve.config import EvolveConfig
 from agent_evolve.contract.workspace import AgentWorkspace
-from agent_evolve.agents.or_interact.react_agent import ORReactAgent
+from agent_evolve.agents.or_interact.react_agent import (
+    ORReactAgent,
+    USER_TOOL_OVERRIDE_ENV,
+)
 from agent_evolve.benchmarks.or_interact import ORInteractBenchmark
 from agent_evolve.engine.versioning import VersionControl
 from agent_evolve.engine.observer import Observer
@@ -868,7 +871,7 @@ def test_or_interact_heuristic_tool_is_enabled_only_by_workspace_setting(
     assert "tools/run_heuristic.py" in prompt
 
 
-def test_or_interact_user_tool_is_enabled_only_by_workspace_setting(
+def test_or_interact_user_tool_is_enabled_by_workspace_setting(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -920,6 +923,18 @@ def test_or_interact_user_tool_is_enabled_only_by_workspace_setting(
     assert user_response["code"] == "no_grounded_records"
     assert user_response["answer"]
     assert "run_heuristic" not in captured["tools"]
+
+
+def test_or_interact_user_tool_can_be_enabled_by_runtime_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = _workspace(tmp_path / "workspace")
+    monkeypatch.setenv(USER_TOOL_OVERRIDE_ENV, "1")
+
+    agent = ORReactAgent(workspace)
+
+    assert agent._user_tool_enabled() is True
 
 
 def test_or_interact_user_tool_disabled_hides_inherited_interaction_content(
@@ -1185,7 +1200,12 @@ def test_or_interact_cli_has_no_check_flags(monkeypatch: pytest.MonkeyPatch) -> 
     )
 
     monkeypatch.setattr(sys, "argv", ["evaluate_or_interact.py"])
-    assert not hasattr(evaluate_or_interact.parse_args(), "check")
+    args = evaluate_or_interact.parse_args()
+    assert not hasattr(args, "check")
+    assert args.user is False
+
+    monkeypatch.setattr(sys, "argv", ["evaluate_or_interact.py", "--user"])
+    assert evaluate_or_interact.parse_args().user is True
 
     monkeypatch.setattr(sys, "argv", ["evolve_or_interact.py"])
     args = evolve_or_interact.parse_args()

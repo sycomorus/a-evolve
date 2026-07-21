@@ -18,7 +18,10 @@ if str(ROOT) not in sys.path:
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from agent_evolve.agents.or_interact.react_agent import ORReactAgent  # noqa: E402
+from agent_evolve.agents.or_interact.react_agent import (  # noqa: E402
+    ORReactAgent,
+    USER_TOOL_OVERRIDE_ENV,
+)
 from agent_evolve.benchmarks.or_interact import (  # noqa: E402
     ORInteractBenchmark,
     evaluation_limit_for_split,
@@ -49,13 +52,14 @@ def main() -> int:
         console=console,
     )
 
+    user_tool_enabled = args.user or _workspace_user_tool_enabled(workspace)
     benchmark = ORInteractBenchmark(
         benchmark_dir=args.benchmark_dir,
         dataset=args.dataset,
         seed=42,
         train_size=train_size_from_limit(args.limit_train),
         val_size=args.limit_val,
-        interaction_enabled=_workspace_user_tool_enabled(workspace),
+        interaction_enabled=user_tool_enabled,
     )
     evaluation_limit = evaluation_limit_for_split(
         args.split,
@@ -65,7 +69,9 @@ def main() -> int:
         legacy_limit=args.limit,
     )
     previous_results_dir = os.environ.get("OR_REACT_RESULTS_DIR")
+    previous_user_tool_override = os.environ.get(USER_TOOL_OVERRIDE_ENV)
     os.environ["OR_REACT_RESULTS_DIR"] = str((output_dir / "runs").resolve())
+    os.environ[USER_TOOL_OVERRIDE_ENV] = "1" if user_tool_enabled else "0"
     try:
         agent = ORReactAgent(workspace)
         summary = run_evaluation(
@@ -82,6 +88,10 @@ def main() -> int:
             os.environ.pop("OR_REACT_RESULTS_DIR", None)
         else:
             os.environ["OR_REACT_RESULTS_DIR"] = previous_results_dir
+        if previous_user_tool_override is None:
+            os.environ.pop(USER_TOOL_OVERRIDE_ENV, None)
+        else:
+            os.environ[USER_TOOL_OVERRIDE_ENV] = previous_user_tool_override
     summary["source_type"] = source_type
     summary["dataset"] = args.dataset
     summary["limit_train"] = args.limit_train
@@ -144,6 +154,11 @@ def parse_args() -> argparse.Namespace:
         dest="limit_test",
         type=int,
         help="Evaluation limit when --split test or holdout.",
+    )
+    parser.add_argument(
+        "--user",
+        action="store_true",
+        help="Enable the grounded clarification ask_user tool for this evaluation.",
     )
     parser.add_argument("--output-dir")
     return parser.parse_args()
