@@ -1,6 +1,9 @@
 """Tests for GEPA workspace ↔ candidate serialization round-trip."""
 import json
 from pathlib import Path
+
+import pytest
+
 from agent_evolve.contract.workspace import AgentWorkspace
 from agent_evolve.config import EvolveConfig
 
@@ -132,3 +135,56 @@ def test_restore_memory_clears_and_rewrites(tmp_path):
     assert len(all_mem) == 2
     assert all(m.get("new") for m in all_mem)
     assert not any(m.get("old") for m in all_mem)
+
+
+@pytest.mark.parametrize(
+    "blob",
+    [
+        "true",
+        "[true]",
+        '{"_category": "episodic", "new": "valid"}\ntrue',
+    ],
+)
+def test_restore_memory_rejects_invalid_entries_without_clearing(tmp_path, blob):
+    from agent_evolve.algorithms.gepa.serialization import (
+        CandidateFormatError,
+        restore_memory,
+    )
+
+    ws = AgentWorkspace(tmp_path)
+    ws.add_memory({"old": "data"}, category="episodic")
+
+    with pytest.raises(CandidateFormatError, match="JSON object"):
+        restore_memory(ws, blob)
+
+    assert ws.read_memories("episodic") == [{"old": "data"}]
+
+
+@pytest.mark.parametrize(
+    ("component", "invalid_blob"),
+    [
+        ("prompt_fragments", "true"),
+        ("skills", "true"),
+    ],
+)
+def test_restore_candidate_validates_all_components_before_mutating(
+    tmp_path, component, invalid_blob
+):
+    from agent_evolve.algorithms.gepa.serialization import (
+        CandidateFormatError,
+        restore_candidate,
+    )
+
+    ws = _make_workspace(tmp_path)
+    config = EvolveConfig(evolve_prompts=True, evolve_skills=True, evolve_memory=True)
+    candidate = {
+        "system_prompt": "Changed prompt.",
+        component: invalid_blob,
+    }
+
+    with pytest.raises(CandidateFormatError, match=component):
+        restore_candidate(ws, candidate, config)
+
+    assert ws.read_prompt() == "You are an expert agent."
+    assert sorted(ws.list_fragments()) == ["code-exec.md", "verification.md"]
+    assert [skill.name for skill in ws.list_skills()] == ["entity-verify", "multi-req"]

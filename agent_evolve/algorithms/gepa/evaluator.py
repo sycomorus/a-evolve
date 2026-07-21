@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .serialization import restore_candidate
+from .serialization import CandidateFormatError, restore_candidate
 
 if TYPE_CHECKING:
     from ...config import EvolveConfig
@@ -188,6 +188,34 @@ def _evaluate_candidate(
                 elapsed_seconds=round(time.monotonic() - started, 3),
             )
         return obs.feedback.score, build_side_info(obs)
+    except CandidateFormatError as exc:
+        if debug_log:
+            debug_log.write(
+                "candidate_rejected",
+                task_id=example.id,
+                worker=worker,
+                error=str(exc),
+                elapsed_seconds=round(time.monotonic() - started, 3),
+            )
+        return 0.0, {
+            "Input": {
+                "Task ID": example.id,
+                "Task": _truncate(example.input, 500),
+            },
+            "Generated Outputs": {
+                "Output": "",
+                "Agent Trace": "Candidate was rejected before execution.",
+            },
+            "Feedback": {
+                "Status": "INVALID_CANDIDATE",
+                "Score": 0.0,
+                "Detail": str(exc),
+                "Raw": "",
+            },
+            "scores": {
+                "correctness": 0.0,
+            },
+        }
     except BaseException as exc:
         if debug_log:
             debug_log.write(

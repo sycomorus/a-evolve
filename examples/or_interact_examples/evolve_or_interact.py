@@ -32,6 +32,9 @@ if str(REPO_ROOT) not in sys.path:
 from agent_evolve.api import Evolver  # noqa: E402
 from agent_evolve.algorithms.adaptive_skill import AdaptiveSkillEngine  # noqa: E402
 from agent_evolve.algorithms.meta_harness import MetaHarnessEngine  # noqa: E402
+from agent_evolve.algorithms.gepa.prompts import (  # noqa: E402
+    COMPONENT_REFLECTION_PROMPTS,
+)
 from agent_evolve.algorithms.unified.openai_compat import OpenAICompatProvider  # noqa: E402
 from agent_evolve.algorithms.step_opsd import (  # noqa: E402
     build_step_opsd_records,
@@ -827,7 +830,10 @@ def _build_gepa_engine(
             # the terminal and report metric-call progress.
             display_progress_bar=True,
         ),
-        reflection=ReflectionConfig(reflection_lm=reflection_lm),
+        reflection=ReflectionConfig(
+            reflection_lm=reflection_lm,
+            reflection_prompt_template=COMPONENT_REFLECTION_PROMPTS.copy(),
+        ),
     )
     return GEPAEngine(
         config,

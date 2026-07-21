@@ -161,3 +161,31 @@ def test_make_evaluator_calls_restore_and_run():
     mock_restore.assert_called_once()
     trial.agent.reload_from_fs.assert_called_once()
     trial.run_single.assert_called_once_with(task)
+
+
+def test_make_evaluator_rejects_invalid_candidate_without_running_trial():
+    from agent_evolve.algorithms.gepa.evaluator import make_evaluator
+    from agent_evolve.algorithms.gepa.serialization import CandidateFormatError
+
+    config = EvolveConfig()
+    trial = MagicMock()
+    trial.agent.workspace = MagicMock()
+    evaluator = make_evaluator(trial, config)
+
+    with patch(
+        "agent_evolve.algorithms.gepa.evaluator.restore_candidate",
+        side_effect=CandidateFormatError(
+            "memory line 1 must be a JSON object, got bool"
+        ),
+    ):
+        score, side_info = evaluator(
+            {"memory": "true"},
+            example=Task(id="t1", input="do something"),
+        )
+
+    assert score == 0.0
+    assert side_info["Feedback"]["Status"] == "INVALID_CANDIDATE"
+    assert "JSON object" in side_info["Feedback"]["Detail"]
+    assert side_info["scores"]["correctness"] == 0.0
+    trial.agent.reload_from_fs.assert_not_called()
+    trial.run_single.assert_not_called()

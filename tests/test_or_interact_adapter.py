@@ -321,6 +321,7 @@ def test_gepa_engine_uses_evolver_openai_endpoint(
         parallel_workers=8,
     )
     reflection_lm = engine.gepa_config.reflection.reflection_lm
+    reflection_templates = engine.gepa_config.reflection.reflection_prompt_template
 
     assert engine.gepa_config.engine.max_metric_calls == 50
     assert engine.gepa_config.engine.display_progress_bar is True
@@ -328,6 +329,8 @@ def test_gepa_engine_uses_evolver_openai_endpoint(
     assert engine.parallel_workers == 8
     assert config.validation_limit is None
     assert config.evolve_tools is False
+    assert "JSON object" in reflection_templates["memory"]
+    assert "=== SKILL:" in reflection_templates["skills"]
     assert reflection_lm("reflect") == "updated"
     openai_factory.assert_called_once_with(
         base_url="https://example.invalid/v1",

@@ -184,3 +184,16 @@ def test_gepa_engine_default_config():
 
         mock_engine_config.assert_called_once()
         mock_reflection_config.assert_called_once()
+        templates = mock_reflection_config.call_args.kwargs[
+            "reflection_prompt_template"
+        ]
+        assert set(templates) == {
+            "system_prompt",
+            "prompt_fragments",
+            "skills",
+            "memory",
+        }
+        assert "JSON object" in templates["memory"]
+        assert "=== SKILL:" in templates["skills"]
+        assert "<curr_param>" in templates["memory"]
+        assert "<side_info>" in templates["memory"]

@@ -23,6 +23,7 @@ from gepa.optimize_anything import (
 from ...engine.base import EvolutionEngine
 from ...types import StepResult
 from .evaluator import GEPADebugLog, make_evaluator, make_parallel_evaluator
+from .prompts import COMPONENT_REFLECTION_PROMPTS
 from .serialization import build_candidate, restore_candidate
 
 if TYPE_CHECKING:
@@ -67,6 +68,11 @@ class GEPAEngine(EvolutionEngine):
                 ),
                 reflection=ReflectionConfig(
                     reflection_lm=config.evolver_model,
+                    reflection_prompt_template=(
+                        COMPONENT_REFLECTION_PROMPTS.copy()
+                        if not objective and not background
+                        else None
+                    ),
                 ),
             )
 
