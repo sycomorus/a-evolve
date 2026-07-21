@@ -314,44 +314,51 @@ def main() -> int:
             work_dir=run.run_dir,
         )
 
-        with Progress(
-            TextColumn("[bold magenta]Evolving"),
-            BarColumn(),
-            MofNCompleteColumn(),
-            TextColumn(
-                "[dim]epoch={task.fields[epoch]} batch={task.fields[batch]} "
-                "score={task.fields[score]} mutated={task.fields[mutated]} "
-                "gate={task.fields[gate]}"
-            ),
-            TimeElapsedColumn(),
-            console=console,
-        ) as progress:
-            progress_task = progress.add_task(
-                "evolve",
-                total=total_updates,
-                epoch="n/a",
-                batch="n/a",
-                score="n/a",
-                mutated="n/a",
-                gate="n/a",
-            )
-
-            def update_progress(event: dict[str, object]) -> None:
-                progress.update(
-                    progress_task,
-                    completed=int(event["cycle"]),
-                    epoch=str(event.get("epoch", "n/a")),
-                    batch=str(event.get("batch_index", "n/a")),
-                    score=f"{float(event['score']):.3f}",
-                    mutated="yes" if event["mutated"] else "no",
-                    gate=(
-                        ("accept" if event.get("accepted") else "reject")
-                        if args.algorithm == "adaptive-skill" and args.limit_val
-                        else "n/a"
-                    ),
+        if args.algorithm == "gepa":
+            console.rule("[bold magenta]GEPA evolution")
+            result = evolver.run(cycles=args.max_cycles)
+        else:
+            with Progress(
+                TextColumn("[bold magenta]Evolving"),
+                BarColumn(),
+                MofNCompleteColumn(),
+                TextColumn(
+                    "[dim]epoch={task.fields[epoch]} batch={task.fields[batch]} "
+                    "score={task.fields[score]} mutated={task.fields[mutated]} "
+                    "gate={task.fields[gate]}"
+                ),
+                TimeElapsedColumn(),
+                console=console,
+            ) as progress:
+                progress_task = progress.add_task(
+                    "evolve",
+                    total=total_updates,
+                    epoch="n/a",
+                    batch="n/a",
+                    score="n/a",
+                    mutated="n/a",
+                    gate="n/a",
                 )
 
-            result = evolver.run(cycles=args.max_cycles, progress_callback=update_progress)
+                def update_progress(event: dict[str, object]) -> None:
+                    progress.update(
+                        progress_task,
+                        completed=int(event["cycle"]),
+                        epoch=str(event.get("epoch", "n/a")),
+                        batch=str(event.get("batch_index", "n/a")),
+                        score=f"{float(event['score']):.3f}",
+                        mutated="yes" if event["mutated"] else "no",
+                        gate=(
+                            ("accept" if event.get("accepted") else "reject")
+                            if args.algorithm == "adaptive-skill" and args.limit_val
+                            else "n/a"
+                        ),
+                    )
+
+                result = evolver.run(
+                    cycles=args.max_cycles,
+                    progress_callback=update_progress,
+                )
 
         workspace = evolver.agent.workspace.root
         final_dir = workspace / "evolution" / "final_test"
@@ -781,6 +788,8 @@ def _build_gepa_engine(
     gepa_config = GEPAConfig(
         engine=EngineConfig(
             max_metric_calls=max_metric_calls,
+            # GEPA runs outside the outer Rich display, so tqdm can safely own
+            # the terminal and report metric-call progress.
             display_progress_bar=True,
         ),
         reflection=ReflectionConfig(reflection_lm=reflection_lm),
