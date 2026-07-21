@@ -4,7 +4,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import ANY, MagicMock, call, patch
 
 from agent_evolve.config import EvolveConfig
 from agent_evolve.contract.workspace import AgentWorkspace
@@ -152,7 +152,13 @@ def test_gepa_engine_parallel_mode_uses_worker_pool(tmp_path):
                 trial=trial,
             )
 
-        make_parallel.assert_called_once_with(trial, workspace, 8, engine.config)
+        make_parallel.assert_called_once_with(
+            trial,
+            workspace,
+            8,
+            engine.config,
+            debug_log=ANY,
+        )
         assert engine.gepa_config.engine.parallel is True
         assert engine.gepa_config.engine.max_workers == 8
         cleanup.assert_called_once_with()

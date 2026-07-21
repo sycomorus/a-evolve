@@ -1,7 +1,22 @@
 """Tests for GEPA evaluator, side info, and trajectory compression."""
+import json
+
 from unittest.mock import MagicMock, patch
 from agent_evolve.config import EvolveConfig
 from agent_evolve.types import Feedback, Observation, Task, Trajectory
+
+
+def test_gepa_debug_log_writes_jsonl_and_stderr(tmp_path, capsys):
+    from agent_evolve.algorithms.gepa.evaluator import GEPADebugLog
+
+    debug_log = GEPADebugLog(tmp_path)
+    debug_log.write("test_event", task_id="t1", worker=2)
+
+    record = json.loads(debug_log.path.read_text(encoding="utf-8"))
+    assert record["event"] == "test_event"
+    assert record["task_id"] == "t1"
+    assert record["worker"] == 2
+    assert "[GEPA debug]" in capsys.readouterr().err
 
 
 def _make_observation(

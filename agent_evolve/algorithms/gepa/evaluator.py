@@ -10,9 +10,15 @@ Provides:
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import sys
 import threading
+import time
+import traceback
 from collections import Counter
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .serialization import restore_candidate
@@ -24,15 +30,49 @@ if TYPE_CHECKING:
     from ...types import Observation, Task, Trajectory
 
 
+class GEPADebugLog:
+    """Thread-safe GEPA diagnostics written to JSONL and stderr."""
+
+    def __init__(self, workspace_root: str | Path):
+        self.path = Path(workspace_root) / "evolution" / "gepa" / "debug.jsonl"
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+
+    def write(self, event: str, **fields: Any) -> None:
+        record = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "event": event,
+            "pid": os.getpid(),
+            "thread": threading.current_thread().name,
+            **fields,
+        }
+        line = json.dumps(record, ensure_ascii=False, default=str)
+        with self._lock:
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+            print(f"[GEPA debug] {line}", file=sys.stderr, flush=True)
+
+
 def make_evaluator(
-    trial: TrialRunner, config: EvolveConfig
+    trial: TrialRunner,
+    config: EvolveConfig,
+    *,
+    debug_log: GEPADebugLog | None = None,
 ) -> Any:
     """Create a serial evaluator for GEPA's optimize_anything."""
+
     def evaluator(candidate: dict[str, str], example: Task) -> tuple[float, dict]:
-        restore_candidate(trial.agent.workspace, candidate, config)
-        trial.agent.reload_from_fs()
-        obs = trial.run_single(example)
-        return obs.feedback.score, build_side_info(obs)
+        return _evaluate_candidate(
+            workspace=trial.agent.workspace,
+            agent=trial.agent,
+            trial=trial,
+            config=config,
+            candidate=candidate,
+            example=example,
+            worker="serial",
+            debug_log=debug_log,
+        )
+
     return evaluator
 
 
@@ -41,6 +81,8 @@ def make_parallel_evaluator(
     workspace: AgentWorkspace,
     n_workers: int,
     config: EvolveConfig,
+    *,
+    debug_log: GEPADebugLog | None = None,
 ) -> tuple[Any, Any]:
     """Create a thread-safe parallel evaluator with a worker pool."""
     from ...contract.workspace import AgentWorkspace as _AgentWorkspace
@@ -55,10 +97,25 @@ def make_parallel_evaluator(
 
     for i in range(n_workers):
         worker_dir = workspace.root.parent / f"gepa_worker_{i}"
-        shutil.copytree(workspace.root, worker_dir, dirs_exist_ok=True)
-        worker_agent = type(agent)(worker_dir)
-        worker_trial = _TrialRunner(worker_agent, benchmark)
-        worker_pool.append((_AgentWorkspace(worker_dir), worker_agent, worker_trial))
+        if debug_log:
+            debug_log.write("worker_init_start", worker=i, workspace=str(worker_dir))
+        try:
+            shutil.copytree(workspace.root, worker_dir, dirs_exist_ok=True)
+            worker_agent = type(agent)(worker_dir)
+            worker_trial = _TrialRunner(worker_agent, benchmark)
+            worker_pool.append((_AgentWorkspace(worker_dir), worker_agent, worker_trial))
+            if debug_log:
+                debug_log.write("worker_init_done", worker=i, workspace=str(worker_dir))
+        except BaseException as exc:
+            if debug_log:
+                debug_log.write(
+                    "worker_init_failed",
+                    worker=i,
+                    workspace=str(worker_dir),
+                    error=f"{type(exc).__name__}: {exc}",
+                    traceback=traceback.format_exc(),
+                )
+            raise
 
     def get_worker() -> tuple[int, tuple[_AgentWorkspace, Any, _TrialRunner]]:
         with worker_lock:
@@ -75,18 +132,73 @@ def make_parallel_evaluator(
     def evaluator(candidate: dict[str, str], example: Task) -> tuple[float, dict]:
         idx, (ws, ag, tr) = get_worker()
         try:
-            restore_candidate(ws, candidate, config)
-            ag.reload_from_fs()
-            obs = tr.run_single(example)
-            return obs.feedback.score, build_side_info(obs)
+            return _evaluate_candidate(
+                workspace=ws,
+                agent=ag,
+                trial=tr,
+                config=config,
+                candidate=candidate,
+                example=example,
+                worker=idx,
+                debug_log=debug_log,
+            )
         finally:
             release_worker(idx)
 
     def cleanup() -> None:
+        if debug_log:
+            debug_log.write("worker_cleanup_start", workers=len(worker_pool))
         for ws, _, _ in worker_pool:
             shutil.rmtree(ws.root, ignore_errors=True)
+        if debug_log:
+            debug_log.write("worker_cleanup_done", workers=len(worker_pool))
 
     return evaluator, cleanup
+
+
+def _evaluate_candidate(
+    *,
+    workspace: Any,
+    agent: Any,
+    trial: Any,
+    config: EvolveConfig,
+    candidate: dict[str, str],
+    example: Task,
+    worker: int | str,
+    debug_log: GEPADebugLog | None,
+) -> tuple[float, dict]:
+    started = time.monotonic()
+    if debug_log:
+        debug_log.write("evaluation_start", task_id=example.id, worker=worker)
+    try:
+        restore_candidate(workspace, candidate, config)
+        if debug_log:
+            debug_log.write("candidate_restored", task_id=example.id, worker=worker)
+        agent.reload_from_fs()
+        if debug_log:
+            debug_log.write("solve_start", task_id=example.id, worker=worker)
+        obs = trial.run_single(example)
+        if debug_log:
+            debug_log.write(
+                "evaluation_done",
+                task_id=example.id,
+                worker=worker,
+                score=obs.feedback.score,
+                success=obs.feedback.success,
+                elapsed_seconds=round(time.monotonic() - started, 3),
+            )
+        return obs.feedback.score, build_side_info(obs)
+    except BaseException as exc:
+        if debug_log:
+            debug_log.write(
+                "evaluation_failed",
+                task_id=example.id,
+                worker=worker,
+                error=f"{type(exc).__name__}: {exc}",
+                traceback=traceback.format_exc(),
+                elapsed_seconds=round(time.monotonic() - started, 3),
+            )
+        raise
 
 
 def build_side_info(obs: Observation) -> dict:

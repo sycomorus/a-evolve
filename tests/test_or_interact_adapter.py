@@ -7,6 +7,7 @@ import shutil
 import sys
 import time
 import types
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -271,6 +272,7 @@ def test_gepa_engine_uses_evolver_openai_endpoint(
     reflection_lm = engine.gepa_config.reflection.reflection_lm
 
     assert engine.gepa_config.engine.max_metric_calls == 50
+    assert engine.gepa_config.engine.display_progress_bar is True
     assert engine.validation_limit == 10
     assert engine.parallel_workers == 8
     assert config.validation_limit is None
@@ -285,6 +287,17 @@ def test_gepa_engine_uses_evolver_openai_endpoint(
         messages=[{"role": "user", "content": "reflect"}],
         temperature=0.25,
     )
+
+
+def test_task_timeout_is_safe_in_worker_thread() -> None:
+    from agent_evolve.agents.or_interact.react_agent import _task_timeout
+
+    def run() -> str:
+        with _task_timeout(1):
+            return "completed"
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        assert executor.submit(run).result() == "completed"
 
 
 def test_loads_dataset_directory_when_index_lacks_dataset(tmp_path: Path) -> None:

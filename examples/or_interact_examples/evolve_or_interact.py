@@ -779,7 +779,10 @@ def _build_gepa_engine(
         temperature=temperature,
     )
     gepa_config = GEPAConfig(
-        engine=EngineConfig(max_metric_calls=max_metric_calls),
+        engine=EngineConfig(
+            max_metric_calls=max_metric_calls,
+            display_progress_bar=True,
+        ),
         reflection=ReflectionConfig(reflection_lm=reflection_lm),
     )
     return GEPAEngine(

@@ -8,6 +8,7 @@ import json
 import os
 import re
 import signal
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -635,6 +636,10 @@ def _validate_tool_function(name: str, function: Any) -> None:
 @contextmanager
 def _task_timeout(seconds: int):
     if seconds <= 0:
+        yield
+        return
+    # GEPA evaluates tasks in worker threads, where Python forbids SIGALRM.
+    if threading.current_thread() is not threading.main_thread():
         yield
         return
 
