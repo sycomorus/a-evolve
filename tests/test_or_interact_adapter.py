@@ -203,6 +203,57 @@ def test_evolve_cli_rejects_invalid_gepa_combinations(
     assert message in capsys.readouterr().err
 
 
+def test_evolve_cli_selects_meta_harness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from examples.or_interact_examples import evolve_or_interact
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "evolve_or_interact.py",
+            "--algorithm",
+            "meta-harness",
+            "--limit-val",
+            "10",
+        ],
+    )
+
+    args = evolve_or_interact.parse_args()
+
+    assert args.algorithm == "meta-harness"
+    assert args.limit_val == 10
+
+
+@pytest.mark.parametrize(
+    "extra_args, message",
+    [
+        ([], "requires --limit-val greater than 0"),
+        (["--limit-val", "10", "--step-opsd"], "--step-opsd cannot be used"),
+        (["--limit-val", "10", "--harness-tree"], "--harness-tree cannot be used"),
+    ],
+)
+def test_evolve_cli_rejects_invalid_meta_harness_combinations(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    extra_args: list[str],
+    message: str,
+) -> None:
+    from examples.or_interact_examples import evolve_or_interact
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["evolve_or_interact.py", "--algorithm", "meta-harness", *extra_args],
+    )
+
+    with pytest.raises(SystemExit):
+        evolve_or_interact.parse_args()
+
+    assert message in capsys.readouterr().err
+
+
 def test_evolve_cli_rejects_non_positive_gepa_budget(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -287,6 +338,165 @@ def test_gepa_engine_uses_evolver_openai_endpoint(
         messages=[{"role": "user", "content": "reflect"}],
         temperature=0.25,
     )
+
+
+def test_meta_harness_evaluates_on_configured_split() -> None:
+    from agent_evolve.algorithms.meta_harness import MetaHarnessEngine
+
+    val_tasks = [Task(id="val_1", input="", metadata={})]
+
+    class FakeTrial:
+        def __init__(self) -> None:
+            self.requests: list[tuple[str, int]] = []
+
+        def get_tasks(self, split: str, limit: int) -> list[Task]:
+            self.requests.append((split, limit))
+            return val_tasks
+
+        def run_tasks(self, tasks: list[Task]) -> list[Observation]:
+            return [
+                Observation(
+                    task=task,
+                    trajectory=Trajectory(task_id=task.id, output=""),
+                    feedback=Feedback(success=True, score=1.0, detail="ok"),
+                )
+                for task in tasks
+            ]
+
+    engine = MetaHarnessEngine(
+        EvolveConfig(extra={"eval_split": "val", "eval_sample_size": 0})
+    )
+    trial = FakeTrial()
+
+    result = engine._evaluate_candidate(trial)
+
+    assert trial.requests == [("val", 10000)]
+    assert result["score"] == 1.0
+
+    trial.requests.clear()
+    explicit_tasks = [Task(id="explicit", input="", metadata={})]
+    engine._evaluate_candidate(trial, tasks=explicit_tasks)
+    assert trial.requests == []
+
+
+def test_meta_harness_serial_evaluation_reloads_candidate_and_reset_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent_evolve.algorithms.meta_harness import MetaHarnessEngine
+
+    workspace_path = _workspace(tmp_path / "workspace")
+    workspace = AgentWorkspace(workspace_path)
+    prompt_path = workspace_path / "prompts" / "system.md"
+    task = Task(id="val_1", input="", metadata={})
+
+    class FakeAgent:
+        def __init__(self) -> None:
+            self.prompt = ""
+            self.reloads: list[str] = []
+            self.reload_from_fs()
+
+        def reload_from_fs(self) -> None:
+            self.prompt = prompt_path.read_text(encoding="utf-8")
+            self.reloads.append(self.prompt)
+
+    class FakeTrial:
+        def __init__(self) -> None:
+            self.agent = FakeAgent()
+            self.evaluated_prompts: list[str] = []
+
+        def run_tasks(self, tasks: list[Task]) -> list[Observation]:
+            self.evaluated_prompts.append(self.agent.prompt)
+            return [
+                Observation(
+                    task=current,
+                    trajectory=Trajectory(task_id=current.id, output=""),
+                    feedback=Feedback(
+                        success=self.agent.prompt == "Candidate prompt",
+                        score=1.0 if self.agent.prompt == "Candidate prompt" else 0.0,
+                        detail="evaluated",
+                    ),
+                )
+                for current in tasks
+            ]
+
+    engine = MetaHarnessEngine(EvolveConfig(extra={"eval_split": "val"}))
+    trial = FakeTrial()
+
+    def apply_candidate(_root: Path, _diff: str) -> None:
+        prompt_path.write_text("Candidate prompt", encoding="utf-8")
+
+    def reset_workspace(_root: Path) -> None:
+        prompt_path.write_text("Base prompt", encoding="utf-8")
+
+    monkeypatch.setattr(engine, "_apply_diff", apply_candidate)
+    monkeypatch.setattr(engine, "_git_reset", reset_workspace)
+    monkeypatch.setattr(
+        engine,
+        "_archive_candidate_from_snapshot",
+        lambda *args, **kwargs: None,
+    )
+
+    candidates = engine._evaluate_serial(
+        [
+            {
+                "index": 0,
+                "label": "cycle_001_cand_0",
+                "diff": "candidate diff",
+                "valid": True,
+                "validation_err": "",
+                "proposer_result": {"output": "", "exit_code": 0},
+                "snapshot_files": {},
+            }
+        ],
+        workspace,
+        workspace_path / "evolution" / "candidates",
+        1,
+        trial,
+        [task],
+    )
+
+    assert candidates[0]["score"] == 1.0
+    assert trial.evaluated_prompts == ["Candidate prompt"]
+    assert trial.agent.reloads == ["Base prompt", "Candidate prompt", "Base prompt"]
+
+
+def test_meta_harness_archive_records_evaluation_split(tmp_path: Path) -> None:
+    from agent_evolve.algorithms.meta_harness import MetaHarnessEngine
+
+    workspace = AgentWorkspace(_workspace(tmp_path / "workspace"))
+    engine = MetaHarnessEngine(EvolveConfig(extra={"eval_split": "val"}))
+    candidate_dir = workspace.root / "evolution" / "candidates" / "cycle_001_cand_0"
+
+    engine._archive_candidate_from_snapshot(
+        workspace,
+        candidate_dir,
+        {},
+        score=1.0,
+        cost=0,
+        cycle=1,
+        cand_index=0,
+        proposer_result={"exit_code": 0},
+    )
+
+    scores = json.loads((candidate_dir / "scores.json").read_text(encoding="utf-8"))
+    assert scores["evaluation_split"] == "val"
+
+
+def test_meta_harness_uses_existing_batch_update_schedule() -> None:
+    from examples.or_interact_examples.evolve_or_interact import _total_updates
+
+    class ScheduleBenchmark:
+        def get_tasks(self, split: str, limit: int) -> list[Task]:
+            assert split == "train"
+            return [Task(id=f"train_{index}", input="", metadata={}) for index in range(limit)]
+
+    assert _total_updates(
+        benchmark=ScheduleBenchmark(),
+        max_epochs=1,
+        batch_size=10,
+        train_limit=50,
+    ) == 5
 
 
 def test_task_timeout_is_safe_in_worker_thread() -> None:

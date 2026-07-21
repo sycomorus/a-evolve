@@ -31,6 +31,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from agent_evolve.api import Evolver  # noqa: E402
 from agent_evolve.algorithms.adaptive_skill import AdaptiveSkillEngine  # noqa: E402
+from agent_evolve.algorithms.meta_harness import MetaHarnessEngine  # noqa: E402
 from agent_evolve.algorithms.unified.openai_compat import OpenAICompatProvider  # noqa: E402
 from agent_evolve.algorithms.step_opsd import (  # noqa: E402
     build_step_opsd_records,
@@ -96,7 +97,7 @@ def main() -> int:
         evolve_prompts=True,
         evolve_skills=True,
         evolve_memory=True,
-        evolve_tools=args.algorithm == "adaptive-skill",
+        evolve_tools=args.algorithm in {"adaptive-skill", "meta-harness"},
         trajectory_only=False,
         extra={
             "max_skills": args.max_skills,
@@ -109,6 +110,11 @@ def main() -> int:
             "evolution_instruction": _evolution_instruction(
                 enable_heuristic_tool=args.enable_heuristic_tool,
                 interaction_training=interaction_training,
+            ),
+            **(
+                {"eval_split": "val", "harness_enabled": False}
+                if args.algorithm == "meta-harness"
+                else {}
             ),
         },
     )
@@ -138,6 +144,14 @@ def main() -> int:
             parallel_workers=agent.config.parallelism,
         )
         total_updates = 1
+    elif args.algorithm == "meta-harness":
+        engine = MetaHarnessEngine(config)
+        total_updates = _total_updates(
+            benchmark=benchmark,
+            max_epochs=args.max_cycles,
+            batch_size=args.batch_size,
+            train_limit=args.limit_train,
+        )
     else:
         teacher_llm = _build_teacher_llm(agent.config) if args.step_opsd else None
         engine = AdaptiveSkillEngine(config, teacher_llm=teacher_llm)
@@ -405,6 +419,18 @@ def main() -> int:
         "gepa_max_metric_calls": (
             args.gepa_max_metric_calls if args.algorithm == "gepa" else None
         ),
+        "meta_harness_evaluation_split": (
+            engine.eval_split if args.algorithm == "meta-harness" else None
+        ),
+        "meta_harness_validation_limit": (
+            args.limit_val if args.algorithm == "meta-harness" else None
+        ),
+        "meta_harness_num_candidates": (
+            engine.num_candidates if args.algorithm == "meta-harness" else None
+        ),
+        "meta_harness_proposer_model": (
+            engine.model if args.algorithm == "meta-harness" else None
+        ),
         "check": False,
         "cycles_completed": result.cycles_completed,
         "epochs_completed": result.details.get("epochs_completed"),
@@ -485,7 +511,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=10, help="Tasks per harness update.")
     parser.add_argument(
         "--algorithm",
-        choices=["adaptive-skill", "gepa"],
+        choices=["adaptive-skill", "gepa", "meta-harness"],
         default="adaptive-skill",
         help="Evolution algorithm. Defaults to adaptive-skill for backward compatibility.",
     )
@@ -542,7 +568,10 @@ def parse_args() -> argparse.Namespace:
         "--limit-val",
         type=_non_negative_int,
         default=0,
-        help="Validation tasks used to gate each non-Harness-Tree harness update.",
+        help=(
+            "Validation tasks used by adaptive-skill gating, GEPA holdout, or "
+            "Meta-Harness candidate scoring."
+        ),
     )
     parser.add_argument("--limit-test", type=int)
     parser.add_argument(
@@ -583,6 +612,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("--harness-tree cannot be used with --algorithm gepa")
     if args.algorithm == "gepa" and args.limit_val <= 0:
         parser.error("--algorithm gepa requires --limit-val greater than 0")
+    if args.algorithm == "meta-harness" and args.step_opsd:
+        parser.error("--step-opsd cannot be used with --algorithm meta-harness")
+    if args.algorithm == "meta-harness" and args.harness_tree:
+        parser.error("--harness-tree cannot be used with --algorithm meta-harness")
+    if args.algorithm == "meta-harness" and args.limit_val <= 0:
+        parser.error("--algorithm meta-harness requires --limit-val greater than 0")
     if args.limit_val and args.harness_tree:
         parser.error("--limit-val is only supported without --harness-tree")
     return args

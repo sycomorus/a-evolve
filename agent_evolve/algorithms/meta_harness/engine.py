@@ -78,6 +78,7 @@ class MetaHarnessEngine(EvolutionEngine):
         self.num_candidates: int = config.extra.get("num_candidates", 2)
         # Evaluation sample size: 0 = all tasks (paper default), >0 = subsample
         self.eval_sample_size: int = config.extra.get("eval_sample_size", 0)
+        self.eval_split: str = config.extra.get("eval_split", "train")
         # Rollback: revert if best candidate scores below current best.
         # Default False to match the paper — Meta-Harness stores all
         # candidates and allows temporary regressions for exploration.
@@ -124,6 +125,7 @@ class MetaHarnessEngine(EvolutionEngine):
         cycle_num = history.latest_cycle + 1
         score_curve = history.get_score_curve()
         current_best = max(score_curve) if score_curve else 0.0
+        evaluation_tasks = self._resolve_evaluation_tasks(trial, tasks)
 
         candidates_dir = workspace.root / "evolution" / "candidates"
         candidates_dir.mkdir(parents=True, exist_ok=True)
@@ -161,7 +163,7 @@ class MetaHarnessEngine(EvolutionEngine):
             valid, validation_err = self._validate_candidate(workspace)
 
             # Regex audit for task-specific string leakage (paper §4.3)
-            task_ids = [t.id for t in tasks] if tasks else []
+            task_ids = [task.id for task in evaluation_tasks]
             leakage = self._audit_leakage(workspace, task_ids)
             if leakage:
                 logger.warning(
@@ -201,12 +203,12 @@ class MetaHarnessEngine(EvolutionEngine):
         if parallel:
             candidates = self._evaluate_parallel(
                 proposed, workspace, candidates_dir, cycle_num,
-                eval_factory, tasks,
+                eval_factory, evaluation_tasks,
             )
         else:
             candidates = self._evaluate_serial(
                 proposed, workspace, candidates_dir, cycle_num,
-                trial, tasks,
+                trial, evaluation_tasks,
             )
 
         # -- Selection --
@@ -228,6 +230,7 @@ class MetaHarnessEngine(EvolutionEngine):
                     "all_invalid": True,
                     "validation_errors": [c["validation_err"] for c in candidates],
                     "proposer_model": self.model,
+                    "evaluation_split": self.eval_split,
                 },
             )
 
@@ -279,6 +282,7 @@ class MetaHarnessEngine(EvolutionEngine):
                     "selected": best["label"],
                     "current_best": current_best,
                     "proposer_model": self.model,
+                    "evaluation_split": self.eval_split,
                 },
             )
 
@@ -308,6 +312,7 @@ class MetaHarnessEngine(EvolutionEngine):
                 "best_cost": best["cost"],
                 "harness_enabled": self.harness_enabled,
                 "proposer_model": self.model,
+                "evaluation_split": self.eval_split,
                 "total_archived": existing + len(candidates),
             },
         )
@@ -332,6 +337,7 @@ class MetaHarnessEngine(EvolutionEngine):
             # Apply this candidate's diff
             if p["diff"]:
                 self._apply_diff(workspace.root, p["diff"])
+            trial.agent.reload_from_fs()
 
             if p["valid"]:
                 eval_result = self._evaluate_candidate(trial, tasks=tasks)
@@ -371,6 +377,7 @@ class MetaHarnessEngine(EvolutionEngine):
 
             # Reset before next candidate
             self._git_reset(workspace.root)
+            trial.agent.reload_from_fs()
 
         return candidates
 
@@ -550,6 +557,7 @@ class MetaHarnessEngine(EvolutionEngine):
             "selected": False,
             "pareto_optimal": False,
             "proposer_model": self.model,
+            "evaluation_split": self.eval_split,
             "proposer_exit_code": proposer_result.get("exit_code"),
         }
         (cand_dir / "scores.json").write_text(
@@ -665,6 +673,16 @@ class MetaHarnessEngine(EvolutionEngine):
     # Candidate evaluation
     # ------------------------------------------------------------------
 
+    def _resolve_evaluation_tasks(
+        self, trial: TrialRunner | None, tasks: list | None = None,
+    ) -> list:
+        if tasks is not None:
+            return tasks
+        if trial is None:
+            return []
+        limit = self.eval_sample_size if self.eval_sample_size > 0 else 10000
+        return trial.get_tasks(split=self.eval_split, limit=limit)
+
     def _evaluate_candidate(
         self, trial: TrialRunner | None, tasks: list | None = None,
     ) -> dict[str, Any]:
@@ -678,11 +696,7 @@ class MetaHarnessEngine(EvolutionEngine):
             return {"score": 0.0, "cost": 0}
 
         try:
-            if tasks is None:
-                if self.eval_sample_size > 0:
-                    tasks = trial.get_tasks(limit=self.eval_sample_size)
-                else:
-                    tasks = trial.get_tasks(limit=10000)
+            tasks = self._resolve_evaluation_tasks(trial, tasks)
 
             if not tasks:
                 return {"score": 0.0, "cost": 0}
