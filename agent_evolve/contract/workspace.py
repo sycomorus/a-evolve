@@ -12,6 +12,31 @@ import yaml
 from ..types import SkillMeta
 
 
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    """Parse a JSONL file, returning a list of dicts.
+
+    Raises ValueError with file path and line number on malformed entries.
+    """
+    entries: list[dict[str, Any]] = []
+    with open(path) as f:
+        for line_number, line in enumerate(f, start=1):
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"Invalid JSONL entry at {path}:{line_number}: {exc.msg}"
+                ) from exc
+            if not isinstance(entry, dict):
+                raise ValueError(
+                    f"Invalid JSONL entry at {path}:{line_number}: "
+                    f"expected object, got {type(entry).__name__}"
+                )
+            entries.append(entry)
+    return entries
+
+
 class AgentWorkspace:
     """Provides typed read/write access to an agent workspace following the FS contract.
 
@@ -139,24 +164,16 @@ class AgentWorkspace:
         path = self.memory_dir / f"{category}.jsonl"
         if not path.exists():
             return []
-        entries: list[dict[str, Any]] = []
-        with open(path) as f:
-            for line in f:
-                if line.strip():
-                    entries.append(json.loads(line))
-        return entries[-limit:]
+        return read_jsonl(path)[-limit:]
 
     def read_all_memories(self, limit: int = 100) -> list[dict[str, Any]]:
         all_memories: list[dict[str, Any]] = []
         if not self.memory_dir.exists():
             return []
         for jsonl in sorted(self.memory_dir.glob("*.jsonl")):
-            with open(jsonl) as f:
-                for line in f:
-                    if line.strip():
-                        entry = json.loads(line)
-                        entry.setdefault("_category", jsonl.stem)
-                        all_memories.append(entry)
+            for entry in read_jsonl(jsonl):
+                entry.setdefault("_category", jsonl.stem)
+                all_memories.append(entry)
         return all_memories[-limit:]
 
     # ── Harness (optional scaffolding code, mutated by MetaHarness) ──

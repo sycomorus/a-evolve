@@ -24,6 +24,9 @@ from rich.progress import (
 ROOT = Path(__file__).resolve().parents[2]
 REPO_ROOT = ROOT.parent
 EVOLVER_CONFIG = REPO_ROOT / "config" / "evolver.yaml"
+REACT_CONFIG = REPO_ROOT / "config" / "react.yaml"
+PROPOSER_CONFIG_DIR = REPO_ROOT / ".claude-agent"
+DEEPSEEK_ANTHROPIC_BASE_URL = "https://api.deepseek.com/anthropic"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 if str(REPO_ROOT) not in sys.path:
@@ -155,7 +158,7 @@ def main() -> int:
         )
         total_updates = 1
     elif args.algorithm == "meta-harness":
-        engine = MetaHarnessEngine(config)
+        engine = _build_meta_harness_engine(config)
         total_updates = _total_updates(
             benchmark=benchmark,
             max_epochs=args.max_cycles,
@@ -440,6 +443,22 @@ def main() -> int:
         ),
         "meta_harness_proposer_model": (
             engine.model if args.algorithm == "meta-harness" else None
+        ),
+        "meta_harness_proposer_provider": (
+            engine.proposer_provider if args.algorithm == "meta-harness" else None
+        ),
+        "meta_harness_proposer_config_dir": (
+            str(engine.proposer_config_dir)
+            if args.algorithm == "meta-harness"
+            else None
+        ),
+        "meta_harness_settings_source": (
+            "user" if args.algorithm == "meta-harness" else None
+        ),
+        "meta_harness_temperature_policy": (
+            config.extra.get("proposer_temperature_policy")
+            if args.algorithm == "meta-harness"
+            else None
         ),
         "check": False,
         "cycles_completed": result.cycles_completed,
@@ -851,6 +870,78 @@ def _build_gepa_engine(
         parallel_workers=parallel_workers,
         validation_limit=validation_limit,
     )
+
+
+def _build_meta_harness_engine(
+    config: EvolveConfig,
+    *,
+    react_config_path: str | Path | None = None,
+    proposer_config_dir: str | Path = PROPOSER_CONFIG_DIR,
+) -> MetaHarnessEngine:
+    config_path = Path(
+        react_config_path
+        or os.environ.get("OR_REACT_CONFIG", REACT_CONFIG)
+    ).expanduser().absolute()
+    model, _ = resolve_meta_harness_proposer(config_path)
+    isolated_config_dir = ensure_proposer_config_dir(proposer_config_dir)
+    config.extra.update({
+        "proposer_model": model,
+        "proposer_provider": "deepseek",
+        "proposer_config_dir": str(isolated_config_dir),
+        "proposer_settings_source": "user",
+        "proposer_temperature_policy": "gateway_default",
+    })
+
+    def provider_env() -> dict[str, str]:
+        current_model, api_key = resolve_meta_harness_proposer(config_path)
+        return {
+            "ANTHROPIC_BASE_URL": DEEPSEEK_ANTHROPIC_BASE_URL,
+            "ANTHROPIC_AUTH_TOKEN": api_key,
+            "ANTHROPIC_MODEL": current_model,
+            "ANTHROPIC_SMALL_FAST_MODEL": current_model,
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+        }
+
+    return MetaHarnessEngine(config, proposer_env_factory=provider_env)
+
+
+def resolve_meta_harness_proposer(config_path: str | Path) -> tuple[str, str]:
+    file_path = Path(config_path).expanduser().absolute()
+    config = load_yaml(file_path)
+    model = config.get("model")
+    api_key = config.get("api_key")
+    if not isinstance(model, str) or not model.strip():
+        raise ValueError(f"{file_path} must define model for the Meta-Harness proposer.")
+    if not isinstance(api_key, str) or not api_key.strip():
+        raise ValueError(f"{file_path} must define api_key for the Meta-Harness proposer.")
+    return model.strip(), api_key.strip()
+
+
+def ensure_proposer_config_dir(config_dir: str | Path) -> Path:
+    path = Path(config_dir).expanduser().absolute()
+    if path.is_symlink():
+        raise ValueError(f"proposer config directory must not be a symlink: {path}")
+    if path.exists() and not path.is_dir():
+        raise ValueError(f"proposer config path must be a directory: {path}")
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.chmod(0o700)
+
+    settings_path = path / "settings.json"
+    if settings_path.is_symlink():
+        raise ValueError(f"proposer settings must not be a symlink: {settings_path}")
+    if settings_path.exists() and not settings_path.is_file():
+        raise ValueError(f"proposer settings path must be a file: {settings_path}")
+    if not settings_path.exists():
+        settings_path.write_text(
+            json.dumps(
+                {"env": {"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"}},
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    settings_path.chmod(0o600)
+    return path
 
 
 def resolve_evolver_llm() -> tuple[str, str, str | None, float | None]:

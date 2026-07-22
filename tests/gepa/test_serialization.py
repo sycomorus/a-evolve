@@ -137,6 +137,32 @@ def test_restore_memory_clears_and_rewrites(tmp_path):
     assert not any(m.get("old") for m in all_mem)
 
 
+def test_read_all_memories_reports_invalid_jsonl_path_and_line(tmp_path):
+    ws = AgentWorkspace(tmp_path)
+    ws.memory_dir.mkdir(parents=True)
+    path = ws.memory_dir / "episodic.jsonl"
+    path.write_text('{"valid": true}\nnot-json\n')
+
+    with pytest.raises(ValueError) as exc_info:
+        ws.read_all_memories()
+
+    assert f"{path}:2" in str(exc_info.value)
+    assert "Expecting value" in str(exc_info.value)
+
+
+def test_read_memories_rejects_non_object_jsonl_entry(tmp_path):
+    ws = AgentWorkspace(tmp_path)
+    ws.memory_dir.mkdir(parents=True)
+    path = ws.memory_dir / "episodic.jsonl"
+    path.write_text("[]\n")
+
+    with pytest.raises(ValueError) as exc_info:
+        ws.read_memories()
+
+    assert f"{path}:1" in str(exc_info.value)
+    assert "expected object, got list" in str(exc_info.value)
+
+
 @pytest.mark.parametrize(
     "blob",
     [

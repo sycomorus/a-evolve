@@ -58,6 +58,7 @@ inspect_evals/
 !/tests/test_adaptive_skill_prompt.py
 !/tests/test_runs.py
 !/tests/test_evaluation.py
+!/tests/test_meta_harness_safety.py
 !/tests/gepa/
 
 # Root-level artifacts

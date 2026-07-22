@@ -409,7 +409,7 @@ def test_meta_harness_evaluates_on_configured_split() -> None:
     assert trial.requests == []
 
 
-def test_meta_harness_serial_evaluation_reloads_candidate_and_reset_state(
+def test_meta_harness_serial_evaluation_isolates_candidate_workspace(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -418,25 +418,20 @@ def test_meta_harness_serial_evaluation_reloads_candidate_and_reset_state(
     workspace_path = _workspace(tmp_path / "workspace")
     workspace = AgentWorkspace(workspace_path)
     prompt_path = workspace_path / "prompts" / "system.md"
+    prompt_path.write_text("Base prompt", encoding="utf-8")
     task = Task(id="val_1", input="", metadata={})
+    evaluated_prompts: list[str] = []
 
     class FakeAgent:
-        def __init__(self) -> None:
-            self.prompt = ""
-            self.reloads: list[str] = []
-            self.reload_from_fs()
-
-        def reload_from_fs(self) -> None:
-            self.prompt = prompt_path.read_text(encoding="utf-8")
-            self.reloads.append(self.prompt)
+        def __init__(self, root: Path) -> None:
+            self.prompt = (root / "prompts" / "system.md").read_text(encoding="utf-8")
 
     class FakeTrial:
-        def __init__(self) -> None:
-            self.agent = FakeAgent()
-            self.evaluated_prompts: list[str] = []
+        def __init__(self, root: Path) -> None:
+            self.agent = FakeAgent(root)
 
         def run_tasks(self, tasks: list[Task]) -> list[Observation]:
-            self.evaluated_prompts.append(self.agent.prompt)
+            evaluated_prompts.append(self.agent.prompt)
             return [
                 Observation(
                     task=current,
@@ -451,23 +446,22 @@ def test_meta_harness_serial_evaluation_reloads_candidate_and_reset_state(
             ]
 
     engine = MetaHarnessEngine(EvolveConfig(extra={"eval_split": "val"}))
-    trial = FakeTrial()
 
-    def apply_candidate(_root: Path, _diff: str) -> None:
-        prompt_path.write_text("Candidate prompt", encoding="utf-8")
+    def apply_candidate(root: Path, _diff: str) -> None:
+        (root / "prompts" / "system.md").write_text(
+            "Candidate prompt", encoding="utf-8"
+        )
 
-    def reset_workspace(_root: Path) -> None:
-        prompt_path.write_text("Base prompt", encoding="utf-8")
-
+    monkeypatch.setattr(engine, "_assert_workspace_clean", lambda _root: None)
     monkeypatch.setattr(engine, "_apply_diff", apply_candidate)
-    monkeypatch.setattr(engine, "_git_reset", reset_workspace)
+    monkeypatch.setattr(engine, "_validate_candidate", lambda _workspace: (True, ""))
     monkeypatch.setattr(
         engine,
         "_archive_candidate_from_snapshot",
         lambda *args, **kwargs: None,
     )
 
-    candidates = engine._evaluate_serial(
+    candidates = engine._evaluate_candidates(
         [
             {
                 "index": 0,
@@ -481,14 +475,14 @@ def test_meta_harness_serial_evaluation_reloads_candidate_and_reset_state(
         ],
         workspace,
         workspace_path / "evolution" / "candidates",
-        1,
-        trial,
+        lambda root: FakeTrial(root),
         [task],
+        parallel=False,
     )
 
     assert candidates[0]["score"] == 1.0
-    assert trial.evaluated_prompts == ["Candidate prompt"]
-    assert trial.agent.reloads == ["Base prompt", "Candidate prompt", "Base prompt"]
+    assert evaluated_prompts == ["Candidate prompt"]
+    assert prompt_path.read_text(encoding="utf-8") == "Base prompt"
 
 
 def test_meta_harness_archive_records_evaluation_split(tmp_path: Path) -> None:
@@ -527,6 +521,258 @@ def test_meta_harness_uses_existing_batch_update_schedule() -> None:
         batch_size=10,
         train_limit=50,
     ) == 5
+
+
+def test_meta_harness_deepseek_proposer_uses_isolated_runtime_config(
+    tmp_path: Path,
+) -> None:
+    from examples.or_interact_examples import evolve_or_interact
+
+    react_config = tmp_path / "react.yaml"
+    react_config.write_text(
+        "\n".join(
+            [
+                "api_key: test-proposer-secret",
+                "base_url: https://openai-compatible.invalid/v1",
+                "model: deepseek-v4-flash",
+                "temperature: 0.25",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    config = EvolveConfig(extra={"eval_split": "val"})
+    config_dir = tmp_path / ".claude-agent"
+
+    engine = evolve_or_interact._build_meta_harness_engine(
+        config,
+        react_config_path=react_config,
+        proposer_config_dir=config_dir,
+    )
+    proposer_env, sensitive_values = engine._isolated_proposer_env()
+
+    assert engine.model == "deepseek-v4-flash"
+    assert proposer_env is not None
+    assert proposer_env["ANTHROPIC_BASE_URL"] == "https://api.deepseek.com/anthropic"
+    assert proposer_env["ANTHROPIC_AUTH_TOKEN"] == "test-proposer-secret"
+    assert proposer_env["ANTHROPIC_MODEL"] == "deepseek-v4-flash"
+    assert proposer_env["ANTHROPIC_SMALL_FAST_MODEL"] == "deepseek-v4-flash"
+    assert "test-proposer-secret" in sensitive_values
+    assert config.extra["proposer_provider"] == "deepseek"
+    assert config.extra["proposer_temperature_policy"] == "gateway_default"
+    assert "test-proposer-secret" not in json.dumps(config.extra)
+    assert config_dir.stat().st_mode & 0o777 == 0o700
+    assert (config_dir / "settings.json").stat().st_mode & 0o777 == 0o600
+
+    workspace = AgentWorkspace(_workspace(tmp_path / "workspace"))
+    candidate_dir = workspace.root / "evolution" / "candidates" / "candidate"
+    engine._archive_candidate_from_snapshot(
+        workspace,
+        candidate_dir,
+        {},
+        score=1.0,
+        cost=0,
+        cycle=1,
+        cand_index=0,
+        proposer_result={"exit_code": 0},
+    )
+    assert "test-proposer-secret" not in (candidate_dir / "scores.json").read_text()
+
+
+def test_proposer_config_dir_preserves_settings_and_rejects_unsafe_paths(
+    tmp_path: Path,
+) -> None:
+    from examples.or_interact_examples.evolve_or_interact import (
+        ensure_proposer_config_dir,
+    )
+
+    config_dir = tmp_path / "existing"
+    config_dir.mkdir()
+    settings_path = config_dir / "settings.json"
+    settings_path.write_text('{"custom": true}\n', encoding="utf-8")
+
+    assert ensure_proposer_config_dir(config_dir) == config_dir.absolute()
+    assert settings_path.read_text(encoding="utf-8") == '{"custom": true}\n'
+    assert config_dir.stat().st_mode & 0o777 == 0o700
+    assert settings_path.stat().st_mode & 0o777 == 0o600
+
+    file_path = tmp_path / "not-a-directory"
+    file_path.write_text("data", encoding="utf-8")
+    with pytest.raises(ValueError, match="must be a directory"):
+        ensure_proposer_config_dir(file_path)
+
+    target_dir = tmp_path / "target"
+    target_dir.mkdir()
+    symlink_path = tmp_path / "linked-config"
+    symlink_path.symlink_to(target_dir, target_is_directory=True)
+    with pytest.raises(ValueError, match="must not be a symlink"):
+        ensure_proposer_config_dir(symlink_path)
+
+
+def test_meta_harness_isolated_command_filters_parent_env_and_redacts_secrets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import agent_evolve.algorithms.meta_harness.engine as engine_module
+    from examples.or_interact_examples import evolve_or_interact
+
+    secret = "test-proposer-secret"
+    react_config = tmp_path / "react.yaml"
+    react_config.write_text(
+        f"api_key: {secret}\nmodel: deepseek-v4-flash\n",
+        encoding="utf-8",
+    )
+    engine = evolve_or_interact._build_meta_harness_engine(
+        EvolveConfig(),
+        react_config_path=react_config,
+        proposer_config_dir=tmp_path / ".claude-agent",
+    )
+    for key, value in {
+        "CLAUDE_CONFIG_DIR": "/manual/claude",
+        "ANTHROPIC_API_KEY": "manual-anthropic-key",
+        "OPENAI_API_KEY": "manual-openai-key",
+        "AWS_ACCESS_KEY_ID": "manual-aws-key",
+        "CLAUDE_CODE_USE_BEDROCK": "1",
+    }.items():
+        monkeypatch.setenv(key, value)
+
+    captured: dict[str, Any] = {}
+
+    def fake_run(command: list[str], **kwargs: Any) -> Any:
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return types.SimpleNamespace(
+            stdout=json.dumps({"result": f"result contains {secret}"}),
+            stderr=f"stderr contains {secret}",
+            returncode=0,
+        )
+
+    monkeypatch.setattr(engine_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(engine, "_git_diff", lambda _root: "")
+    caplog.set_level("INFO")
+
+    result = engine._run_claude_code("improve", tmp_path)
+
+    command = captured["command"]
+    child_env = captured["kwargs"]["env"]
+    assert command[command.index("--model") + 1] == "deepseek-v4-flash"
+    assert "--no-session-persistence" in command
+    assert command[command.index("--setting-sources") + 1] == "user"
+    assert secret not in command
+    assert child_env["CLAUDE_CONFIG_DIR"] == str(tmp_path / ".claude-agent")
+    assert child_env["ANTHROPIC_AUTH_TOKEN"] == secret
+    assert child_env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] == "1"
+    assert "ANTHROPIC_API_KEY" not in child_env
+    assert "OPENAI_API_KEY" not in child_env
+    assert "AWS_ACCESS_KEY_ID" not in child_env
+    assert "CLAUDE_CODE_USE_BEDROCK" not in child_env
+    assert secret not in result["output"]
+    assert secret not in result["stderr"]
+    assert secret not in caplog.text
+
+
+def test_meta_harness_isolated_proposer_rereads_key_and_fails_on_cli_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import agent_evolve.algorithms.meta_harness.engine as engine_module
+    from examples.or_interact_examples import evolve_or_interact
+
+    react_config = tmp_path / "react.yaml"
+    react_config.write_text(
+        "api_key: first-key\nmodel: deepseek-v4-flash\n",
+        encoding="utf-8",
+    )
+    engine = evolve_or_interact._build_meta_harness_engine(
+        EvolveConfig(),
+        react_config_path=react_config,
+        proposer_config_dir=tmp_path / ".claude-agent",
+    )
+    react_config.write_text(
+        "api_key: rotated-key\nmodel: deepseek-v4-flash\n",
+        encoding="utf-8",
+    )
+    captured_env: dict[str, str] = {}
+
+    def fake_run(_command: list[str], **kwargs: Any) -> Any:
+        captured_env.update(kwargs["env"])
+        return types.SimpleNamespace(stdout="", stderr="failed", returncode=7)
+
+    monkeypatch.setattr(engine_module.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="exit code 7"):
+        engine._run_claude_code("improve", tmp_path)
+    assert captured_env["ANTHROPIC_AUTH_TOKEN"] == "rotated-key"
+
+
+def test_meta_harness_rejects_secrets_and_symlinks_in_isolated_candidates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from examples.or_interact_examples import evolve_or_interact
+
+    secret = "test-proposer-secret"
+    react_config = tmp_path / "react.yaml"
+    react_config.write_text(
+        f"api_key: {secret}\nmodel: deepseek-v4-flash\n",
+        encoding="utf-8",
+    )
+    engine = evolve_or_interact._build_meta_harness_engine(
+        EvolveConfig(),
+        react_config_path=react_config,
+        proposer_config_dir=tmp_path / ".claude-agent",
+    )
+    workspace = _workspace(tmp_path / "workspace")
+    prompt_path = workspace / "prompts" / "system.md"
+    prompt_path.write_text(f"leaked {secret}", encoding="utf-8")
+    monkeypatch.setattr(engine, "_git_diff", lambda _root: "")
+
+    with pytest.raises(RuntimeError, match="sensitive provider data"):
+        engine._audit_isolated_candidate(workspace, (secret,))
+
+    prompt_path.write_text("safe", encoding="utf-8")
+    symlink = workspace / "tools" / "linked.py"
+    symlink.symlink_to(tmp_path / "outside.py")
+    with pytest.raises(RuntimeError, match="created a symlink"):
+        engine._audit_isolated_candidate(workspace, (secret,))
+
+
+def test_meta_harness_default_proposer_invocation_remains_unchanged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import agent_evolve.algorithms.meta_harness.engine as engine_module
+    from agent_evolve.algorithms.meta_harness import MetaHarnessEngine
+
+    engine = MetaHarnessEngine(EvolveConfig())
+    captured: dict[str, Any] = {}
+
+    def fake_run(command: list[str], **kwargs: Any) -> Any:
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return types.SimpleNamespace(stdout="", stderr="failed", returncode=7)
+
+    monkeypatch.setattr(engine_module.subprocess, "run", fake_run)
+
+    result = engine._run_claude_code("improve", tmp_path)
+
+    assert result["exit_code"] == 7
+    assert "env" not in captured["kwargs"]
+    assert "--setting-sources" not in captured["command"]
+    assert "--no-session-persistence" in captured["command"]
+
+    monkeypatch.setattr(
+        engine_module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: types.SimpleNamespace(
+            stdout=json.dumps({"result": {"status": "unchanged"}}),
+            stderr="",
+            returncode=0,
+        ),
+    )
+    structured_result = engine._run_claude_code("improve", tmp_path)
+    assert structured_result["output"] == {"status": "unchanged"}
 
 
 def test_task_timeout_is_safe_in_worker_thread() -> None:
