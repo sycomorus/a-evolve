@@ -639,16 +639,24 @@ def test_meta_harness_isolated_command_filters_parent_env_and_redacts_secrets(
 
     captured: dict[str, Any] = {}
 
-    def fake_run(command: list[str], **kwargs: Any) -> Any:
+    class FakePopen:
+        returncode = 0
+
+        def __init__(self, command: list[str], **kwargs: Any) -> None:
+            captured["command"] = command
+            captured["kwargs"] = kwargs
+
+        def communicate(self, timeout: int | None = None) -> tuple[str, str]:
+            return json.dumps({"result": f"result contains {secret}"}), (
+                f"stderr contains {secret}"
+            )
+
+    def fake_popen(command: list[str], **kwargs: Any) -> Any:
         captured["command"] = command
         captured["kwargs"] = kwargs
-        return types.SimpleNamespace(
-            stdout=json.dumps({"result": f"result contains {secret}"}),
-            stderr=f"stderr contains {secret}",
-            returncode=0,
-        )
+        return FakePopen(command, **kwargs)
 
-    monkeypatch.setattr(engine_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(engine_module.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(engine, "_git_diff", lambda _root: "")
     caplog.set_level("INFO")
 
@@ -658,11 +666,14 @@ def test_meta_harness_isolated_command_filters_parent_env_and_redacts_secrets(
     child_env = captured["kwargs"]["env"]
     assert command[command.index("--model") + 1] == "deepseek-v4-flash"
     assert "--no-session-persistence" in command
+    assert "--tools" not in command
     assert command[command.index("--setting-sources") + 1] == "user"
     assert secret not in command
     assert child_env["CLAUDE_CONFIG_DIR"] == str(tmp_path / ".claude-agent")
     assert child_env["ANTHROPIC_AUTH_TOKEN"] == secret
     assert child_env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] == "1"
+    assert child_env["BASH_DEFAULT_TIMEOUT_MS"] == "60000"
+    assert child_env["BASH_MAX_TIMEOUT_MS"] == "60000"
     assert "ANTHROPIC_API_KEY" not in child_env
     assert "OPENAI_API_KEY" not in child_env
     assert "AWS_ACCESS_KEY_ID" not in child_env
@@ -695,11 +706,16 @@ def test_meta_harness_isolated_proposer_rereads_key_and_fails_on_cli_error(
     )
     captured_env: dict[str, str] = {}
 
-    def fake_run(_command: list[str], **kwargs: Any) -> Any:
-        captured_env.update(kwargs["env"])
-        return types.SimpleNamespace(stdout="", stderr="failed", returncode=7)
+    class FakePopen:
+        returncode = 7
 
-    monkeypatch.setattr(engine_module.subprocess, "run", fake_run)
+        def __init__(self, _command: list[str], **kwargs: Any) -> None:
+            captured_env.update(kwargs["env"])
+
+        def communicate(self, timeout: int | None = None) -> tuple[str, str]:
+            return "", "failed"
+
+    monkeypatch.setattr(engine_module.subprocess, "Popen", FakePopen)
 
     with pytest.raises(RuntimeError, match="exit code 7"):
         engine._run_claude_code("improve", tmp_path)
@@ -745,32 +761,47 @@ def test_meta_harness_default_proposer_invocation_remains_unchanged(
     import agent_evolve.algorithms.meta_harness.engine as engine_module
     from agent_evolve.algorithms.meta_harness import MetaHarnessEngine
 
-    engine = MetaHarnessEngine(EvolveConfig())
+    engine = MetaHarnessEngine(
+        EvolveConfig(extra={"proposer_tool_timeout_sec": 15})
+    )
     captured: dict[str, Any] = {}
 
-    def fake_run(command: list[str], **kwargs: Any) -> Any:
+    class FakePopen:
+        returncode = 7
+
+        def __init__(self, command: list[str], **kwargs: Any) -> None:
+            captured["command"] = command
+            captured["kwargs"] = kwargs
+
+        def communicate(self, timeout: int | None = None) -> tuple[str, str]:
+            return "", "failed"
+
+    def fake_popen(command: list[str], **kwargs: Any) -> Any:
         captured["command"] = command
         captured["kwargs"] = kwargs
-        return types.SimpleNamespace(stdout="", stderr="failed", returncode=7)
+        return FakePopen(command, **kwargs)
 
-    monkeypatch.setattr(engine_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(engine_module.subprocess, "Popen", fake_popen)
 
     result = engine._run_claude_code("improve", tmp_path)
 
     assert result["exit_code"] == 7
-    assert "env" not in captured["kwargs"]
+    assert captured["kwargs"]["env"]["BASH_DEFAULT_TIMEOUT_MS"] == "15000"
+    assert captured["kwargs"]["env"]["BASH_MAX_TIMEOUT_MS"] == "15000"
     assert "--setting-sources" not in captured["command"]
+    assert "--tools" not in captured["command"]
     assert "--no-session-persistence" in captured["command"]
 
-    monkeypatch.setattr(
-        engine_module.subprocess,
-        "run",
-        lambda *_args, **_kwargs: types.SimpleNamespace(
-            stdout=json.dumps({"result": {"status": "unchanged"}}),
-            stderr="",
-            returncode=0,
-        ),
-    )
+    class SuccessfulPopen:
+        returncode = 0
+
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        def communicate(self, timeout: int | None = None) -> tuple[str, str]:
+            return json.dumps({"result": {"status": "unchanged"}}), ""
+
+    monkeypatch.setattr(engine_module.subprocess, "Popen", SuccessfulPopen)
     structured_result = engine._run_claude_code("improve", tmp_path)
     assert structured_result["output"] == {"status": "unchanged"}
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import signal
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -61,6 +62,47 @@ def test_apply_diff_uses_clean_git_apply_only(monkeypatch: pytest.MonkeyPatch) -
     assert calls[:2] == [("apply", "--check", "-"), ("apply", "-")]
     assert all("--allow-empty" not in call for call in calls)
     assert all("--3way" not in call for call in calls)
+
+
+def test_proposer_timeout_terminates_entire_process_group(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _engine()
+    engine.timeout_sec = 1
+    calls: list[tuple[int, signal.Signals]] = []
+
+    class HangingPopen:
+        pid = 4321
+        returncode = -signal.SIGTERM
+
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def communicate(self, timeout: int | None = None) -> tuple[str, str]:
+            if timeout == engine.timeout_sec:
+                raise subprocess.TimeoutExpired(
+                    "claude",
+                    timeout,
+                    output=b"partial output",
+                    stderr=b"last tool: find /",
+                )
+            return "partial output", "last tool: find /"
+
+    monkeypatch.setattr(subprocess, "Popen", HangingPopen)
+    monkeypatch.setattr(
+        "agent_evolve.algorithms.meta_harness.engine.os.killpg",
+        lambda pid, sig: calls.append((pid, sig)),
+    )
+
+    result = engine._run_claude_code("improve", tmp_path)
+
+    assert calls == [(4321, signal.SIGTERM)]
+    assert result == {
+        "output": "partial output",
+        "stderr": "last tool: find /",
+        "exit_code": -1,
+    }
 
 
 def test_git_reset_restores_index_and_preserves_evolution(tmp_path: Path) -> None:

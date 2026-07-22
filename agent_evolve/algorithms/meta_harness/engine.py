@@ -18,6 +18,7 @@ import json
 import logging
 import math
 import os
+import signal
 import shutil
 import subprocess
 import tempfile
@@ -74,6 +75,7 @@ _CONFLICTING_PROVIDER_ENV_KEYS = (
     "CLAUDE_CODE_USE_VERTEX",
     "CLAUDE_CODE_USE_FOUNDRY",
 )
+_PROPOSER_KILL_GRACE_SEC = 5
 
 
 class MetaHarnessEngine(EvolutionEngine):
@@ -113,6 +115,11 @@ class MetaHarnessEngine(EvolutionEngine):
         self.model: str = config.extra.get("proposer_model", DEFAULT_MODEL)
         self.max_turns: int = config.extra.get("proposer_max_turns", 50)
         self.timeout_sec: int = config.extra.get("proposer_timeout_sec", 600)
+        self.tool_timeout_sec: int = int(
+            config.extra.get("proposer_tool_timeout_sec", 60)
+        )
+        if self.tool_timeout_sec <= 0:
+            raise ValueError("proposer_tool_timeout_sec must be positive")
         proposer_config_dir = config.extra.get("proposer_config_dir")
         self.proposer_config_dir = (
             Path(proposer_config_dir).expanduser().absolute()
@@ -267,6 +274,7 @@ class MetaHarnessEngine(EvolutionEngine):
             proposed,
             workspace,
             candidates_dir,
+            cycle_num,
             isolated_eval_factory,
             evaluation_tasks,
             parallel=parallel,
@@ -1033,25 +1041,57 @@ class MetaHarnessEngine(EvolutionEngine):
             self.proposer_config_dir or "default",
         )
 
-        run_kwargs: dict[str, Any] = {
-            "capture_output": True,
+        popen_kwargs: dict[str, Any] = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
             "text": True,
-            "timeout": self.timeout_sec,
             "cwd": str(workspace_root),
+            "start_new_session": True,
         }
-        if proposer_env is not None:
-            run_kwargs["env"] = proposer_env
+        process_env = dict(proposer_env or os.environ)
+        tool_timeout_ms = str(self.tool_timeout_sec * 1000)
+        process_env["BASH_DEFAULT_TIMEOUT_MS"] = tool_timeout_ms
+        process_env["BASH_MAX_TIMEOUT_MS"] = tool_timeout_ms
+        popen_kwargs["env"] = process_env
 
         try:
-            proc = subprocess.run(cmd, **run_kwargs)
-            output = proc.stdout.strip()
-            stderr = self._redact(proc.stderr.strip(), sensitive_values)
+            proc = subprocess.Popen(cmd, **popen_kwargs)
+            try:
+                stdout, raw_stderr = proc.communicate(timeout=self.timeout_sec)
+            except subprocess.TimeoutExpired as exc:
+                stdout, raw_stderr = self._terminate_process_group(proc)
+                if not stdout:
+                    stdout = self._subprocess_text(exc.stdout)
+                if not raw_stderr:
+                    raw_stderr = self._subprocess_text(exc.stderr)
+                stderr = self._redact(raw_stderr.strip(), sensitive_values)
+                detail = stderr or "no diagnostic output"
+                logger.error(
+                    "Claude Code timed out after %ds: %s",
+                    self.timeout_sec,
+                    detail[-1000:],
+                )
+                if proposer_env is not None:
+                    raise RuntimeError(
+                        f"Claude Code proposer timed out after {self.timeout_sec}s: "
+                        f"{detail[-1000:]}"
+                    ) from None
+                return {
+                    "output": stdout.strip(),
+                    "stderr": stderr or "TIMEOUT",
+                    "exit_code": -1,
+                }
+
+            output = stdout.strip()
+            stderr = self._redact(raw_stderr.strip(), sensitive_values)
 
             if proc.returncode != 0:
                 logger.warning("Claude Code exited with code %d", proc.returncode)
                 if proposer_env is not None:
+                    detail = stderr or self._redact(output, sensitive_values)
                     raise RuntimeError(
-                        f"Claude Code proposer failed with exit code {proc.returncode}"
+                        f"Claude Code proposer failed with exit code {proc.returncode}: "
+                        f"{detail[-1000:] or 'no diagnostic output'}"
                     )
             elif proposer_env is not None:
                 self._audit_isolated_candidate(workspace_root, sensitive_values)
@@ -1072,15 +1112,6 @@ class MetaHarnessEngine(EvolutionEngine):
                 "exit_code": proc.returncode,
             }
 
-        except subprocess.TimeoutExpired:
-            logger.error("Claude Code timed out after %ds", self.timeout_sec)
-            if proposer_env is not None:
-                raise RuntimeError("Claude Code proposer timed out") from None
-            return {
-                "output": "",
-                "stderr": "TIMEOUT",
-                "exit_code": -1,
-            }
         except FileNotFoundError:
             logger.error("Claude Code CLI not found")
             if proposer_env is not None:
@@ -1090,6 +1121,33 @@ class MetaHarnessEngine(EvolutionEngine):
                 "stderr": "claude CLI not found",
                 "exit_code": -1,
             }
+
+    @staticmethod
+    def _subprocess_text(value: str | bytes | None) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, bytes):
+            return value.decode(errors="replace")
+        return value
+
+    @staticmethod
+    def _terminate_process_group(
+        proc: subprocess.Popen[str],
+    ) -> tuple[str, str]:
+        """Terminate Claude Code and any tool processes it spawned."""
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+        try:
+            return proc.communicate(timeout=_PROPOSER_KILL_GRACE_SEC)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            return proc.communicate()
 
     # ------------------------------------------------------------------
     # Git helpers for multi-candidate workflow
