@@ -29,6 +29,13 @@ Most steps are expected to be acceptable. Do not review every step. In step_revi
 include only the earliest causally wrong step, or at most 1-2 steps with the largest
 impact on the final failure. Omit correct or minor steps. Keep each field concise.
 
+Check whether the trajectory performed an evidence-based skeptical review before finalize
+when that review could have caught a material error in formulation or constraint coverage,
+objective direction, submitted quantity, units, indexing, reporting requirements, or solver
+output consistency. If a missing or inadequate review materially affected the result, record
+it in missed_steps, normally with phase finalization. Do not demand boilerplate self-review
+when no material uncertainty or inconsistency is visible.
+
 Return JSON only with:
 - task_id
 - overall_diagnosis
@@ -44,6 +51,11 @@ Grounded clarifications are also privileged. Do not repeat or paraphrase a groun
 the original grounded question, its file name, or task-specific values from it. Describe only
 the abstract information need, the visible evidence that should trigger a question, a reusable
 question template, and how the answer should affect the formulation.
+
+Evaluate whether the agent should have asked proactively from evidence visible before a
+material modeling decision, including trajectories with no ask_user call. Use missed_ask
+when additional user knowledge could have reduced a concrete modeling risk. Treat rephrased
+or probing follow-ups after no_match or no_grounded_records as unnecessary interaction.
 
 Also return interaction_review: {requirement, observed_behavior, decision,
 evidence_before_decision, recommended_timing, information_need, question_template,

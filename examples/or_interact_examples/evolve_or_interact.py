@@ -64,11 +64,17 @@ HEURISTIC_EVOLUTION_INSTRUCTION = (
     "already provided by the harness; do not create, modify, or register "
     "`tools/run_heuristic.py`."
 )
+STEP_OPSD_EVOLUTION_INSTRUCTION = (
+    "This run enables Step-OPSD teacher review. Use the redacted teacher signals to improve "
+    "reusable prompts, skills, memory, or tools. Evolve from observed failure patterns rather than adding "
+    "a fixed boilerplate checklist to every task."
+)
 USER_INTERACTION_EVOLUTION_INSTRUCTION = (
     "This run enables interaction-aware Step-OPSD. Use the redacted interaction reviews "
-    "to improve reusable prompt, skill, or memory policy that proactively asks when "
-    "plausible missing user knowledge could reduce modeling risk. "
-    "Apply useful answers to the formulation. Do not reconstruct grounded answers, memorize "
+    "to improve reusable prompts, skills, memory, or tools that help future agents ask "
+    "proactively when visible evidence shows plausible missing user knowledge could reduce "
+    "a concrete modeling risk, apply useful answers to the formulation, and stop probing after "
+    "no_match or no_grounded_records. Do not reconstruct grounded answers, memorize "
     "task-specific questions, request oracle values, create an ask_user tool, or impose a "
     "fixed per-task question limit."
 )
@@ -112,6 +118,7 @@ def main() -> int:
             "step_opsd_review_failures_only": not interaction_training,
             "evolution_instruction": _evolution_instruction(
                 enable_heuristic_tool=args.enable_heuristic_tool,
+                step_opsd=args.step_opsd,
                 interaction_training=interaction_training,
             ),
             **(
@@ -659,11 +666,14 @@ def _write_or_interact_settings(
 def _evolution_instruction(
     *,
     enable_heuristic_tool: bool,
+    step_opsd: bool,
     interaction_training: bool,
 ) -> str | None:
     sections = []
     if enable_heuristic_tool:
         sections.append(HEURISTIC_EVOLUTION_INSTRUCTION)
+    if step_opsd:
+        sections.append(STEP_OPSD_EVOLUTION_INSTRUCTION)
     if interaction_training:
         sections.append(USER_INTERACTION_EVOLUTION_INSTRUCTION)
     return "\n\n".join(sections) or None

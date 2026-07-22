@@ -15,6 +15,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from baseline.react.agent import AgentResult
+from baseline.react.prompts import SYSTEM_PROMPT
 from baseline.react.trace import TraceWriter
 from agent_evolve.config import EvolveConfig
 from agent_evolve.contract.workspace import AgentWorkspace
@@ -34,6 +35,29 @@ from examples.or_interact_examples.harness_tree import (
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BENCHMARK_DIR = REPO_ROOT / "OR-Interact-Bench"
+
+
+def test_or_interact_seed_prompt_matches_react_baseline() -> None:
+    seed_prompt = (
+        REPO_ROOT / "a-evolve" / "seed_workspaces" / "or_interact_react" / "prompts" / "system.md"
+    ).read_text(encoding="utf-8")
+
+    assert seed_prompt.strip() == SYSTEM_PROMPT.strip()
+
+
+def test_step_opsd_teacher_prompts_review_evolved_behaviors() -> None:
+    from agent_evolve.algorithms.step_opsd.review import (
+        TEACHER_INTERACTION_PROMPT_EXTENSION,
+        TEACHER_SYSTEM_PROMPT,
+    )
+
+    assert "skeptical review before finalize" in TEACHER_SYSTEM_PROMPT
+    assert "missed_steps" in TEACHER_SYSTEM_PROMPT
+    assert "phase finalization" in TEACHER_SYSTEM_PROMPT
+    assert "Do not demand boilerplate self-review" in TEACHER_SYSTEM_PROMPT
+    assert "including trajectories with no ask_user call" in TEACHER_INTERACTION_PROMPT_EXTENSION
+    assert "no_match or no_grounded_records" in TEACHER_INTERACTION_PROMPT_EXTENSION
+    assert "poor or unnecessary interaction" in TEACHER_INTERACTION_PROMPT_EXTENSION
 
 
 def test_split_is_reproducible_and_disjoint() -> None:
@@ -914,6 +938,11 @@ def test_or_interact_user_tool_is_enabled_by_workspace_setting(
     prompt = str(captured["system_prompt"])
     assert "ask_user" in captured["tools"]
     assert "ask_user" in prompt
+    assert "oracle objective" in prompt
+    assert "Use it proactively" not in prompt
+    assert "Prefer clarification" not in prompt
+    assert "no_match" not in prompt
+    assert "no_grounded_records" not in prompt
     tool_response = captured["user_response"]
     assert isinstance(tool_response, dict)
     user_response = tool_response["user_response"]
@@ -1253,6 +1282,44 @@ def test_or_interact_cli_has_no_check_flags(monkeypatch: pytest.MonkeyPatch) -> 
     assert review_args.dataset == "IndustryOR"
     assert review_args.limit == 2
     assert review_args.output_dir == "/tmp/reviews"
+
+
+def test_step_opsd_evolution_guidance_is_conditional() -> None:
+    from examples.or_interact_examples.evolve_or_interact import _evolution_instruction
+
+    assert _evolution_instruction(
+        enable_heuristic_tool=False,
+        step_opsd=False,
+        interaction_training=False,
+    ) is None
+
+    heuristic_guidance = _evolution_instruction(
+        enable_heuristic_tool=True,
+        step_opsd=False,
+        interaction_training=False,
+    )
+    assert heuristic_guidance is not None
+    assert "run_heuristic" in heuristic_guidance
+    assert "skeptical review before finalize" not in heuristic_guidance
+
+    review_guidance = _evolution_instruction(
+        enable_heuristic_tool=False,
+        step_opsd=True,
+        interaction_training=False,
+    )
+    assert review_guidance is not None
+    assert "skeptical review before finalize" in review_guidance
+    assert "ask proactively" not in review_guidance
+
+    interaction_guidance = _evolution_instruction(
+        enable_heuristic_tool=False,
+        step_opsd=True,
+        interaction_training=True,
+    )
+    assert interaction_guidance is not None
+    assert "skeptical review before finalize" in interaction_guidance
+    assert "ask proactively" in interaction_guidance
+    assert "no_match or no_grounded_records" in interaction_guidance
 
 
 def test_or_interact_evolve_settings_writer_records_heuristic_switch(tmp_path: Path) -> None:

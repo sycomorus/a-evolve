@@ -439,18 +439,20 @@ def test_evolution_prompt_includes_run_specific_instruction_only_when_given(
         drafts=[],
         evo_number=1,
     )
-    heuristic_prompt = build_evolution_prompt(
+    guided_prompt = build_evolution_prompt(
         workspace=workspace,
         logs=[],
         drafts=[],
         evo_number=1,
-        evolution_instruction="The agent may evolve heuristic algorithms.",
+        evolution_instruction=(
+            "Use redacted teacher signals to evolve a skeptical review before finalize."
+        ),
     )
 
     assert "Run-Specific Evolution Guidance" not in default_prompt
-    assert "heuristic algorithms" not in default_prompt
-    assert "Run-Specific Evolution Guidance" in heuristic_prompt
-    assert "heuristic algorithms" in heuristic_prompt
+    assert "skeptical review before finalize" not in default_prompt
+    assert "Run-Specific Evolution Guidance" in guided_prompt
+    assert "skeptical review before finalize" in guided_prompt
 
 
 def test_trajectory_only_judge_uses_injected_evolver_llm(tmp_path: Path) -> None:
