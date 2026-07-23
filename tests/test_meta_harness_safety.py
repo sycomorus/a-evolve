@@ -102,7 +102,69 @@ def test_proposer_timeout_terminates_entire_process_group(
         "output": "partial output",
         "stderr": "last tool: find /",
         "exit_code": -1,
+        "timed_out": True,
     }
+
+
+def test_proposer_timeout_skips_cycle_and_archives_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = _workspace(tmp_path / "workspace")
+    engine = MetaHarnessEngine(EvolveConfig(extra={"num_candidates": 2}))
+    prompt = workspace.root / "prompts" / "system.md"
+    calls = 0
+
+    class FakeTrial:
+        agent = SimpleNamespace()
+        benchmark = object()
+
+    def propose(_prompt: str, _root: Path) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        prompt.write_text(f"Candidate {calls}\n")
+        if calls == 1:
+            return {"output": "done", "stderr": "", "exit_code": 0}
+        return {
+            "output": "",
+            "stderr": "TIMEOUT",
+            "exit_code": -1,
+            "timed_out": True,
+        }
+
+    monkeypatch.setattr(engine, "_run_claude_code", propose)
+    monkeypatch.setattr(
+        engine,
+        "_evaluate_candidates",
+        lambda *_args, **_kwargs: pytest.fail("timed-out cycle must not be evaluated"),
+    )
+
+    history = SimpleNamespace(latest_cycle=0, get_score_curve=lambda: [])
+    result = engine.step(workspace, [], history, FakeTrial(), tasks=[])
+
+    assert result.mutated is False
+    assert result.stop is False
+    assert result.metadata == {
+        "cycle": 1,
+        "cycle_skipped": True,
+        "failure_stage": "proposer_timeout",
+        "timed_out_candidate": "cycle_001_cand_1",
+        "proposer_timeout_sec": 900,
+        "proposed_before_timeout": 1,
+    }
+    assert prompt.read_text() == "Base prompt\n"
+
+    candidates = workspace.root / "evolution" / "candidates"
+    first_scores = json.loads(
+        (candidates / "cycle_001_cand_0" / "scores.json").read_text()
+    )
+    timeout_scores = json.loads(
+        (candidates / "cycle_001_cand_1" / "scores.json").read_text()
+    )
+    assert first_scores["valid"] is True
+    assert first_scores["failure_stage"] == "cycle_skipped"
+    assert timeout_scores["valid"] is False
+    assert timeout_scores["failure_stage"] == "proposer_timeout"
 
 
 def test_git_reset_restores_index_and_preserves_evolution(tmp_path: Path) -> None:
@@ -281,7 +343,16 @@ def test_final_apply_failure_restores_main_workspace(
         prompt.write_text("Candidate prompt\n")
         return {"output": "done", "stderr": "", "exit_code": 0}
 
-    def evaluate(proposed, *_args, **_kwargs):
+    def evaluate(
+        proposed,
+        _workspace,
+        _candidates_dir,
+        _eval_factory,
+        _tasks,
+        *,
+        parallel,
+    ):
+        assert parallel is False
         proposal = proposed[0]
         return [
             {

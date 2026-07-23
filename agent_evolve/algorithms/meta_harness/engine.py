@@ -114,7 +114,7 @@ class MetaHarnessEngine(EvolutionEngine):
         self.harness_enabled: bool = config.extra.get("harness_enabled", False)
         self.model: str = config.extra.get("proposer_model", DEFAULT_MODEL)
         self.max_turns: int = config.extra.get("proposer_max_turns", 50)
-        self.timeout_sec: int = config.extra.get("proposer_timeout_sec", 600)
+        self.timeout_sec: int = config.extra.get("proposer_timeout_sec", 900)
         self.tool_timeout_sec: int = int(
             config.extra.get("proposer_tool_timeout_sec", 60)
         )
@@ -214,6 +214,57 @@ class MetaHarnessEngine(EvolutionEngine):
                 )
 
                 result = self._run_claude_code(prompt, workspace.root)
+                if result.get("timed_out"):
+                    error = (
+                        f"Claude Code proposer timed out after {self.timeout_sec}s: "
+                        f"{result.get('stderr') or 'no diagnostic output'}"
+                    )
+                    self._mark_archived_cycle_skipped(
+                        candidates_dir,
+                        proposed,
+                        error,
+                    )
+                    self._archive_candidate_from_snapshot(
+                        workspace,
+                        candidates_dir / cand_label,
+                        {},
+                        0.0,
+                        0.0,
+                        cycle_num,
+                        i,
+                        result,
+                        valid=False,
+                        validation_err=error,
+                        diagnostics={
+                            "proposal_valid": False,
+                            "proposal_validation_error": error,
+                            "failure_stage": "proposer_timeout",
+                            "error": error,
+                            "selection_attempted": False,
+                            "final_apply_succeeded": False,
+                            "final_apply_error": "",
+                        },
+                    )
+                    logger.warning(
+                        "Skipping Meta-Harness cycle %d after %s timed out",
+                        cycle_num,
+                        cand_label,
+                    )
+                    return StepResult(
+                        mutated=False,
+                        summary=(
+                            f"MetaHarness cycle {cycle_num}: skipped after "
+                            f"{cand_label} proposer timeout"
+                        ),
+                        metadata={
+                            "cycle": cycle_num,
+                            "cycle_skipped": True,
+                            "failure_stage": "proposer_timeout",
+                            "timed_out_candidate": cand_label,
+                            "proposer_timeout_sec": self.timeout_sec,
+                            "proposed_before_timeout": len(proposed),
+                        },
+                    )
                 diff = self._git_diff(workspace.root)
                 valid, validation_err = self._validate_candidate(workspace)
 
@@ -274,7 +325,6 @@ class MetaHarnessEngine(EvolutionEngine):
             proposed,
             workspace,
             candidates_dir,
-            cycle_num,
             isolated_eval_factory,
             evaluation_tasks,
             parallel=parallel,
@@ -449,6 +499,32 @@ class MetaHarnessEngine(EvolutionEngine):
             "exit_code": proposal["proposer_result"].get("exit_code"),
             "output_chars": len(proposal["proposer_result"].get("output", "")),
         }
+
+    @staticmethod
+    def _mark_archived_cycle_skipped(
+        candidates_dir: Path,
+        proposed: list[dict[str, Any]],
+        error: str,
+    ) -> None:
+        for proposal in proposed:
+            cand_dir = candidates_dir / proposal["label"]
+            diagnostics_path = cand_dir / "diagnostics.json"
+            if diagnostics_path.exists():
+                diagnostics = json.loads(diagnostics_path.read_text())
+                diagnostics.update({
+                    "failure_stage": "cycle_skipped",
+                    "error": error,
+                })
+                diagnostics_path.write_text(json.dumps(diagnostics, indent=2))
+
+            scores_path = cand_dir / "scores.json"
+            if scores_path.exists():
+                scores = json.loads(scores_path.read_text())
+                scores.update({
+                    "failure_stage": "cycle_skipped",
+                    "validation_error": error,
+                })
+                scores_path.write_text(json.dumps(scores, indent=2))
 
     def _evaluate_isolated_candidate(
         self,
@@ -1071,15 +1147,11 @@ class MetaHarnessEngine(EvolutionEngine):
                     self.timeout_sec,
                     detail[-1000:],
                 )
-                if proposer_env is not None:
-                    raise RuntimeError(
-                        f"Claude Code proposer timed out after {self.timeout_sec}s: "
-                        f"{detail[-1000:]}"
-                    ) from None
                 return {
-                    "output": stdout.strip(),
+                    "output": self._redact(stdout.strip(), sensitive_values),
                     "stderr": stderr or "TIMEOUT",
                     "exit_code": -1,
+                    "timed_out": True,
                 }
 
             output = stdout.strip()
