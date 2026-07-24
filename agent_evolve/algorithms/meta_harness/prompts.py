@@ -47,6 +47,7 @@ def build_proposer_prompt(
     cycle: int,
     score_curve: list[float],
     *,
+    turn_budget: int,
     harness_enabled: bool = False,
     candidate_index: int | None = None,
     num_candidates: int | None = None,
@@ -66,6 +67,10 @@ def build_proposer_prompt(
     """
     skills = workspace.list_skills()
     skill_names = [s.name for s in skills]
+    turn_budget = max(1, int(turn_budget))
+    reserve_turns = max(1, turn_budget // 5)
+    finish_by_turn = max(1, turn_budget - reserve_turns)
+    diagnosis_turns = max(1, finish_by_turn // 2)
 
     # Score history
     if score_curve:
@@ -163,6 +168,20 @@ Score history: {scores_str}
 ### What You MUST NOT Do
 - Do not modify anything under evolution/ (read-only archive).
 - Do not hardcode task-specific answers or task IDs into any file.
+
+### Execution Budget
+Hard limit: {turn_budget} turns. Every tool-use round consumes this same budget.
+- Complete diagnosis and browsing by turn {diagnosis_turns}. Start with aggregate scores,
+  targeted searches, and a small representative sample of failure traces; do not read
+  the full archive sequentially.
+- Finish all edits and verification by turn {finish_by_turn}.
+- Reserve the final {reserve_turns} turns for recovery from tool failures and the final
+  2-3 sentence summary. Avoid task-list bookkeeping unless it directly helps finish.
+- If you reach turn {finish_by_turn}, stop browsing immediately. Make the smallest
+  evidence-backed safe edit, verify it once, and conclude. Do not begin another
+  investigation or broaden the scope.
+- Do not start another tool call after the workspace changes are complete. Return the
+  final summary immediately.
 
 ### How to Work
 1. **Diagnose**: Browse `evolution/candidates/` — compare high-scoring vs \

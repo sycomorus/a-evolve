@@ -29,13 +29,14 @@ REFUSAL_CODES = tuple(code for code in USER_RESPONSE_REASONS if code != "answere
 class ObjectiveEvaluation:
     task_id: str
     correct: bool
-    expected: float
+    expected: float | None
     predicted: float | None
     absolute_error: float | None
     relative_error: float | None
     relative_tolerance: float
     run_status: str | None
     error: str | None
+    skipped: bool = False
 
 
 class ORInteractBenchmark(BenchmarkAdapter):
@@ -179,14 +180,29 @@ class ORInteractBenchmark(BenchmarkAdapter):
 
     def _missing_runtime(self, task: Task) -> ObjectiveEvaluation:
         oracle = _read_oracle(Path(task.metadata["task_dir"]) / "oracle" / "objective.json")
+        objective_value = oracle.get("objective_value")
+        tolerance = float(oracle.get("relative_tolerance", 0.0))
+        if objective_value is None:
+            return ObjectiveEvaluation(
+                task_id=task.id,
+                correct=False,
+                expected=None,
+                predicted=None,
+                absolute_error=None,
+                relative_error=None,
+                relative_tolerance=tolerance,
+                run_status=None,
+                error="oracle objective_value is null",
+                skipped=True,
+            )
         return ObjectiveEvaluation(
             task_id=task.id,
             correct=False,
-            expected=float(oracle["objective_value"]),
+            expected=float(objective_value),
             predicted=None,
             absolute_error=None,
             relative_error=None,
-            relative_tolerance=float(oracle.get("relative_tolerance", 0.0)),
+            relative_tolerance=tolerance,
             run_status=None,
             error="trajectory missing runtime_dir",
         )
@@ -194,10 +210,24 @@ class ORInteractBenchmark(BenchmarkAdapter):
 
 def evaluate_task_objective(task_id: str, task_dir: Path, runtime_dir: Path) -> ObjectiveEvaluation:
     oracle = _read_oracle(task_dir / "oracle" / "objective.json")
-    expected = float(oracle["objective_value"])
     tolerance = float(oracle.get("relative_tolerance", 0.0))
-
     run_status = _read_run_status(runtime_dir / "run_summary.json")
+    objective_value = oracle.get("objective_value")
+    if objective_value is None:
+        return ObjectiveEvaluation(
+            task_id=task_id,
+            correct=False,
+            expected=None,
+            predicted=None,
+            absolute_error=None,
+            relative_error=None,
+            relative_tolerance=tolerance,
+            run_status=run_status,
+            error="oracle objective_value is null",
+            skipped=True,
+        )
+
+    expected = float(objective_value)
     predicted, error = _read_prediction(runtime_dir / ANSWER_FILENAME)
     if predicted is None:
         return ObjectiveEvaluation(
@@ -297,7 +327,7 @@ def _feedback_detail(evaluation: ObjectiveEvaluation, trajectory: Trajectory, ta
     parts = [
         f"Status: {status}",
         f"Run status: {evaluation.run_status or 'unknown'}",
-        f"Expected objective: {evaluation.expected:.10g}",
+        f"Expected objective: {_format_optional(evaluation.expected)}",
         f"Predicted objective: {_format_optional(evaluation.predicted)}",
         f"Relative error: {_format_optional(evaluation.relative_error)}",
         f"Tolerance: {evaluation.relative_tolerance:.10g}",

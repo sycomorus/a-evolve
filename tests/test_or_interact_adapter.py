@@ -683,7 +683,7 @@ def test_meta_harness_isolated_command_filters_parent_env_and_redacts_secrets(
     assert secret not in caplog.text
 
 
-def test_meta_harness_isolated_proposer_rereads_key_and_fails_on_cli_error(
+def test_meta_harness_isolated_proposer_rereads_key_and_returns_cli_error(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -717,8 +717,15 @@ def test_meta_harness_isolated_proposer_rereads_key_and_fails_on_cli_error(
 
     monkeypatch.setattr(engine_module.subprocess, "Popen", FakePopen)
 
-    with pytest.raises(RuntimeError, match="exit code 7"):
-        engine._run_claude_code("improve", tmp_path)
+    result = engine._run_claude_code("improve", tmp_path)
+
+    assert result == {
+        "output": "",
+        "stderr": "failed",
+        "exit_code": 7,
+        "failure_stage": "proposer_exit",
+        "error": "Claude Code proposer failed with exit code 7: failed",
+    }
     assert captured_env["ANTHROPIC_AUTH_TOKEN"] == "rotated-key"
 
 
@@ -1043,6 +1050,40 @@ def test_evaluate_wrong_objective(tmp_path: Path) -> None:
     assert "Reference solution path:" in feedback.detail
     assert "oracle/reference_solution.py" in feedback.detail
     assert "factory_planning" in feedback.detail
+
+
+def test_evaluate_null_oracle_is_skipped_and_counted_as_error(tmp_path: Path) -> None:
+    benchmark_dir = tmp_path / "OR-Interact-Bench"
+    task_dir = benchmark_dir / "RCO-medium" / "task_001"
+    _minimal_visible_task(task_dir)
+    (task_dir / "oracle").mkdir()
+    (task_dir / "oracle" / "objective.json").write_text(
+        json.dumps({"objective_value": None, "relative_tolerance": 0.01}),
+        encoding="utf-8",
+    )
+    benchmark = ORInteractBenchmark(
+        benchmark_dir=benchmark_dir,
+        dataset="RCO-medium",
+        train_size=1,
+    )
+    task = benchmark.get_tasks("train", limit=1)[0]
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+
+    feedback = benchmark.evaluate(task, _trajectory(runtime_dir))
+
+    assert feedback.success is False
+    assert feedback.score == 0.0
+    assert feedback.raw["evaluation"]["skipped"] is True
+    assert feedback.raw["evaluation"]["expected"] is None
+    assert "oracle objective_value is null" in feedback.detail
+
+    missing_runtime_feedback = benchmark.evaluate(
+        task,
+        Trajectory(task_id=task.id, output="", steps=[]),
+    )
+    assert missing_runtime_feedback.success is False
+    assert missing_runtime_feedback.raw["evaluation"]["skipped"] is True
 
 
 @pytest.mark.parametrize(

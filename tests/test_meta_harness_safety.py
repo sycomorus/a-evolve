@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from agent_evolve.algorithms.meta_harness import MetaHarnessEngine
+from agent_evolve.algorithms.meta_harness.prompts import build_proposer_prompt
 from agent_evolve.config import EvolveConfig
 from agent_evolve.contract.workspace import AgentWorkspace
 
@@ -42,6 +43,24 @@ def _workspace(root: Path) -> AgentWorkspace:
 
 def _engine() -> MetaHarnessEngine:
     return MetaHarnessEngine(EvolveConfig(extra={"num_candidates": 1}))
+
+
+def test_proposer_prompt_includes_hard_turn_budget(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path / "workspace")
+
+    prompt = build_proposer_prompt(
+        workspace,
+        cycle=1,
+        score_curve=[0.5],
+        turn_budget=50,
+    )
+
+    assert "Hard limit: 50 turns" in prompt
+    assert "diagnosis and browsing by turn 20" in prompt
+    assert "Finish all edits and verification by turn 40" in prompt
+    assert "Reserve the final 10 turns" in prompt
+    assert "stop browsing immediately" in prompt
+    assert "Do not start another tool call after the workspace changes are complete" in prompt
 
 
 def test_apply_diff_uses_clean_git_apply_only(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -103,7 +122,60 @@ def test_proposer_timeout_terminates_entire_process_group(
         "stderr": "last tool: find /",
         "exit_code": -1,
         "timed_out": True,
+        "failure_stage": "proposer_timeout",
+        "error": "Claude Code proposer timed out after 1s: last tool: find /",
     }
+
+
+def test_proposer_cli_launch_failure_returns_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _engine()
+
+    def missing_cli(*_args: object, **_kwargs: object) -> object:
+        raise FileNotFoundError("claude")
+
+    monkeypatch.setattr(subprocess, "Popen", missing_cli)
+
+    result = engine._run_claude_code("improve", tmp_path)
+
+    assert result == {
+        "output": "",
+        "stderr": "claude",
+        "exit_code": -1,
+        "failure_stage": "proposer_launch",
+        "error": "Claude Code CLI not found",
+    }
+
+
+def test_proposer_reported_error_with_zero_exit_returns_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _engine()
+    output = json.dumps({
+        "is_error": True,
+        "subtype": "error_max_turns",
+        "errors": ["Reached maximum number of turns (50)"],
+    })
+
+    class ErrorPopen:
+        returncode = 0
+
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def communicate(self, timeout: int | None = None) -> tuple[str, str]:
+            return output, ""
+
+    monkeypatch.setattr(subprocess, "Popen", ErrorPopen)
+
+    result = engine._run_claude_code("improve", tmp_path)
+
+    assert result["exit_code"] == 0
+    assert result["failure_stage"] == "proposer_exit"
+    assert result["error"].endswith(output)
 
 
 def test_proposer_timeout_skips_cycle_and_archives_status(
@@ -148,9 +220,11 @@ def test_proposer_timeout_skips_cycle_and_archives_status(
         "cycle": 1,
         "cycle_skipped": True,
         "failure_stage": "proposer_timeout",
-        "timed_out_candidate": "cycle_001_cand_1",
+        "failed_candidate": "cycle_001_cand_1",
+        "proposer_exit_code": -1,
+        "proposer_error": "Claude Code proposer timed out after 900s: TIMEOUT",
         "proposer_timeout_sec": 900,
-        "proposed_before_timeout": 1,
+        "proposed_before_failure": 1,
     }
     assert prompt.read_text() == "Base prompt\n"
 
@@ -165,6 +239,64 @@ def test_proposer_timeout_skips_cycle_and_archives_status(
     assert first_scores["failure_stage"] == "cycle_skipped"
     assert timeout_scores["valid"] is False
     assert timeout_scores["failure_stage"] == "proposer_timeout"
+
+
+def test_proposer_nonzero_exit_skips_cycle_and_returns_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = _workspace(tmp_path / "workspace")
+    engine = MetaHarnessEngine(EvolveConfig(extra={"num_candidates": 1}))
+
+    class FakeTrial:
+        agent = SimpleNamespace()
+        benchmark = object()
+
+    monkeypatch.setattr(
+        engine,
+        "_run_claude_code",
+        lambda _prompt, _root: {
+            "output": "",
+            "stderr": "Reached maximum number of turns (50)",
+            "exit_code": 1,
+            "failure_stage": "proposer_exit",
+            "error": (
+                "Claude Code proposer failed with exit code 1: "
+                "Reached maximum number of turns (50)"
+            ),
+        },
+    )
+    monkeypatch.setattr(
+        engine,
+        "_evaluate_candidates",
+        lambda *_args, **_kwargs: pytest.fail("failed cycle must not be evaluated"),
+    )
+
+    history = SimpleNamespace(latest_cycle=0, get_score_curve=lambda: [])
+    result = engine.step(workspace, [], history, FakeTrial(), tasks=[])
+
+    assert result.mutated is False
+    assert result.stop is False
+    assert result.metadata == {
+        "cycle": 1,
+        "cycle_skipped": True,
+        "failure_stage": "proposer_exit",
+        "failed_candidate": "cycle_001_cand_0",
+        "proposer_exit_code": 1,
+        "proposer_error": (
+            "Claude Code proposer failed with exit code 1: "
+            "Reached maximum number of turns (50)"
+        ),
+        "proposed_before_failure": 0,
+    }
+    assert (workspace.root / "prompts" / "system.md").read_text() == "Base prompt\n"
+
+    candidate = workspace.root / "evolution" / "candidates" / "cycle_001_cand_0"
+    scores = json.loads((candidate / "scores.json").read_text())
+    diagnostics = json.loads((candidate / "diagnostics.json").read_text())
+    assert scores["valid"] is False
+    assert scores["failure_stage"] == "proposer_exit"
+    assert diagnostics["error"].endswith("Reached maximum number of turns (50)")
 
 
 def test_git_reset_restores_index_and_preserves_evolution(tmp_path: Path) -> None:

@@ -207,6 +207,7 @@ class MetaHarnessEngine(EvolutionEngine):
                     workspace,
                     cycle_num,
                     score_curve,
+                    turn_budget=self.max_turns,
                     harness_enabled=self.harness_enabled,
                     candidate_index=i,
                     num_candidates=self.num_candidates,
@@ -214,10 +215,14 @@ class MetaHarnessEngine(EvolutionEngine):
                 )
 
                 result = self._run_claude_code(prompt, workspace.root)
-                if result.get("timed_out"):
-                    error = (
+                if result.get("error") or result.get("timed_out"):
+                    error = str(result.get("error") or (
                         f"Claude Code proposer timed out after {self.timeout_sec}s: "
                         f"{result.get('stderr') or 'no diagnostic output'}"
+                    ))
+                    failure_stage = str(
+                        result.get("failure_stage")
+                        or ("proposer_timeout" if result.get("timed_out") else "proposer_failure")
                     )
                     self._mark_archived_cycle_skipped(
                         candidates_dir,
@@ -238,7 +243,7 @@ class MetaHarnessEngine(EvolutionEngine):
                         diagnostics={
                             "proposal_valid": False,
                             "proposal_validation_error": error,
-                            "failure_stage": "proposer_timeout",
+                            "failure_stage": failure_stage,
                             "error": error,
                             "selection_attempted": False,
                             "final_apply_succeeded": False,
@@ -246,24 +251,27 @@ class MetaHarnessEngine(EvolutionEngine):
                         },
                     )
                     logger.warning(
-                        "Skipping Meta-Harness cycle %d after %s timed out",
-                        cycle_num,
-                        cand_label,
+                        "Skipping Meta-Harness cycle %d after %s failed: %s",
+                        cycle_num, cand_label, error,
                     )
+                    metadata = {
+                        "cycle": cycle_num,
+                        "cycle_skipped": True,
+                        "failure_stage": failure_stage,
+                        "failed_candidate": cand_label,
+                        "proposer_exit_code": result.get("exit_code"),
+                        "proposer_error": error,
+                        "proposed_before_failure": len(proposed),
+                    }
+                    if result.get("timed_out"):
+                        metadata["proposer_timeout_sec"] = self.timeout_sec
                     return StepResult(
                         mutated=False,
                         summary=(
                             f"MetaHarness cycle {cycle_num}: skipped after "
-                            f"{cand_label} proposer timeout"
+                            f"{cand_label} proposer failure: {error}"
                         ),
-                        metadata={
-                            "cycle": cycle_num,
-                            "cycle_skipped": True,
-                            "failure_stage": "proposer_timeout",
-                            "timed_out_candidate": cand_label,
-                            "proposer_timeout_sec": self.timeout_sec,
-                            "proposed_before_timeout": len(proposed),
-                        },
+                        metadata=metadata,
                     )
                 diff = self._git_diff(workspace.root)
                 valid, validation_err = self._validate_candidate(workspace)
@@ -716,6 +724,8 @@ class MetaHarnessEngine(EvolutionEngine):
                     "exit_code": proposer_result.get("exit_code"),
                     "output": proposer_result.get("output", ""),
                     "stderr": proposer_result.get("stderr", ""),
+                    "failure_stage": proposer_result.get("failure_stage"),
+                    "error": proposer_result.get("error", ""),
                     "model": self.model,
                     "provider": self.proposer_provider,
                 },
@@ -1152,28 +1162,42 @@ class MetaHarnessEngine(EvolutionEngine):
                     "stderr": stderr or "TIMEOUT",
                     "exit_code": -1,
                     "timed_out": True,
+                    "failure_stage": "proposer_timeout",
+                    "error": (
+                        f"Claude Code proposer timed out after {self.timeout_sec}s: "
+                        f"{detail}"
+                    ),
                 }
 
             output = stdout.strip()
             stderr = self._redact(raw_stderr.strip(), sensitive_values)
 
-            if proc.returncode != 0:
-                logger.warning("Claude Code exited with code %d", proc.returncode)
-                if proposer_env is not None:
-                    detail = stderr or self._redact(output, sensitive_values)
-                    raise RuntimeError(
-                        f"Claude Code proposer failed with exit code {proc.returncode}: "
-                        f"{detail[-1000:] or 'no diagnostic output'}"
-                    )
-            elif proposer_env is not None:
-                self._audit_isolated_candidate(workspace_root, sensitive_values)
-
-            result_text = output
+            parsed: Any = None
+            result_text: Any = output
             try:
                 parsed = json.loads(output)
                 result_text = parsed.get("result", output)
             except (json.JSONDecodeError, TypeError):
                 pass
+
+            reported_error = isinstance(parsed, dict) and parsed.get("is_error") is True
+            if proc.returncode != 0 or reported_error:
+                logger.warning("Claude Code exited with code %d", proc.returncode)
+                detail = stderr or self._redact(output, sensitive_values)
+                error = (
+                    f"Claude Code proposer failed with exit code {proc.returncode}: "
+                    f"{detail[-1000:] or 'no diagnostic output'}"
+                )
+                return {
+                    "output": self._redact(str(result_text), sensitive_values),
+                    "stderr": stderr,
+                    "exit_code": proc.returncode,
+                    "failure_stage": "proposer_exit",
+                    "error": error,
+                }
+            elif proposer_env is not None:
+                self._audit_isolated_candidate(workspace_root, sensitive_values)
+
             if proposer_env is not None:
                 result_text = self._redact(str(result_text), sensitive_values)
 
@@ -1184,14 +1208,19 @@ class MetaHarnessEngine(EvolutionEngine):
                 "exit_code": proc.returncode,
             }
 
-        except FileNotFoundError:
-            logger.error("Claude Code CLI not found")
-            if proposer_env is not None:
-                raise RuntimeError("Claude Code CLI not found") from None
+        except OSError as exc:
+            error = (
+                "Claude Code CLI not found"
+                if isinstance(exc, FileNotFoundError)
+                else f"Claude Code proposer failed to start: {exc}"
+            )
+            logger.error(error)
             return {
                 "output": "",
-                "stderr": "claude CLI not found",
+                "stderr": str(exc),
                 "exit_code": -1,
+                "failure_stage": "proposer_launch",
+                "error": error,
             }
 
     @staticmethod
